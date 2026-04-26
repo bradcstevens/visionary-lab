@@ -133,12 +133,9 @@ export async function createProject(request: CreateProjectRequest): Promise<Stag
     throw new Error(`Failed to create project: ${response.status} ${errorText}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  return data.project ?? data;
 }
-
-/**
- * List all staging projects
- */
 export async function listProjects(): Promise<StagingProject[]> {
   const url = `${API_BASE_URL}/staging/projects`;
   
@@ -153,7 +150,8 @@ export async function listProjects(): Promise<StagingProject[]> {
     throw new Error(`Failed to list projects: ${response.status} ${errorText}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  return data.projects ?? data;
 }
 
 /**
@@ -173,7 +171,8 @@ export async function getProject(projectId: string): Promise<StagingProject> {
     throw new Error(`Failed to get project: ${response.status} ${errorText}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  return data.project ?? data;
 }
 
 /**
