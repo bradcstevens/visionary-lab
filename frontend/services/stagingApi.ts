@@ -81,8 +81,12 @@ export interface StagingProject {
 export interface CreateProjectRequest {
   name: string;
   prompt: string;
-  style: string;
-  variations_per_room?: number;
+  settings?: {
+    variations_per_room?: number;
+    model?: string;
+    quality?: string;
+    size?: string;
+  };
 }
 
 // SSE event types for streaming
@@ -151,7 +155,12 @@ export async function listProjects(): Promise<StagingProject[]> {
   }
 
   const data = await response.json();
-  return data.projects ?? data;
+  const projects = data.projects ?? data;
+  if (!Array.isArray(projects)) {
+    console.error('listProjects: expected array, got:', typeof projects, projects);
+    return [];
+  }
+  return projects;
 }
 
 /**
@@ -207,10 +216,12 @@ export async function uploadRooms(projectId: string, roomFiles: { file: File; na
   }
 
   const formData = new FormData();
-  roomFiles.forEach(({ file, name }, index) => {
-    formData.append('room_files', file, file.name);
-    formData.append(`room_names`, name);
+  const labels: string[] = [];
+  roomFiles.forEach(({ file, name }) => {
+    formData.append('images', file, file.name);
+    labels.push(name);
   });
+  formData.append('labels', JSON.stringify(labels));
 
   const response = await fetch(url, {
     method: 'POST',
@@ -232,7 +243,7 @@ export function streamGeneration(
   projectId: string,
   onEvent: StagingStreamEventCallback
 ): () => void {
-  const url = `${API_BASE_URL}/staging/projects/${projectId}/generate/stream`;
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/generate`;
   
   if (API_DEBUG) {
     console.log(`Starting SSE stream for staging generation`);
@@ -340,7 +351,7 @@ export function streamRoomRegeneration(
   roomId: string,
   onEvent: StagingStreamEventCallback
 ): () => void {
-  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}/regenerate/stream`;
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}/regenerate`;
   
   if (API_DEBUG) {
     console.log(`Starting SSE stream for room regeneration`);
