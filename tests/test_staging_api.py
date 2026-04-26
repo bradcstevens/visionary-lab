@@ -1,0 +1,112 @@
+"""Tests for staging API endpoints."""
+import pytest
+from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture
+def mock_staging_deps():
+    """Mock all staging dependencies."""
+    with patch("backend.core.staging_storage.CosmosClient") as mock_cosmos, \
+         patch("backend.core.staging_storage.DefaultAzureCredential") as mock_cred, \
+         patch("backend.api.endpoints.staging.get_staging_pipeline") as mock_pipeline_fn:
+        
+        # Mock CosmosClient chain
+        mock_client = MagicMock()
+        mock_cosmos.return_value = mock_client
+        mock_db = MagicMock()
+        mock_client.get_database_client.return_value = mock_db
+        mock_container = MagicMock()
+        mock_db.create_container_if_not_exists.return_value = mock_container
+        
+        # Mock credential
+        mock_cred.return_value = MagicMock()
+        
+        # Mock pipeline
+        mock_pipeline = MagicMock()
+        mock_pipeline_fn.return_value = mock_pipeline
+        
+        yield {"container": mock_container, "pipeline": mock_pipeline}
+
+
+def test_create_project(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.create_item.return_value = {
+        "id": "proj-123",
+        "name": "Test Project",
+        "prompt": "Modern minimalist",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "created_at": "2026-04-26T00:00:00Z",
+        "updated_at": "2026-04-26T00:00:00Z",
+        "doc_type": "staging_project",
+    }
+
+    response = client.post("/api/v1/staging/projects", json={
+        "name": "Test Project",
+        "prompt": "Modern minimalist",
+    })
+    assert response.status_code == 201
+    data = response.json()
+    assert data["project"]["name"] == "Test Project"
+    assert data["project"]["status"] == "uploading"
+
+
+def test_list_projects(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.query_items.return_value = []
+    
+    # Mock count query - returns list with a single integer result
+    def mock_query_items(query=None, **kwargs):
+        if "SELECT VALUE COUNT(1)" in query:
+            return [0]  # Count query returns list with integer
+        return []
+    
+    mock_container.query_items = mock_query_items
+
+    response = client.get("/api/v1/staging/projects")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["projects"] == []
+    assert data["total"] == 0
+
+
+def test_get_project(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-123",
+        "name": "Test",
+        "prompt": "Test prompt",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-123")
+    assert response.status_code == 200
+    assert response.json()["project"]["id"] == "proj-123"
+
+
+def test_get_project_not_found(client, mock_staging_deps):
+    from azure.cosmos.exceptions import CosmosResourceNotFoundError
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.side_effect = CosmosResourceNotFoundError(status_code=404, message="Not found")
+    response = client.get("/api/v1/staging/projects/nonexistent")
+    assert response.status_code == 404
+
+
+def test_delete_project(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {"id": "proj-123"}  # Found
+    mock_container.delete_item.return_value = None  # Success
+    response = client.delete("/api/v1/staging/projects/proj-123")
+    assert response.status_code == 200
+
+
+def test_delete_project_not_found(client, mock_staging_deps):
+    from azure.cosmos.exceptions import CosmosResourceNotFoundError
+    mock_container = mock_staging_deps["container"]
+    # The delete endpoint calls storage.delete_project which tries to delete directly
+    mock_container.delete_item.side_effect = CosmosResourceNotFoundError(status_code=404, message="Not found")
+    response = client.delete("/api/v1/staging/projects/nonexistent")
+    assert response.status_code == 404

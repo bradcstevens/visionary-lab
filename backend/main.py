@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 import os  # noqa: E402
 import uvicorn  # noqa: E402
 from .core.config import settings  # noqa: E402
-from .api.endpoints import images, metadata_router, videos, gallery, env  # noqa: E402
+from .api.endpoints import images, metadata_router, videos, gallery, env, staging  # noqa: E402
 
 
 # Create directories if they don't exist
@@ -38,6 +38,7 @@ app.include_router(videos.router, prefix=f"{settings.API_V1_STR}/videos", tags=[
 app.include_router(gallery.router, prefix=f"{settings.API_V1_STR}/gallery", tags=["gallery"])
 app.include_router(metadata_router.router, prefix=f"{settings.API_V1_STR}/metadata", tags=["metadata"])
 app.include_router(env.router, prefix=f"{settings.API_V1_STR}", tags=["env"])
+app.include_router(staging.router, prefix=f"{settings.API_V1_STR}/staging", tags=["staging"])
 
 
 @app.get("/")
