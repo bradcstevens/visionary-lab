@@ -10,6 +10,13 @@ from fastapi.responses import StreamingResponse
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.staging_storage import StagingStorageService
+from backend.models.design_brief import (
+    ChatRequest,
+    ChatResponse,
+    DesignBrief,
+    GenerateBriefRequest,
+    ImageAnalysis,
+)
 from backend.models.staging import (
     CreateProjectRequest,
     ItemStatus,
@@ -28,6 +35,16 @@ router = APIRouter()
 
 def get_staging_storage() -> StagingStorageService:
     return StagingStorageService()
+
+
+def get_image_analyzer():
+    from backend.core import async_llm_client
+    from backend.core.analyze import ImageAnalyzer
+    return ImageAnalyzer(
+        openai_client=None,
+        model=settings.LLM_DEPLOYMENT,
+        async_openai_client=async_llm_client,
+    )
 
 
 def get_staging_pipeline():
@@ -212,3 +229,139 @@ async def regenerate_room(
             yield _sse_event(event["type"], event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/projects/{project_id}/analyze")
+async def analyze_project_images(
+    project_id: str,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Analyze all uploaded images in the project."""
+    import asyncio
+    import base64
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    rooms = project_data.get("rooms", [])
+    if not rooms:
+        raise HTTPException(status_code=400, detail="No images uploaded yet")
+
+    analyzer = get_image_analyzer()
+    blob_service = AzureBlobStorageService()
+
+    system_msg = (
+        "Describe this scene in detail for a design assistant. Include: "
+        "existing structures, plants, materials, colors, spatial layout, "
+        "and identifiable zones where items could be added. "
+        "Return JSON with keys: description (string), features (list of strings), "
+        "zones (list of strings identifying areas suitable for placing new objects)."
+    )
+
+    async def analyze_one(room: dict) -> dict:
+        url = room["original_image_url"]
+        blob_name = "/".join(url.split("/")[-2:])
+        image_bytes = await blob_service.get_asset_content(
+            blob_name=blob_name,
+            container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+        )
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8") if isinstance(image_bytes, bytes) else image_bytes
+        result = await analyzer.async_image_chat(image_base64=image_b64, system_message=system_msg)
+        return {
+            "room_id": room["id"],
+            "description": result.get("description", ""),
+            "features": result.get("features", []),
+            "zones": result.get("zones", []),
+        }
+
+    analyses = await asyncio.gather(*[analyze_one(r) for r in rooms], return_exceptions=True)
+    valid_analyses = [a for a in analyses if isinstance(a, dict)]
+
+    storage.update_project(project_id, {"analyses": valid_analyses})
+
+    return {"analyses": valid_analyses}
+
+
+@router.post("/projects/{project_id}/chat", response_model=ChatResponse)
+async def chat_with_project(
+    project_id: str,
+    request: ChatRequest,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Conversational AI endpoint for the Design Session."""
+    from backend.core import async_llm_client
+    from backend.core.design_chat import DesignChatService
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    raw_analyses = project_data.get("analyses", [])
+    analyses = [ImageAnalysis(**a) for a in raw_analyses]
+
+    service = DesignChatService(
+        async_llm_client=async_llm_client,
+        llm_deployment=settings.LLM_DEPLOYMENT,
+        image_analyses=analyses,
+    )
+
+    return await service.chat(
+        message=request.message,
+        conversation_history=request.conversation_history,
+        focused_image_id=request.focused_image_id,
+    )
+
+
+@router.post("/projects/{project_id}/brief")
+async def generate_brief(
+    project_id: str,
+    request: GenerateBriefRequest = None,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Generate a structured Design Brief from the conversation."""
+    from backend.core import async_llm_client
+    from backend.core.brief_generator import BriefGeneratorService
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    raw_analyses = project_data.get("analyses", [])
+    analyses = [ImageAnalysis(**a) for a in raw_analyses]
+
+    conversation_history = []
+    if request and request.conversation_history:
+        conversation_history = request.conversation_history
+
+    service = BriefGeneratorService(
+        async_llm_client=async_llm_client,
+        llm_deployment=settings.LLM_DEPLOYMENT,
+    )
+
+    brief = await service.generate_brief(
+        conversation_history=conversation_history,
+        image_analyses=analyses,
+    )
+
+    brief_dict = brief.dict()
+    storage.update_project(project_id, {"design_brief": brief_dict})
+
+    return {"brief": brief_dict}
+
+
+@router.put("/projects/{project_id}/brief")
+async def update_brief(
+    project_id: str,
+    brief: DesignBrief,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Save user edits to the Design Brief."""
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    brief_dict = brief.dict()
+    storage.update_project(project_id, {"design_brief": brief_dict})
+
+    return {"brief": brief_dict}

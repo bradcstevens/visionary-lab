@@ -120,3 +120,45 @@ async def test_chat_signals_ready_for_brief():
     )
 
     assert response.ready_for_brief is True
+
+
+def test_analyze_endpoint_returns_analyses(client, mock_staging_deps):
+    from unittest.mock import AsyncMock, patch
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-analyze",
+        "name": "Test",
+        "prompt": "Test",
+        "status": "uploading",
+        "rooms": [
+            {
+                "id": "room-1",
+                "label": "Backyard East",
+                "original_image_url": "https://test.blob.core.windows.net/images/staging/proj-analyze/originals/img.png",
+                "status": "pending",
+                "variations": [],
+            }
+        ],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    with patch("backend.api.endpoints.staging.get_image_analyzer") as mock_analyzer_fn:
+        mock_analyzer = AsyncMock()
+        mock_analyzer_fn.return_value = mock_analyzer
+        mock_analyzer.async_image_chat = AsyncMock(return_value={
+            "description": "Backyard with wooden fence and turf",
+            "features": ["fence", "turf"],
+        })
+
+        with patch("backend.api.endpoints.staging.AzureBlobStorageService") as mock_blob_cls:
+            mock_blob = AsyncMock()
+            mock_blob_cls.return_value = mock_blob
+            mock_blob.get_asset_content = AsyncMock(return_value=b"fake-image-bytes")
+
+            response = client.post("/api/v1/staging/projects/proj-analyze/analyze")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "analyses" in data
+    assert len(data["analyses"]) == 1
+    assert data["analyses"][0]["room_id"] == "room-1"
