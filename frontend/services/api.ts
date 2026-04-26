@@ -1174,7 +1174,7 @@ export async function generateImages(
   background: string = "auto",
   outputFormat: string = "png",
   quality: string = "auto",
-  model: string = "gpt-image-1.5"
+  model: string = "gpt-image-2"
 ): Promise<ImageGenerationResponse> {
   const pipelineRequest: ImagePipelineRequest = {
     action: PipelineAction.GENERATE,
@@ -1215,7 +1215,7 @@ export async function saveGeneratedImages(
   saveAll: boolean = true,
   folderPath: string = "",
   outputFormat: string = "png",
-  model: string = "gpt-image-1.5",
+  model: string = "gpt-image-2",
   background: string = "auto",
   size: string = "1024x1024",
   analyze: boolean = false
@@ -1294,7 +1294,7 @@ export async function generateImagesWithAnalysis(params: {
   const pipelineRequest: ImagePipelineRequest = {
     action: PipelineAction.GENERATE,
     prompt: params.prompt,
-    model: params.model || 'gpt-image-1.5',
+    model: params.model || 'gpt-image-2',
     n: params.n ?? 1,
     size: params.size || 'auto',
     response_format: 'b64_json',
@@ -1647,7 +1647,7 @@ export async function moveAsset(
  * @param inputFidelity - Input fidelity for better reproduction of input features:
  *   - 'low' (default): Standard fidelity, faster processing
  *   - 'high': Better reproduction of input image features, additional cost (~$0.04-$0.06 per image)
- * @param model - Image generation model to use (default: "gpt-image-1.5")
+ * @param model - Image generation model to use (default: "gpt-image-2")
  */
 export async function editImage(
   sourceImages: File | File[],
@@ -1656,7 +1656,7 @@ export async function editImage(
   size: string = "auto",
   quality: string = "auto",
   inputFidelity: string = "low",
-  model: string = "gpt-image-1.5"
+  model: string = "gpt-image-2"
 ): Promise<ImageGenerationResponse> {
   if (inputFidelity && !["low", "high"].includes(inputFidelity)) {
     throw new Error("input_fidelity must be either 'low' or 'high'");
