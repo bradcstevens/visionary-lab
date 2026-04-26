@@ -36,7 +36,7 @@ param aiFoundryLocation string = 'swedencentral'
 param LLM_DEPLOYMENT string = 'gpt-5-4'
 @description('Name of the primary image generation deployment (gpt-image-2)')
 param IMAGEGEN_DEPLOYMENT string = 'gpt-image-2'
-@description('Name of the optional legacy gpt-image-1.5 deployment')
+@description('Name of the optional legacy image generation deployment (gpt-image-1.5 era)')
 param IMAGEGEN_15_DEPLOYMENT string = ''
 @description('Name of the gpt-image-1-mini deployment')
 param IMAGEGEN_1_MINI_DEPLOYMENT string = ''

@@ -1,7 +1,7 @@
 """Tests for the post-migration default model identifiers.
 
 These guard against regressions where the codebase reverts to legacy slugs
-(`gpt-4o`, `gpt-image-1.5`, etc.) that the deployed Foundry resource may no
+(`gpt-5.4`, `gpt-image-2`, etc.) that the deployed Foundry resource may no
 longer have.
 """
 
@@ -28,7 +28,6 @@ def test_image_generation_request_default_model_is_gpt_image_2():
     "model",
     [
         "gpt-image-2",
-        "gpt-image-1.5",  # legacy alias must still validate
         "gpt-image-1-mini",
         "flux-kontext-pro",
     ],
@@ -61,6 +60,5 @@ def test_gpt_image_client_slug_map_includes_gpt_image_2(monkeypatch):
     client = gpt_image_module.GPTImageClient.__new__(gpt_image_module.GPTImageClient)
 
     assert client._get_deployment_for_model("gpt-image-2") == "vislab-gpt-image-2"
-    assert client._get_deployment_for_model("gpt-image-1.5") == "vislab-gpt-image-2"  # falls back to current deployment
     assert client._get_deployment_for_model("gpt-image-1-mini") == "vislab-mini"
     assert client._get_deployment_for_model("flux-kontext-pro") == "vislab-flux"

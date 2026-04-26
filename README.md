@@ -47,7 +47,7 @@ Visionary Lab uses **Azure AI Foundry** as a single unified AI resource with all
 | Deployment | Model | Purpose |
 |-----------|-------|---------|
 | `gpt-5.4` | GPT-5.4 | LLM for prompt enhancement and analysis |
-| `gpt-image-1.5` | GPT-Image-1.5 | Primary image generation |
+| `gpt-image-2` | GPT-Image-2 | Primary image generation |
 | `gpt-image-1-mini` | GPT-Image-1-Mini | Fast image generation |
 | `flux-kontext-pro` | FLUX.1-Kontext-pro | Alternative image generation |
 | `sora-2` | Sora 2 | Video generation |
@@ -131,7 +131,7 @@ npm install --legacy-peer-deps
    |---------|-------------|
    | `AI_FOUNDRY_ENDPOINT` | Your AI Foundry endpoint (e.g., `https://your-foundry.cognitiveservices.azure.com/`) |
    | `LLM_DEPLOYMENT` | LLM deployment name (e.g., `gpt-5-4`) |
-   | `IMAGEGEN_DEPLOYMENT` | Primary image model deployment (e.g., `gpt-image-1.5`) |
+   | `IMAGEGEN_DEPLOYMENT` | Primary image model deployment (e.g., `gpt-image-2`) |
    | `IMAGEGEN_1_MINI_DEPLOYMENT` | Mini image model deployment (e.g., `gpt-image-1-mini`) |
    | `FLUX_KONTEXT_DEPLOYMENT` | FLUX model deployment (e.g., `flux-kontext-pro`) |
    | `SORA_DEPLOYMENT` | Video model deployment (e.g., `sora-2`) |

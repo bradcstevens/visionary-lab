@@ -39,7 +39,7 @@ class ImagePromptBrandProtectionResponse(BaseModel):
 class ImageGenerationRequest(BaseModel):
     """Request model for image generation"""
 
-    # common parameters for gpt-image-1.5:
+    # common parameters for gpt-image models:
     prompt: str = Field(...,
                         description="User prompt for image generation. Maximum 32000 characters for gpt-image-2.",
                         examples=["A futuristic city skyline at sunset"])
@@ -52,7 +52,7 @@ class ImageGenerationRequest(BaseModel):
         """Validate that the model is one of the supported models"""
         valid_models = [
             "gpt-image-2",
-            "gpt-image-1.5",  # legacy alias kept for backwards compatibility
+            "gpt-image-1.5",  # kept for backwards-compat with existing metadata
             "gpt-image-1-mini",
             "flux-kontext-pro",
         ]
@@ -65,9 +65,9 @@ class ImageGenerationRequest(BaseModel):
                       description="Output image dimensions. Must be one of 1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), or auto.",
                       examples=["1024x1024", "1536x1024", "1024x1536", "auto"])
     response_format: str = Field("b64_json",
-                                 description="Response format for the generated image. Note: gpt-image-1.5 always returns b64_json regardless of this setting.",
+                                 description="Response format for the generated image. Note: gpt-image-2 always returns b64_json regardless of this setting.",
                                  examples=["b64_json"])
-    # gpt-image-1.5 specific parameters:
+    # gpt-image specific parameters:
     quality: Optional[str] = Field("auto",
                                    description="Quality setting: 'low', 'medium', 'high', 'auto'. Defaults to auto.",
                                    examples=["low", "medium", "high", "auto"])
@@ -90,7 +90,7 @@ class ImageEditRequest(ImageGenerationRequest):
     """Request model for image editing"""
 
     image: Union[str, HttpUrl, List[Union[str, HttpUrl]]] = Field(...,
-                                                                  description="The image(s) to edit. For gpt-image-1.5, you can provide up to 10 images, each should be a png, webp, or jpg file less than 25MB. Can be local file path(s), Base64-encoded image(s) (data URI) or URL(s).",
+                                                                  description="The image(s) to edit. For gpt-image-2, you can provide up to 10 images, each should be a png, webp, or jpg file less than 25MB. Can be local file path(s), Base64-encoded image(s) (data URI) or URL(s).",
                                                                   examples=[
                                                                       "images/image.png",
                                                                       ["images/image1.png",
@@ -107,7 +107,7 @@ class ImageEditRequest(ImageGenerationRequest):
                                                     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
                                                 ])
 
-    # gpt-image-1.5 specific edit parameters:
+    # gpt-image specific edit parameters:
     input_fidelity: Optional[str] = Field("low",
                                           description="Input fidelity setting for image editing: 'low' (default, faster), 'high' (better reproduction of input image features, additional cost). Only available for image editing operations.",
                                           examples=["low", "high"])
@@ -144,7 +144,7 @@ class ImageGenerationResponse(BaseResponse):
         None, description="JSON response from the image generation API"
     )
     token_usage: Optional[TokenUsage] = Field(
-        None, description="Token usage information (for gpt-image-1.5 only)"
+        None, description="Token usage information"
     )
 
 
@@ -216,7 +216,7 @@ class ImageGenerateWithAnalysisRequest(BaseModel):
     )
     response_format: str = Field(
         "b64_json",
-        description="Response format for generated image(s). gpt-image-1.5 returns b64_json",
+        description="Response format for generated image(s). gpt-image-2 returns b64_json",
     )
     quality: Optional[str] = Field(
         "auto", description="Quality setting: 'low', 'medium', 'high', 'auto'"
@@ -397,7 +397,7 @@ class ImagePipelineRequest(BaseModel):
         "b64_json", description="Expected response format from the model"
     )
     quality: Optional[str] = Field(
-        "auto", description="Quality hint for gpt-image-1.5"
+        "auto", description="Quality hint for image generation"
     )
     output_format: Optional[str] = Field(
         "png", description="Desired output format"
