@@ -111,6 +111,56 @@ export interface StagingStreamEvent {
 
 export type StagingStreamEventCallback = (event: StagingStreamEvent) => void;
 
+// Design Brief types
+export interface PlantEntry {
+  species: string;
+  botanical_name?: string;
+  quantity: number;
+  size: string;
+  placement: string;
+  visual_notes?: string;
+}
+
+export interface PlacementGuide {
+  back_row: string;
+  middle_row?: string;
+  front_row?: string;
+  accent_areas?: string;
+}
+
+export interface DesignBrief {
+  global_instructions: string;
+  plant_palette: PlantEntry[];
+  placement_guide: PlacementGuide;
+  per_image_notes: Record<string, string>;
+  preserve_elements: string[];
+  settings: {
+    variations_per_room: number;
+    model: string;
+    quality: string;
+    size: string;
+  };
+}
+
+export interface ImageAnalysisResult {
+  room_id: string;
+  description: string;
+  features: string[];
+  zones: string[];
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  focused_image_id?: string;
+}
+
+export interface ChatResponse {
+  reply: string;
+  ready_for_brief: boolean;
+  suggested_actions: string[];
+}
+
 // API Functions
 
 /**
@@ -448,4 +498,67 @@ export function streamRoomRegeneration(
     }
     abortController.abort();
   };
+}
+export async function analyzeImages(projectId: string): Promise<ImageAnalysisResult[]> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/analyze`;
+  const response = await fetch(url, { method: 'POST' });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to analyze images: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.analyses ?? [];
+}
+
+export async function chatWithProject(
+  projectId: string,
+  message: string,
+  conversationHistory: ChatMessage[],
+  focusedImageId?: string,
+): Promise<ChatResponse> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/chat`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      conversation_history: conversationHistory,
+      focused_image_id: focusedImageId ?? null,
+    }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Chat failed: ${response.status} ${errorText}`);
+  }
+  return response.json();
+}
+
+export async function generateBrief(projectId: string, conversationHistory: ChatMessage[]): Promise<DesignBrief> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/brief`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversation_history: conversationHistory }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to generate brief: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.brief;
+}
+
+export async function updateBrief(projectId: string, brief: DesignBrief): Promise<DesignBrief> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/brief`;
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(brief),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to update brief: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.brief;
 }
