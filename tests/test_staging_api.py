@@ -3,31 +3,6 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
-@pytest.fixture
-def mock_staging_deps():
-    """Mock all staging dependencies."""
-    with patch("backend.core.staging_storage.CosmosClient") as mock_cosmos, \
-         patch("backend.core.staging_storage.DefaultAzureCredential") as mock_cred, \
-         patch("backend.api.endpoints.staging.get_staging_pipeline") as mock_pipeline_fn:
-        
-        # Mock CosmosClient chain
-        mock_client = MagicMock()
-        mock_cosmos.return_value = mock_client
-        mock_db = MagicMock()
-        mock_client.get_database_client.return_value = mock_db
-        mock_container = MagicMock()
-        mock_db.create_container_if_not_exists.return_value = mock_container
-        
-        # Mock credential
-        mock_cred.return_value = MagicMock()
-        
-        # Mock pipeline
-        mock_pipeline = MagicMock()
-        mock_pipeline_fn.return_value = mock_pipeline
-        
-        yield {"container": mock_container, "pipeline": mock_pipeline}
-
-
 def test_create_project(client, mock_staging_deps):
     mock_container = mock_staging_deps["container"]
     mock_container.create_item.return_value = {

@@ -11,20 +11,6 @@ interface RoomGroupProps {
 }
 
 export function RoomGroup({ room, onVariationClick, onRetryVariation }: RoomGroupProps) {
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'completed':
-        return 'bg-green-500';
-      case 'processing':
-        return 'bg-blue-500';
-      case 'failed':
-        return 'bg-red-500';
-      case 'pending':
-      default:
-        return 'bg-gray-500';
-    }
-  };
-
   const getStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
     switch (status) {
       case 'completed':

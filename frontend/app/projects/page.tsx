@@ -22,7 +22,7 @@ function ProjectsList() {
     try {
       setIsLoading(true);
       const data = await listProjects();
-      setProjects(data);
+      setProjects(Array.isArray(data) ? data : []);
     } catch (error) {
       console.error('Failed to load projects:', error);
       toast.error('Failed to load projects');

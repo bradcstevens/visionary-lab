@@ -5,31 +5,6 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from fastapi import UploadFile
 
 
-@pytest.fixture
-def mock_staging_deps():
-    """Mock all staging dependencies."""
-    with patch("backend.core.staging_storage.CosmosClient") as mock_cosmos, \
-         patch("backend.core.staging_storage.DefaultAzureCredential") as mock_cred, \
-         patch("backend.api.endpoints.staging.get_staging_pipeline") as mock_pipeline_fn:
-
-        # Mock CosmosClient chain
-        mock_client = MagicMock()
-        mock_cosmos.return_value = mock_client
-        mock_db = MagicMock()
-        mock_client.get_database_client.return_value = mock_db
-        mock_container = MagicMock()
-        mock_db.create_container_if_not_exists.return_value = mock_container
-
-        # Mock credential
-        mock_cred.return_value = MagicMock()
-
-        # Mock pipeline
-        mock_pipeline = MagicMock()
-        mock_pipeline_fn.return_value = mock_pipeline
-
-        yield {"container": mock_container, "pipeline": mock_pipeline}
-
-
 # --- Task 1: Upload rooms accepts 'images' field name ---
 
 def test_upload_rooms_accepts_images_field(client, mock_staging_deps):
