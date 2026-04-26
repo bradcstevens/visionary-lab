@@ -225,7 +225,7 @@ async def regenerate_room(
         v.error = None
 
     async def event_stream():
-        async for event in pipeline.process_room(project, room):
+        async for event in pipeline.process_room(project, room, brief_prompts=None):
             yield _sse_event(event["type"], event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

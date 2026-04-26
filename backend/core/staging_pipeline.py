@@ -127,7 +127,7 @@ class StagingPipeline:
         raise RuntimeError("Failed to adapt prompt after 3 attempts")
 
     async def process_room(
-        self, project: StagingProject, room: Room,
+        self, project: StagingProject, room: Room, brief_prompts: dict = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process a single room: analyze → adapt → generate variations. Yields SSE events."""
         async with self.semaphore:
@@ -146,11 +146,15 @@ class StagingPipeline:
                 analysis = await self.analyze_room(image_b64)
                 room_description = analysis.get("description", "A room")
 
-                adapted_prompts = await self.adapt_prompt(
-                    user_prompt=project.prompt,
-                    room_analysis=room_description,
-                    n_variations=project.settings.variations_per_room,
-                )
+                # Use brief-generated prompts if available, else fall back to adapt_prompt
+                if brief_prompts and room.id in brief_prompts:
+                    adapted_prompts = brief_prompts[room.id]
+                else:
+                    adapted_prompts = await self.adapt_prompt(
+                        user_prompt=project.prompt,
+                        room_analysis=room_description,
+                        n_variations=project.settings.variations_per_room,
+                    )
 
                 for idx, adapted_prompt in enumerate(adapted_prompts):
                     variation = room.variations[idx]
@@ -229,8 +233,26 @@ class StagingPipeline:
 
         pending_rooms = [r for r in project.rooms if r.status in (ItemStatus.PENDING, ItemStatus.FAILED)]
 
+        # If project has a design_brief, use BriefGeneratorService for prompt adaptation
+        brief_prompts = {}
+        if project.design_brief:
+            from backend.core.brief_generator import BriefGeneratorService
+            from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+
+            brief = DBModel(**project.design_brief)
+            analyses = [ImageAnalysis(**a) for a in (project.analyses or [])]
+            brief_service = BriefGeneratorService(
+                async_llm_client=self.async_llm_client,
+                llm_deployment=self.llm_deployment,
+            )
+            brief_prompts = await brief_service.brief_to_prompts(
+                brief=brief,
+                image_analyses=analyses,
+                n_variations=project.settings.variations_per_room,
+            )
+
         for room in pending_rooms:
-            async for event in self.process_room(project, room):
+            async for event in self.process_room(project, room, brief_prompts=brief_prompts):
                 yield event
 
         all_completed = all(r.status == ItemStatus.COMPLETED for r in project.rooms)
