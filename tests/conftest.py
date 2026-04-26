@@ -11,9 +11,11 @@ from unittest.mock import MagicMock, patch
 # so that Settings() picks up test values instead of requiring real creds.
 os.environ.setdefault("MODEL_PROVIDER", "azure")
 os.environ.setdefault("AI_FOUNDRY_ENDPOINT", "https://test-foundry.cognitiveservices.azure.com/")
-os.environ.setdefault("LLM_DEPLOYMENT", "test-llm-deployment")
-os.environ.setdefault("IMAGEGEN_DEPLOYMENT", "test-deployment")
-os.environ.setdefault("SORA_DEPLOYMENT", "test-sora-deployment")
+os.environ.setdefault("LLM_DEPLOYMENT", "gpt-5-4")
+os.environ.setdefault("IMAGEGEN_DEPLOYMENT", "gpt-image-2")
+os.environ.setdefault("IMAGEGEN_1_MINI_DEPLOYMENT", "gpt-image-1-mini")
+os.environ.setdefault("FLUX_KONTEXT_DEPLOYMENT", "flux-kontext-pro")
+os.environ.setdefault("SORA_DEPLOYMENT", "sora")
 os.environ.setdefault("AZURE_STORAGE_ACCOUNT_NAME", "teststorage")
 os.environ.setdefault("AZURE_BLOB_SERVICE_URL", "https://teststorage.blob.core.windows.net/")
 os.environ.setdefault("AZURE_BLOB_IMAGE_CONTAINER", "images")
@@ -48,6 +50,19 @@ def mock_cosmos():
         mock_client.get_database_client.return_value = mock_db
         mock_container = MagicMock()
         mock_db.get_container_client.return_value = mock_container
+        yield mock_container
+
+
+@pytest.fixture
+def mock_staging_storage():
+    """Mock StagingStorageService for staging endpoint tests."""
+    with patch("backend.core.staging_storage.CosmosClient") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_db = MagicMock()
+        mock_client.get_database_client.return_value = mock_db
+        mock_container = MagicMock()
+        mock_db.create_container_if_not_exists.return_value = mock_container
         yield mock_container
 
 
