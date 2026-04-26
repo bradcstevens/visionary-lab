@@ -69,6 +69,8 @@ class StagingProject(BaseModel):
     rooms: List[Room] = Field(default_factory=list)
     settings: StagingSettings = Field(default_factory=StagingSettings)
     folder_path: Optional[str] = None
+    design_brief: Optional[Dict[str, Any]] = Field(None, description="Structured design brief from AI conversation")
+    analyses: Optional[List[Dict[str, Any]]] = Field(None, description="Image analysis results")
 
 
 class CreateProjectRequest(BaseModel):
