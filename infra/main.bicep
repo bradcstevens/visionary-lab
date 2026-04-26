@@ -32,32 +32,32 @@ param aiProjectName string = '${aiFoundryName}-proj'
 param aiFoundryLocation string = 'swedencentral'
 
 // Model deployment names
-@description('Name of the LLM deployment')
-param LLM_DEPLOYMENT string = 'gpt-4o'
-@description('Name of the image generation deployment')
-param IMAGEGEN_DEPLOYMENT string = ''
-@description('Name of the gpt-image-1.5 deployment')
+@description('Name of the LLM deployment (Azure deployment names disallow ".", so gpt-5.4 maps to gpt-5-4)')
+param LLM_DEPLOYMENT string = 'gpt-5-4'
+@description('Name of the primary image generation deployment (gpt-image-2)')
+param IMAGEGEN_DEPLOYMENT string = 'gpt-image-2'
+@description('Name of the optional legacy gpt-image-1.5 deployment')
 param IMAGEGEN_15_DEPLOYMENT string = ''
 @description('Name of the gpt-image-1-mini deployment')
 param IMAGEGEN_1_MINI_DEPLOYMENT string = ''
 @description('Name of the Sora deployment')
-param SORA_DEPLOYMENT string = ''
+param SORA_DEPLOYMENT string = 'sora-2'
 @description('Name of the FLUX Kontext Pro deployment')
 param FLUX_KONTEXT_DEPLOYMENT string = ''
 
 // Model types and versions (for Bicep-managed deployments)
-param llmModelType string = 'gpt-4o'
-param llmModelVersion string = '2024-11-20'
+param llmModelType string = 'gpt-5.4'
+param llmModelVersion string = '2026-03-05'
 // Image/video models may be deployed via CLI when Bicep doesn't support the format
-@description('Set to true to deploy image gen models via Bicep (requires OpenAI-format models)')
-param deployImageGenModels bool = false
-param imageGenModelType string = 'gpt-image-1.5'
-param imageGenModelVersion string = '2024-04-01'
-param imageGen15ModelVersion string = '2024-04-01'
-param imageGen1MiniModelVersion string = '2024-04-01'
+@description('Set to true to deploy image gen models via Bicep (requires OpenAI-format models). Defaults to true so that the primary gpt-image-2 deployment is created when IMAGEGEN_DEPLOYMENT is set.')
+param deployImageGenModels bool = true
+param imageGenModelType string = 'gpt-image-2'
+param imageGenModelVersion string = '2026-04-21'
+param imageGen15ModelVersion string = '2025-12-16'
+param imageGen1MiniModelVersion string = '2025-10-06'
 @description('Set to true to deploy Sora via Bicep')
-param deploySoraModel bool = false
-param soraModelVersion string = '2025-05-02'
+param deploySoraModel bool = true
+param soraModelVersion string = '2025-10-06'
 
 // Docker images for the backend and frontend container apps
 param DOCKER_IMAGE_BACKEND string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
@@ -291,9 +291,10 @@ module soraDeployment './modules/aiFoundryModelDeployment.bicep' = if (deploySor
   params: {
     aiFoundryName: aiFoundryName
     deploymentName: SORA_DEPLOYMENT
-    modelName: 'sora'
+    modelName: 'sora-2'
     modelVersion: soraModelVersion
     skuCapacity: 1
+    skuName: 'GlobalStandard'
   }
   dependsOn: [
     imageGen1MiniDeployment

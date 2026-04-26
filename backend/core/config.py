@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     AZURE_COSMOS_CONTAINER_ID: str = "metadata"
 
     # Staging feature
-    STAGING_MAX_ROOMS_PER_PROJECT: int = 10
+    STAGING_MAX_ROOMS_PER_PROJECT: int = 0  # 0 = unlimited
     STAGING_MAX_VARIATIONS: int = 10
     STAGING_CONCURRENT_ROOMS: int = 3
     STAGING_COSMOS_CONTAINER_ID: str = "staging-projects"

@@ -121,7 +121,7 @@ async def upload_rooms(
     if not project_data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if len(images) > settings.STAGING_MAX_ROOMS_PER_PROJECT:
+    if settings.STAGING_MAX_ROOMS_PER_PROJECT > 0 and len(images) > settings.STAGING_MAX_ROOMS_PER_PROJECT:
         raise HTTPException(status_code=400, detail=f"Maximum {settings.STAGING_MAX_ROOMS_PER_PROJECT} rooms per project")
 
     label_list = json.loads(labels) if labels else []

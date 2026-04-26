@@ -13,6 +13,9 @@ param deployNew bool = true
 resource aiFoundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = if (deployNew) {
   name: aiFoundryName
   location: location
+  tags: {
+    SecurityControl: 'Ignore'
+  }
   identity: {
     type: 'SystemAssigned'
   }

@@ -18,17 +18,21 @@ token_provider = get_bearer_token_provider(
 )
 
 # Initialize Sora 2 client
-try:
-    sora_client = Sora(
-        endpoint=settings.AI_FOUNDRY_ENDPOINT,
-        deployment_name=settings.SORA_DEPLOYMENT,
-        credential=credential,
-        token_provider=token_provider,
-    )
-    logger.info(f"Initialized Sora 2 client with Foundry endpoint, deployment: {settings.SORA_DEPLOYMENT}")
-except Exception as e:
-    logger.error(f"Failed to initialize Sora 2 client: {str(e)}")
+if not settings.SORA_DEPLOYMENT:
+    logger.warning("SORA_DEPLOYMENT is not set — Sora client will be unavailable")
     sora_client = None
+else:
+    try:
+        sora_client = Sora(
+            endpoint=settings.AI_FOUNDRY_ENDPOINT,
+            deployment_name=settings.SORA_DEPLOYMENT,
+            credential=credential,
+            token_provider=token_provider,
+        )
+        logger.info(f"Initialized Sora 2 client with Foundry endpoint, deployment: {settings.SORA_DEPLOYMENT}")
+    except Exception as e:
+        logger.error(f"Failed to initialize Sora 2 client: {str(e)}")
+        sora_client = None
 
 # Initialize GPT-Image client (using default model)
 try:

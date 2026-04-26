@@ -46,7 +46,7 @@ Visionary Lab uses **Azure AI Foundry** as a single unified AI resource with all
 
 | Deployment | Model | Purpose |
 |-----------|-------|---------|
-| `gpt-4o` | GPT-4o | LLM for prompt enhancement and analysis |
+| `gpt-5.4` | GPT-5.4 | LLM for prompt enhancement and analysis |
 | `gpt-image-1.5` | GPT-Image-1.5 | Primary image generation |
 | `gpt-image-1-mini` | GPT-Image-1-Mini | Fast image generation |
 | `flux-kontext-pro` | FLUX.1-Kontext-pro | Alternative image generation |
@@ -130,7 +130,7 @@ npm install --legacy-peer-deps
    | Setting | Description |
    |---------|-------------|
    | `AI_FOUNDRY_ENDPOINT` | Your AI Foundry endpoint (e.g., `https://your-foundry.cognitiveservices.azure.com/`) |
-   | `LLM_DEPLOYMENT` | LLM deployment name (e.g., `gpt-4o`) |
+   | `LLM_DEPLOYMENT` | LLM deployment name (e.g., `gpt-5-4`) |
    | `IMAGEGEN_DEPLOYMENT` | Primary image model deployment (e.g., `gpt-image-1.5`) |
    | `IMAGEGEN_1_MINI_DEPLOYMENT` | Mini image model deployment (e.g., `gpt-image-1-mini`) |
    | `FLUX_KONTEXT_DEPLOYMENT` | FLUX model deployment (e.g., `flux-kontext-pro`) |
@@ -198,7 +198,7 @@ azd up
 
 During `azd up`, you'll be prompted for:
 - **AI Foundry name**: Globally unique name for your AI Foundry resource
-- **Model deployment names**: Which models to deploy (gpt-4o, gpt-image-1.5, sora-2, etc.)
+- **Model deployment names**: Which models to deploy (gpt-5.4, gpt-image-2, sora-2, etc.)
 
 ✨ That's it! Your Visionary Lab will be running on Azure Container Apps with:
 - Azure AI Foundry with all model deployments

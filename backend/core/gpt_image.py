@@ -79,13 +79,14 @@ class GPTImageClient:
         Map model name to Azure deployment name
         
         Args:
-            model: Model identifier (gpt-image-1.5, gpt-image-1, gpt-image-1-mini)
+            model: Model identifier (gpt-image-2, gpt-image-1.5, gpt-image-1, gpt-image-1-mini, flux-kontext-pro)
             
         Returns:
             Deployment name from settings
         """
         mapping = {
-            "gpt-image-1.5": settings.IMAGEGEN_DEPLOYMENT,
+            "gpt-image-2": settings.IMAGEGEN_DEPLOYMENT,
+            "gpt-image-1.5": settings.IMAGEGEN_15_DEPLOYMENT or settings.IMAGEGEN_DEPLOYMENT,
             "gpt-image-1": settings.IMAGEGEN_DEPLOYMENT,  # legacy alias
             "gpt-image-1-mini": settings.IMAGEGEN_1_MINI_DEPLOYMENT,
             "flux-kontext-pro": settings.FLUX_KONTEXT_DEPLOYMENT,
@@ -137,7 +138,7 @@ class GPTImageClient:
                         "IMAGEGEN_DEPLOYMENT must be set for Azure OpenAI")
                 params["model"] = self.deployment_name
             else:
-                params["model"] = model or "gpt-image-1.5"
+                params["model"] = model or "gpt-image-2"
 
             # Add user parameter if provided
             if user:
@@ -150,8 +151,8 @@ class GPTImageClient:
                 # Add quality for gpt-image models
                 params["quality"] = quality
 
-            # Add gpt-image-1.5 specific parameters
-            if not is_flux and model in ("gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"):
+            # Add gpt-image specific parameters (gpt-image-2, gpt-image-1.5, gpt-image-1, gpt-image-1-mini)
+            if not is_flux and model in ("gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"):
                 if background != "auto":
                     params["background"] = background
                 try:
@@ -305,7 +306,7 @@ class GPTImageClient:
             else:
                 # Handle model parameter for OpenAI provider
                 if "model" not in kwargs:
-                    kwargs["model"] = "gpt-image-1.5"
+                    kwargs["model"] = "gpt-image-2"
 
                 # Get model for logging
                 model = kwargs.get("model")
@@ -441,7 +442,7 @@ class GPTImageClient:
                         "IMAGEGEN_DEPLOYMENT must be set for Azure OpenAI")
                 params["model"] = self.deployment_name
             else:
-                params["model"] = model or "gpt-image-1.5"
+                params["model"] = model or "gpt-image-2"
 
             # Add quality parameter
             if quality != "auto":

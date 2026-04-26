@@ -43,11 +43,6 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
   const handleFileChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
     
-    if (roomFiles.length + files.length > 10) {
-      toast.error('Maximum 10 images allowed');
-      return;
-    }
-
     const newRoomFiles = files.map(file => ({
       file,
       name: file.name.replace(/\.[^/.]+$/, ''), // Remove extension for default name
@@ -173,7 +168,7 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
                   <span className="font-medium">Click to upload</span> or drag and drop
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  PNG, JPG, JPEG up to 10 images
+                  PNG, JPG, JPEG — no limit on images
                 </div>
               </label>
             </div>
@@ -182,7 +177,7 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
             {roomFiles.length > 0 && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <Label>Uploaded Rooms ({roomFiles.length}/10)</Label>
+                  <Label>Uploaded Rooms ({roomFiles.length})</Label>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   {roomFiles.map((roomFile, index) => (

@@ -41,16 +41,21 @@ class ImageGenerationRequest(BaseModel):
 
     # common parameters for gpt-image-1.5:
     prompt: str = Field(...,
-                        description="User prompt for image generation. Maximum 32000 characters for gpt-image-1.5.",
+                        description="User prompt for image generation. Maximum 32000 characters for gpt-image-2.",
                         examples=["A futuristic city skyline at sunset"])
-    model: str = Field("gpt-image-1.5",
+    model: str = Field("gpt-image-2",
                        description="Image generation model to use",
-                       examples=["gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini"])
+                       examples=["gpt-image-2", "gpt-image-1-mini", "flux-kontext-pro"])
     
     @validator('model')
     def validate_model(cls, v):
         """Validate that the model is one of the supported models"""
-        valid_models = ["gpt-image-1.5", "gpt-image-1-mini", "flux-kontext-pro"]
+        valid_models = [
+            "gpt-image-2",
+            "gpt-image-1.5",  # legacy alias kept for backwards compatibility
+            "gpt-image-1-mini",
+            "flux-kontext-pro",
+        ]
         if v not in valid_models:
             raise ValueError(f"Model must be one of {valid_models}")
         return v
@@ -203,7 +208,7 @@ class ImageGenerateWithAnalysisRequest(BaseModel):
     """Request model for generating, analyzing, and saving images in one call"""
     # Generation parameters (mirrors ImageGenerationRequest)
     prompt: str = Field(..., description="User prompt for image generation")
-    model: str = Field("gpt-image-1.5", description="Image generation model to use")
+    model: str = Field("gpt-image-2", description="Image generation model to use")
     n: int = Field(1, description="Number of images to generate (1-10)")
     size: str = Field(
         "auto",
@@ -381,7 +386,7 @@ class ImagePipelineRequest(BaseModel):
     )
     prompt: str = Field(..., description="Prompt used for generation or editing")
     model: str = Field(
-        "gpt-image-1.5", description="Model deployment identifier"
+        "gpt-image-2", description="Model deployment identifier"
     )
     n: int = Field(1, description="Number of variants to produce (1-10)")
     size: str = Field(
