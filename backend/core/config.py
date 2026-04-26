@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     IMAGEGEN_1_MINI_DEPLOYMENT: Optional[str] = None
     FLUX_KONTEXT_DEPLOYMENT: Optional[str] = None
     SORA_DEPLOYMENT: Optional[str] = None
-    DEFAULT_IMAGE_MODEL: str = "gpt-image-1.5"
+    DEFAULT_IMAGE_MODEL: str = "gpt-image-2"
 
     # OpenAI API for direct OpenAI usage (non-Azure)
     OPENAI_API_KEY: Optional[str] = None
@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     AZURE_COSMOS_DB_ENDPOINT: Optional[str] = None
     AZURE_COSMOS_DB_ID: str = "visionarylab"
     AZURE_COSMOS_CONTAINER_ID: str = "metadata"
+
+    # Staging feature
+    STAGING_MAX_ROOMS_PER_PROJECT: int = 0  # 0 = unlimited
+    STAGING_MAX_VARIATIONS: int = 10
+    STAGING_CONCURRENT_ROOMS: int = 3
+    STAGING_COSMOS_CONTAINER_ID: str = "staging-projects"
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"

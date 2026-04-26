@@ -1,0 +1,3478 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.38.3.11034",
+      "templateHash": "10910682752480484047"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources"
+      }
+    },
+    "containerAppEnvName": {
+      "type": "string",
+      "defaultValue": "[format('cae-{0}', parameters('environmentName'))]",
+      "metadata": {
+        "description": "Name of the Container App Environment"
+      }
+    },
+    "containerAppNameBackend": {
+      "type": "string",
+      "defaultValue": "[format('ca-backend-{0}', parameters('environmentName'))]",
+      "metadata": {
+        "description": "Name of the Container App"
+      }
+    },
+    "containerAppNameFrontend": {
+      "type": "string",
+      "defaultValue": "[format('ca-frontend-{0}', parameters('environmentName'))]"
+    },
+    "logAnalyticsWorkspaceName": {
+      "type": "string",
+      "defaultValue": "[format('log-{0}', parameters('environmentName'))]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "defaultValue": "[format('st{0}', toLower(uniqueString(resourceGroup().id, parameters('environmentName'))))]",
+      "metadata": {
+        "description": "Unique name for the Storage Account (3-24 lowercase letters and numbers)"
+      }
+    },
+    "containerRegistryName": {
+      "type": "string",
+      "defaultValue": "[format('cr{0}', toLower(uniqueString(resourceGroup().id, parameters('environmentName'))))]",
+      "metadata": {
+        "description": "Unique name for the Container Registry (5-50 lowercase letters and numbers)"
+      }
+    },
+    "aiFoundryName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the AI Foundry resource"
+      }
+    },
+    "aiProjectName": {
+      "type": "string",
+      "defaultValue": "[format('{0}-proj', parameters('aiFoundryName'))]",
+      "metadata": {
+        "description": "Name of the AI Foundry project"
+      }
+    },
+    "aiFoundryLocation": {
+      "type": "string",
+      "defaultValue": "swedencentral",
+      "metadata": {
+        "description": "Location for AI Foundry (some models are region-specific)"
+      }
+    },
+    "LLM_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "gpt-5-4",
+      "metadata": {
+        "description": "Name of the LLM deployment (Azure deployment names disallow \".\", so gpt-5.4 maps to gpt-5-4)"
+      }
+    },
+    "IMAGEGEN_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "gpt-image-2",
+      "metadata": {
+        "description": "Name of the primary image generation deployment (gpt-image-2)"
+      }
+    },
+    "IMAGEGEN_15_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Name of the optional legacy gpt-image-1.5 deployment"
+      }
+    },
+    "IMAGEGEN_1_MINI_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Name of the gpt-image-1-mini deployment"
+      }
+    },
+    "SORA_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "sora-2",
+      "metadata": {
+        "description": "Name of the Sora deployment"
+      }
+    },
+    "FLUX_KONTEXT_DEPLOYMENT": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Name of the FLUX Kontext Pro deployment"
+      }
+    },
+    "llmModelType": {
+      "type": "string",
+      "defaultValue": "gpt-5.4"
+    },
+    "llmModelVersion": {
+      "type": "string",
+      "defaultValue": "2026-03-05"
+    },
+    "deployImageGenModels": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Set to true to deploy image gen models via Bicep (requires OpenAI-format models). Defaults to true so that the primary gpt-image-2 deployment is created when IMAGEGEN_DEPLOYMENT is set."
+      }
+    },
+    "imageGenModelType": {
+      "type": "string",
+      "defaultValue": "gpt-image-2"
+    },
+    "imageGenModelVersion": {
+      "type": "string",
+      "defaultValue": "2026-04-21"
+    },
+    "imageGen15ModelVersion": {
+      "type": "string",
+      "defaultValue": "2025-12-16"
+    },
+    "imageGen1MiniModelVersion": {
+      "type": "string",
+      "defaultValue": "2025-10-06"
+    },
+    "deploySoraModel": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Set to true to deploy Sora via Bicep"
+      }
+    },
+    "soraModelVersion": {
+      "type": "string",
+      "defaultValue": "2025-10-06"
+    },
+    "DOCKER_IMAGE_BACKEND": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+    },
+    "DOCKER_IMAGE_FRONTEND": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+    },
+    "API_PROTOCOL": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "API_HOSTNAME": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "API_PORT": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "AUTH_CLIENT_ID": {
+      "type": "securestring",
+      "defaultValue": ""
+    },
+    "AUTH_CLIENT_SECRET": {
+      "type": "securestring",
+      "defaultValue": ""
+    },
+    "AUTH_ISSUER": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "environmentName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "vnetName": {
+      "type": "string",
+      "defaultValue": "[format('vnet-{0}', parameters('environmentName'))]",
+      "metadata": {
+        "description": "Name of the Virtual Network"
+      }
+    },
+    "frontDoorName": {
+      "type": "string",
+      "defaultValue": "[format('afd-{0}', parameters('environmentName'))]",
+      "metadata": {
+        "description": "Name of the Azure Front Door profile"
+      }
+    },
+    "frontendCustomDomain": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Custom domain name for the frontend (e.g., visionary.go-agentic.com). Leave empty to skip."
+      }
+    },
+    "frontendCertificateId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Managed certificate resource ID for the custom domain. Leave empty for first-time setup."
+      }
+    },
+    "cosmosAccountName": {
+      "type": "string",
+      "defaultValue": "visionary-lab-cosmos"
+    },
+    "cosmosDatabaseName": {
+      "type": "string",
+      "defaultValue": "VisionaryLabDB"
+    },
+    "cosmosContainerName": {
+      "type": "string",
+      "defaultValue": "visionarylab"
+    }
+  },
+  "variables": {
+    "cosmosPrefix": "[toLower(substring(uniqueString(resourceGroup().id, parameters('environmentName')), 0, 5))]",
+    "cosmosAccountNamePrefixed": "[format('{0}-{1}', variables('cosmosPrefix'), parameters('cosmosAccountName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storageAccountMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "storageAccountName": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "deployNew": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "14792142527125372438"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "storageAccountName": {
+              "type": "string",
+              "defaultValue": "[format('a{0}', toLower(uniqueString(resourceGroup().id, 'storage')))]"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2024-01-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "kind": "StorageV2",
+              "properties": {
+                "publicNetworkAccess": "Disabled",
+                "allowBlobPublicAccess": false,
+                "networkAcls": {
+                  "defaultAction": "Deny",
+                  "bypass": "None"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "storageAccountPrimaryEndpoint": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2024-01-01').primaryEndpoints.blob]"
+            },
+            "storageAccountId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+            },
+            "storageAccountName": {
+              "type": "string",
+              "value": "[parameters('storageAccountName')]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storageContainerMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "storageAccountName": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "containerName": {
+            "value": "images"
+          },
+          "deployNew": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "1715901629883946182"
+            }
+          },
+          "parameters": {
+            "storageAccountName": {
+              "type": "string"
+            },
+            "containerName": {
+              "type": "string"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2022-09-01",
+              "name": "[format('{0}/default/{1}', parameters('storageAccountName'), parameters('containerName'))]",
+              "properties": {
+                "publicAccess": "None"
+              }
+            }
+          ],
+          "outputs": {
+            "containerId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', split(format('{0}/default/{1}', parameters('storageAccountName'), parameters('containerName')), '/')[0], split(format('{0}/default/{1}', parameters('storageAccountName'), parameters('containerName')), '/')[1], split(format('{0}/default/{1}', parameters('storageAccountName'), parameters('containerName')), '/')[2])]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "containerRegistryMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerRegistryName": {
+            "value": "[parameters('containerRegistryName')]"
+          },
+          "deployNew": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "7707279121402778006"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "containerRegistryName": {
+              "type": "string"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.ContainerRegistry/registries",
+              "apiVersion": "2023-07-01",
+              "name": "[parameters('containerRegistryName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Basic"
+              },
+              "properties": {
+                "adminUserEnabled": true
+              }
+            }
+          ],
+          "outputs": {
+            "containerRegistryId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')))]"
+            },
+            "containerRegistryName": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), parameters('containerRegistryName'), parameters('containerRegistryName'))]"
+            },
+            "containerRegistryLoginServer": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer, reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').loginServer)]"
+            },
+            "containerRegistryUsername": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username, listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').username)]"
+            },
+            "containerRegistryPassword": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value, listCredentials(resourceId('Microsoft.ContainerRegistry/registries', parameters('containerRegistryName')), '2023-07-01').passwords[0].value)]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cosmosDbMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "cosmosAccountName": {
+            "value": "[variables('cosmosAccountNamePrefixed')]"
+          },
+          "databaseName": {
+            "value": "[parameters('cosmosDatabaseName')]"
+          },
+          "containerName": {
+            "value": "[parameters('cosmosContainerName')]"
+          },
+          "subnetId": {
+            "value": ""
+          },
+          "deployNew": {
+            "value": true
+          },
+          "publicNetworkAccess": {
+            "value": "Disabled"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "12368776970956173106"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "cosmosAccountName": {
+              "type": "string"
+            },
+            "databaseName": {
+              "type": "string",
+              "defaultValue": "VisionaryLabDB"
+            },
+            "containerName": {
+              "type": "string",
+              "defaultValue": "visionarylab"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "subnetId": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "publicNetworkAccess": {
+              "type": "string",
+              "defaultValue": "Enabled"
+            }
+          },
+          "variables": {
+            "uniqueCosmosAccountName": "[if(equals(parameters('cosmosAccountName'), ''), format('cosmos-{0}', uniqueString(resourceGroup().id)), parameters('cosmosAccountName'))]"
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.DocumentDB/databaseAccounts",
+              "apiVersion": "2024-05-15",
+              "name": "[variables('uniqueCosmosAccountName')]",
+              "location": "[parameters('location')]",
+              "kind": "GlobalDocumentDB",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "databaseAccountOfferType": "Standard",
+                "enableFreeTier": false,
+                "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+                "networkAclBypass": "None",
+                "isVirtualNetworkFilterEnabled": false,
+                "consistencyPolicy": {
+                  "defaultConsistencyLevel": "Session"
+                },
+                "locations": [
+                  {
+                    "locationName": "[parameters('location')]",
+                    "failoverPriority": 0,
+                    "isZoneRedundant": false
+                  }
+                ],
+                "capabilities": [],
+                "virtualNetworkRules": []
+              }
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}', variables('uniqueCosmosAccountName'), parameters('databaseName'))]",
+              "properties": {
+                "resource": {
+                  "id": "[parameters('databaseName')]"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}/{2}', variables('uniqueCosmosAccountName'), parameters('databaseName'), parameters('containerName'))]",
+              "properties": {
+                "resource": {
+                  "id": "[parameters('containerName')]",
+                  "partitionKey": {
+                    "paths": [
+                      "/media_type"
+                    ],
+                    "kind": "Hash",
+                    "version": 1
+                  },
+                  "indexingPolicy": {
+                    "indexingMode": "consistent",
+                    "automatic": true,
+                    "includedPaths": [
+                      {
+                        "path": "/*"
+                      }
+                    ],
+                    "excludedPaths": [
+                      {
+                        "path": "/_etag/?"
+                      }
+                    ]
+                  }
+                },
+                "options": {
+                  "throughput": 600
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases', variables('uniqueCosmosAccountName'), parameters('databaseName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}', variables('uniqueCosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), 'sql-role-definition-reader'))]",
+              "properties": {
+                "roleName": "[format('{0}-data-reader-role', variables('uniqueCosmosAccountName'))]",
+                "type": "CustomRole",
+                "assignableScopes": [
+                  "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+                ],
+                "permissions": [
+                  {
+                    "dataActions": [
+                      "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read",
+                      "Microsoft.DocumentDB/databaseAccounts/readMetadata",
+                      "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery",
+                      "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/readChangeFeed"
+                    ]
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}', variables('uniqueCosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), 'sql-role-definition-contributor'))]",
+              "properties": {
+                "roleName": "[format('{0}-data-contributor-role', variables('uniqueCosmosAccountName'))]",
+                "type": "CustomRole",
+                "assignableScopes": [
+                  "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+                ],
+                "permissions": [
+                  {
+                    "dataActions": [
+                      "Microsoft.DocumentDB/databaseAccounts/readMetadata",
+                      "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/*",
+                      "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/*"
+                    ]
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "cosmosAccountId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName'))]"
+            },
+            "cosmosAccountName": {
+              "type": "string",
+              "value": "[variables('uniqueCosmosAccountName')]"
+            },
+            "cosmosAccountEndpoint": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), '2024-05-15').documentEndpoint]"
+            },
+            "databaseName": {
+              "type": "string",
+              "value": "[parameters('databaseName')]"
+            },
+            "containerName": {
+              "type": "string",
+              "value": "[parameters('containerName')]"
+            },
+            "systemAssignedIdentityPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), '2024-05-15', 'full').identity.principalId]"
+            },
+            "dataReaderRoleId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', variables('uniqueCosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), 'sql-role-definition-reader'))]"
+            },
+            "dataContributorRoleId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', variables('uniqueCosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', variables('uniqueCosmosAccountName')), 'sql-role-definition-contributor'))]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vnetMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "vnetName": {
+            "value": "[parameters('vnetName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "2306802873132314853"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for all resources"
+              }
+            },
+            "vnetName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Virtual Network"
+              }
+            },
+            "vnetAddressPrefix": {
+              "type": "string",
+              "defaultValue": "10.0.0.0/16",
+              "metadata": {
+                "description": "Address prefix for the VNet"
+              }
+            },
+            "containerAppsSubnetName": {
+              "type": "string",
+              "defaultValue": "snet-container-apps",
+              "metadata": {
+                "description": "Name of the Container Apps subnet"
+              }
+            },
+            "containerAppsSubnetPrefix": {
+              "type": "string",
+              "defaultValue": "10.0.0.0/23",
+              "metadata": {
+                "description": "Address prefix for the Container Apps subnet (minimum /23)"
+              }
+            },
+            "privateEndpointsSubnetName": {
+              "type": "string",
+              "defaultValue": "snet-private-endpoints",
+              "metadata": {
+                "description": "Name of the Private Endpoints subnet"
+              }
+            },
+            "privateEndpointsSubnetPrefix": {
+              "type": "string",
+              "defaultValue": "10.0.2.0/24",
+              "metadata": {
+                "description": "Address prefix for the Private Endpoints subnet"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2024-01-01",
+              "name": "[parameters('vnetName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": [
+                    "[parameters('vnetAddressPrefix')]"
+                  ]
+                },
+                "subnets": [
+                  {
+                    "name": "[parameters('containerAppsSubnetName')]",
+                    "properties": {
+                      "addressPrefix": "[parameters('containerAppsSubnetPrefix')]",
+                      "delegations": [
+                        {
+                          "name": "Microsoft.App.environments",
+                          "properties": {
+                            "serviceName": "Microsoft.App/environments"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "name": "[parameters('privateEndpointsSubnetName')]",
+                    "properties": {
+                      "addressPrefix": "[parameters('privateEndpointsSubnetPrefix')]"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "outputs": {
+            "vnetId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+            },
+            "containerAppsSubnetId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName')), '2024-01-01').subnets[0].id]"
+            },
+            "privateEndpointsSubnetId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName')), '2024-01-01').subnets[1].id]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "blobDnsZoneMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "zoneName": {
+            "value": "privatelink.blob.core.windows.net"
+          },
+          "vnetId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'vnetMod'), '2025-04-01').outputs.vnetId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "2287526910135789437"
+            }
+          },
+          "parameters": {
+            "zoneName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the private DNS zone (e.g., privatelink.blob.core.windows.net)"
+              }
+            },
+            "vnetId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the VNet to link"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2020-06-01",
+              "name": "[parameters('zoneName')]",
+              "location": "global",
+              "properties": {}
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2020-06-01",
+              "name": "[format('{0}/{1}', parameters('zoneName'), format('{0}-link', replace(parameters('zoneName'), '.', '-')))]",
+              "location": "global",
+              "properties": {
+                "virtualNetwork": {
+                  "id": "[parameters('vnetId')]"
+                },
+                "registrationEnabled": false
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones', parameters('zoneName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "privateDnsZoneId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateDnsZones', parameters('zoneName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'vnetMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cosmosDnsZoneMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "zoneName": {
+            "value": "privatelink.documents.azure.com"
+          },
+          "vnetId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'vnetMod'), '2025-04-01').outputs.vnetId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "2287526910135789437"
+            }
+          },
+          "parameters": {
+            "zoneName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the private DNS zone (e.g., privatelink.blob.core.windows.net)"
+              }
+            },
+            "vnetId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the VNet to link"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateDnsZones",
+              "apiVersion": "2020-06-01",
+              "name": "[parameters('zoneName')]",
+              "location": "global",
+              "properties": {}
+            },
+            {
+              "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
+              "apiVersion": "2020-06-01",
+              "name": "[format('{0}/{1}', parameters('zoneName'), format('{0}-link', replace(parameters('zoneName'), '.', '-')))]",
+              "location": "global",
+              "properties": {
+                "virtualNetwork": {
+                  "id": "[parameters('vnetId')]"
+                },
+                "registrationEnabled": false
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateDnsZones', parameters('zoneName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "privateDnsZoneId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateDnsZones', parameters('zoneName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'vnetMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storagePrivateEndpointMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "privateEndpointName": {
+            "value": "[format('pe-storage-{0}', parameters('environmentName'))]"
+          },
+          "subnetId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'vnetMod'), '2025-04-01').outputs.privateEndpointsSubnetId.value]"
+          },
+          "privateLinkServiceId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountId.value]"
+          },
+          "groupIds": {
+            "value": [
+              "blob"
+            ]
+          },
+          "privateDnsZoneId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'blobDnsZoneMod'), '2025-04-01').outputs.privateDnsZoneId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "1088548410910644291"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for the private endpoint"
+              }
+            },
+            "privateEndpointName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the private endpoint"
+              }
+            },
+            "subnetId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the subnet for the private endpoint"
+              }
+            },
+            "privateLinkServiceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the target service"
+              }
+            },
+            "groupIds": {
+              "type": "array",
+              "metadata": {
+                "description": "Group IDs for the private link (e.g., [\"blob\"] for storage, [\"Sql\"] for Cosmos DB)"
+              }
+            },
+            "privateDnsZoneId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the private DNS zone for automatic DNS registration"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-01-01",
+              "name": "[parameters('privateEndpointName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('subnetId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "[parameters('privateEndpointName')]",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('privateLinkServiceId')]",
+                      "groupIds": "[parameters('groupIds')]"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}', parameters('privateEndpointName'), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": [
+                  {
+                    "name": "[replace(parameters('privateEndpointName'), '-', '')]",
+                    "properties": {
+                      "privateDnsZoneId": "[parameters('privateDnsZoneId')]"
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "privateEndpointId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'blobDnsZoneMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'vnetMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cosmosPrivateEndpointMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "privateEndpointName": {
+            "value": "[format('pe-cosmos-{0}', parameters('environmentName'))]"
+          },
+          "subnetId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'vnetMod'), '2025-04-01').outputs.privateEndpointsSubnetId.value]"
+          },
+          "privateLinkServiceId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.cosmosAccountId.value]"
+          },
+          "groupIds": {
+            "value": [
+              "Sql"
+            ]
+          },
+          "privateDnsZoneId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDnsZoneMod'), '2025-04-01').outputs.privateDnsZoneId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "1088548410910644291"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for the private endpoint"
+              }
+            },
+            "privateEndpointName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the private endpoint"
+              }
+            },
+            "subnetId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the subnet for the private endpoint"
+              }
+            },
+            "privateLinkServiceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the target service"
+              }
+            },
+            "groupIds": {
+              "type": "array",
+              "metadata": {
+                "description": "Group IDs for the private link (e.g., [\"blob\"] for storage, [\"Sql\"] for Cosmos DB)"
+              }
+            },
+            "privateDnsZoneId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the private DNS zone for automatic DNS registration"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/privateEndpoints",
+              "apiVersion": "2024-01-01",
+              "name": "[parameters('privateEndpointName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "subnet": {
+                  "id": "[parameters('subnetId')]"
+                },
+                "privateLinkServiceConnections": [
+                  {
+                    "name": "[parameters('privateEndpointName')]",
+                    "properties": {
+                      "privateLinkServiceId": "[parameters('privateLinkServiceId')]",
+                      "groupIds": "[parameters('groupIds')]"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}', parameters('privateEndpointName'), 'default')]",
+              "properties": {
+                "privateDnsZoneConfigs": [
+                  {
+                    "name": "[replace(parameters('privateEndpointName'), '-', '')]",
+                    "properties": {
+                      "privateDnsZoneId": "[parameters('privateDnsZoneId')]"
+                    }
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "privateEndpointId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDbMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDnsZoneMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'vnetMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "frontDoorMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "frontDoorName": {
+            "value": "[parameters('frontDoorName')]"
+          },
+          "storageAccountHostName": {
+            "value": "[replace(replace(reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value, 'https://', ''), '/', '')]"
+          },
+          "storageAccountId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountId.value]"
+          },
+          "storageAccountLocation": {
+            "value": "[parameters('location')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "12828421790054106572"
+            }
+          },
+          "parameters": {
+            "frontDoorName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Front Door profile"
+              }
+            },
+            "storageAccountHostName": {
+              "type": "string",
+              "metadata": {
+                "description": "Hostname of the storage account blob endpoint (e.g., stxxx.blob.core.windows.net)"
+              }
+            },
+            "storageAccountId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the storage account"
+              }
+            },
+            "storageAccountLocation": {
+              "type": "string",
+              "metadata": {
+                "description": "Location of the storage account (required for private link)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Cdn/profiles",
+              "apiVersion": "2024-02-01",
+              "name": "[parameters('frontDoorName')]",
+              "location": "global",
+              "sku": {
+                "name": "Premium_AzureFrontDoor"
+              },
+              "properties": {}
+            },
+            {
+              "type": "Microsoft.Cdn/profiles/afdEndpoints",
+              "apiVersion": "2024-02-01",
+              "name": "[format('{0}/{1}', parameters('frontDoorName'), format('{0}-ep', parameters('frontDoorName')))]",
+              "location": "global",
+              "properties": {
+                "enabledState": "Enabled"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Cdn/profiles/originGroups",
+              "apiVersion": "2024-02-01",
+              "name": "[format('{0}/{1}', parameters('frontDoorName'), 'storage-origin-group')]",
+              "properties": {
+                "loadBalancingSettings": {
+                  "sampleSize": 4,
+                  "successfulSamplesRequired": 3
+                },
+                "healthProbeSettings": null
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Cdn/profiles/originGroups/origins",
+              "apiVersion": "2024-02-01",
+              "name": "[format('{0}/{1}/{2}', parameters('frontDoorName'), 'storage-origin-group', 'storage-blob-origin')]",
+              "properties": {
+                "hostName": "[parameters('storageAccountHostName')]",
+                "originHostHeader": "[parameters('storageAccountHostName')]",
+                "httpPort": 80,
+                "httpsPort": 443,
+                "priority": 1,
+                "weight": 1000,
+                "enforceCertificateNameCheck": true,
+                "sharedPrivateLinkResource": {
+                  "privateLink": {
+                    "id": "[parameters('storageAccountId')]"
+                  },
+                  "groupId": "blob",
+                  "privateLinkLocation": "[parameters('storageAccountLocation')]",
+                  "requestMessage": "Front Door private link to blob storage"
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'storage-origin-group')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Cdn/profiles/afdEndpoints/routes",
+              "apiVersion": "2024-02-01",
+              "name": "[format('{0}/{1}/{2}', parameters('frontDoorName'), format('{0}-ep', parameters('frontDoorName')), 'storage-route')]",
+              "properties": {
+                "originGroup": {
+                  "id": "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'storage-origin-group')]"
+                },
+                "supportedProtocols": [
+                  "Https"
+                ],
+                "patternsToMatch": [
+                  "/*"
+                ],
+                "forwardingProtocol": "HttpsOnly",
+                "linkToDefaultDomain": "Enabled",
+                "httpsRedirect": "Enabled"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), format('{0}-ep', parameters('frontDoorName')))]",
+                "[resourceId('Microsoft.Cdn/profiles/originGroups/origins', parameters('frontDoorName'), 'storage-origin-group', 'storage-blob-origin')]",
+                "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'storage-origin-group')]"
+              ]
+            }
+          ],
+          "outputs": {
+            "frontDoorEndpointHostName": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), format('{0}-ep', parameters('frontDoorName'))), '2024-02-01').hostName]"
+            },
+            "frontDoorProfileId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "aiFoundryMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "location": {
+            "value": "[parameters('aiFoundryLocation')]"
+          },
+          "deployNew": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "8673933331050888274"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the AI Foundry resource"
+              }
+            },
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for the AI Foundry resource"
+              }
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Deploy a new AI Foundry resource or reference an existing one"
+              }
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.CognitiveServices/accounts",
+              "apiVersion": "2025-06-01",
+              "name": "[parameters('aiFoundryName')]",
+              "location": "[parameters('location')]",
+              "tags": {
+                "SecurityControl": "Ignore"
+              },
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "sku": {
+                "name": "S0"
+              },
+              "kind": "AIServices",
+              "properties": {
+                "allowProjectManagement": true,
+                "customSubDomainName": "[parameters('aiFoundryName')]",
+                "disableLocalAuth": false,
+                "publicNetworkAccess": "Enabled"
+              }
+            }
+          ],
+          "outputs": {
+            "aiFoundryEndpoint": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), '2025-06-01').endpoint, reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), '2025-06-01').endpoint)]"
+            },
+            "aiFoundryName": {
+              "type": "string",
+              "value": "[parameters('aiFoundryName')]"
+            },
+            "aiFoundryId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')))]"
+            },
+            "aiFoundryPrincipalId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), '2025-06-01', 'full').identity.principalId, '')]"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "aiFoundryProjectMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiProjectName": {
+            "value": "[parameters('aiProjectName')]"
+          },
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "location": {
+            "value": "[parameters('aiFoundryLocation')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "16149273439721927014"
+            }
+          },
+          "parameters": {
+            "aiProjectName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the AI Foundry project"
+              }
+            },
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for the project"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/projects",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('aiProjectName'))]",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {}
+            }
+          ],
+          "outputs": {
+            "projectName": {
+              "type": "string",
+              "value": "[parameters('aiProjectName')]"
+            },
+            "projectId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/projects', parameters('aiFoundryName'), parameters('aiProjectName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "llmDeployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "deploymentName": {
+            "value": "[parameters('LLM_DEPLOYMENT')]"
+          },
+          "modelName": {
+            "value": "[parameters('llmModelType')]"
+          },
+          "modelVersion": {
+            "value": "[parameters('llmModelVersion')]"
+          },
+          "skuCapacity": {
+            "value": 30
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "15133746539956234293"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "deploymentName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deployment name (used to reference the model in API calls)"
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model name (e.g., gpt-5.4, gpt-image-2, sora)"
+              }
+            },
+            "modelFormat": {
+              "type": "string",
+              "defaultValue": "OpenAI",
+              "metadata": {
+                "description": "Model format"
+              }
+            },
+            "modelVersion": {
+              "type": "string",
+              "metadata": {
+                "description": "Model version"
+              }
+            },
+            "skuName": {
+              "type": "string",
+              "defaultValue": "GlobalStandard",
+              "metadata": {
+                "description": "SKU name for the deployment"
+              }
+            },
+            "skuCapacity": {
+              "type": "int",
+              "defaultValue": 1,
+              "metadata": {
+                "description": "SKU capacity (throughput units)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('deploymentName'))]",
+              "sku": {
+                "capacity": "[parameters('skuCapacity')]",
+                "name": "[parameters('skuName')]"
+              },
+              "properties": {
+                "model": {
+                  "name": "[parameters('modelName')]",
+                  "format": "[parameters('modelFormat')]",
+                  "version": "[parameters('modelVersion')]"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "deploymentName": {
+              "type": "string",
+              "value": "[parameters('deploymentName')]"
+            },
+            "deploymentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('aiFoundryName'), parameters('deploymentName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('deployImageGenModels'), not(equals(parameters('IMAGEGEN_DEPLOYMENT'), '')))]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "imageGenDeployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "deploymentName": {
+            "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+          },
+          "modelName": {
+            "value": "[parameters('imageGenModelType')]"
+          },
+          "modelVersion": {
+            "value": "[parameters('imageGenModelVersion')]"
+          },
+          "skuCapacity": {
+            "value": 1
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "15133746539956234293"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "deploymentName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deployment name (used to reference the model in API calls)"
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model name (e.g., gpt-5.4, gpt-image-2, sora)"
+              }
+            },
+            "modelFormat": {
+              "type": "string",
+              "defaultValue": "OpenAI",
+              "metadata": {
+                "description": "Model format"
+              }
+            },
+            "modelVersion": {
+              "type": "string",
+              "metadata": {
+                "description": "Model version"
+              }
+            },
+            "skuName": {
+              "type": "string",
+              "defaultValue": "GlobalStandard",
+              "metadata": {
+                "description": "SKU name for the deployment"
+              }
+            },
+            "skuCapacity": {
+              "type": "int",
+              "defaultValue": 1,
+              "metadata": {
+                "description": "SKU capacity (throughput units)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('deploymentName'))]",
+              "sku": {
+                "capacity": "[parameters('skuCapacity')]",
+                "name": "[parameters('skuName')]"
+              },
+              "properties": {
+                "model": {
+                  "name": "[parameters('modelName')]",
+                  "format": "[parameters('modelFormat')]",
+                  "version": "[parameters('modelVersion')]"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "deploymentName": {
+              "type": "string",
+              "value": "[parameters('deploymentName')]"
+            },
+            "deploymentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('aiFoundryName'), parameters('deploymentName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'llmDeployment')]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('deployImageGenModels'), not(equals(parameters('IMAGEGEN_15_DEPLOYMENT'), '')))]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "imageGen15Deployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "deploymentName": {
+            "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+          },
+          "modelName": {
+            "value": "gpt-image-1.5"
+          },
+          "modelVersion": {
+            "value": "[parameters('imageGen15ModelVersion')]"
+          },
+          "skuCapacity": {
+            "value": 1
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "15133746539956234293"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "deploymentName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deployment name (used to reference the model in API calls)"
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model name (e.g., gpt-5.4, gpt-image-2, sora)"
+              }
+            },
+            "modelFormat": {
+              "type": "string",
+              "defaultValue": "OpenAI",
+              "metadata": {
+                "description": "Model format"
+              }
+            },
+            "modelVersion": {
+              "type": "string",
+              "metadata": {
+                "description": "Model version"
+              }
+            },
+            "skuName": {
+              "type": "string",
+              "defaultValue": "GlobalStandard",
+              "metadata": {
+                "description": "SKU name for the deployment"
+              }
+            },
+            "skuCapacity": {
+              "type": "int",
+              "defaultValue": 1,
+              "metadata": {
+                "description": "SKU capacity (throughput units)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('deploymentName'))]",
+              "sku": {
+                "capacity": "[parameters('skuCapacity')]",
+                "name": "[parameters('skuName')]"
+              },
+              "properties": {
+                "model": {
+                  "name": "[parameters('modelName')]",
+                  "format": "[parameters('modelFormat')]",
+                  "version": "[parameters('modelVersion')]"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "deploymentName": {
+              "type": "string",
+              "value": "[parameters('deploymentName')]"
+            },
+            "deploymentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('aiFoundryName'), parameters('deploymentName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'imageGenDeployment')]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('deployImageGenModels'), not(equals(parameters('IMAGEGEN_1_MINI_DEPLOYMENT'), '')))]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "imageGen1MiniDeployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "deploymentName": {
+            "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+          },
+          "modelName": {
+            "value": "gpt-image-1-mini"
+          },
+          "modelVersion": {
+            "value": "[parameters('imageGen1MiniModelVersion')]"
+          },
+          "skuCapacity": {
+            "value": 1
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "15133746539956234293"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "deploymentName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deployment name (used to reference the model in API calls)"
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model name (e.g., gpt-5.4, gpt-image-2, sora)"
+              }
+            },
+            "modelFormat": {
+              "type": "string",
+              "defaultValue": "OpenAI",
+              "metadata": {
+                "description": "Model format"
+              }
+            },
+            "modelVersion": {
+              "type": "string",
+              "metadata": {
+                "description": "Model version"
+              }
+            },
+            "skuName": {
+              "type": "string",
+              "defaultValue": "GlobalStandard",
+              "metadata": {
+                "description": "SKU name for the deployment"
+              }
+            },
+            "skuCapacity": {
+              "type": "int",
+              "defaultValue": 1,
+              "metadata": {
+                "description": "SKU capacity (throughput units)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('deploymentName'))]",
+              "sku": {
+                "capacity": "[parameters('skuCapacity')]",
+                "name": "[parameters('skuName')]"
+              },
+              "properties": {
+                "model": {
+                  "name": "[parameters('modelName')]",
+                  "format": "[parameters('modelFormat')]",
+                  "version": "[parameters('modelVersion')]"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "deploymentName": {
+              "type": "string",
+              "value": "[parameters('deploymentName')]"
+            },
+            "deploymentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('aiFoundryName'), parameters('deploymentName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'imageGen15Deployment')]"
+      ]
+    },
+    {
+      "condition": "[and(parameters('deploySoraModel'), not(equals(parameters('SORA_DEPLOYMENT'), '')))]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "soraDeployment",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "deploymentName": {
+            "value": "[parameters('SORA_DEPLOYMENT')]"
+          },
+          "modelName": {
+            "value": "sora-2"
+          },
+          "modelVersion": {
+            "value": "[parameters('soraModelVersion')]"
+          },
+          "skuCapacity": {
+            "value": 1
+          },
+          "skuName": {
+            "value": "GlobalStandard"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "15133746539956234293"
+            }
+          },
+          "parameters": {
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the parent AI Foundry resource"
+              }
+            },
+            "deploymentName": {
+              "type": "string",
+              "metadata": {
+                "description": "Deployment name (used to reference the model in API calls)"
+              }
+            },
+            "modelName": {
+              "type": "string",
+              "metadata": {
+                "description": "Model name (e.g., gpt-5.4, gpt-image-2, sora)"
+              }
+            },
+            "modelFormat": {
+              "type": "string",
+              "defaultValue": "OpenAI",
+              "metadata": {
+                "description": "Model format"
+              }
+            },
+            "modelVersion": {
+              "type": "string",
+              "metadata": {
+                "description": "Model version"
+              }
+            },
+            "skuName": {
+              "type": "string",
+              "defaultValue": "GlobalStandard",
+              "metadata": {
+                "description": "SKU name for the deployment"
+              }
+            },
+            "skuCapacity": {
+              "type": "int",
+              "defaultValue": 1,
+              "metadata": {
+                "description": "SKU capacity (throughput units)"
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.CognitiveServices/accounts/deployments",
+              "apiVersion": "2025-06-01",
+              "name": "[format('{0}/{1}', parameters('aiFoundryName'), parameters('deploymentName'))]",
+              "sku": {
+                "capacity": "[parameters('skuCapacity')]",
+                "name": "[parameters('skuName')]"
+              },
+              "properties": {
+                "model": {
+                  "name": "[parameters('modelName')]",
+                  "format": "[parameters('modelFormat')]",
+                  "version": "[parameters('modelVersion')]"
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "deploymentName": {
+              "type": "string",
+              "value": "[parameters('deploymentName')]"
+            },
+            "deploymentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('aiFoundryName'), parameters('deploymentName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'imageGen1MiniDeployment')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "containerAppEnvMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerAppEnvName": {
+            "value": "[parameters('containerAppEnvName')]"
+          },
+          "logAnalyticsWorkspaceName": {
+            "value": "[parameters('logAnalyticsWorkspaceName')]"
+          },
+          "subnetId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'vnetMod'), '2025-04-01').outputs.containerAppsSubnetId.value]"
+          },
+          "deployNew": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "9739343685095584472"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Location for all resources"
+              }
+            },
+            "containerAppEnvName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Container App Environment"
+              }
+            },
+            "logAnalyticsWorkspaceName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Log Analytics workspace"
+              }
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Whether to deploy new resources"
+              }
+            },
+            "subnetId": {
+              "type": "string",
+              "metadata": {
+                "description": "Subnet ID for VNet integration (required for private Cosmos DB access)"
+              }
+            }
+          },
+          "variables": {
+            "hasSubnetId": "[greater(length(parameters('subnetId')), 0)]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.OperationalInsights/workspaces",
+              "apiVersion": "2021-06-01",
+              "name": "[parameters('logAnalyticsWorkspaceName')]",
+              "location": "[parameters('location')]",
+              "properties": {}
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.App/managedEnvironments",
+              "apiVersion": "2023-05-01",
+              "name": "[parameters('containerAppEnvName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "appLogsConfiguration": {
+                  "destination": "log-analytics",
+                  "logAnalyticsConfiguration": {
+                    "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsWorkspaceName')), '2021-06-01').customerId]",
+                    "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsWorkspaceName')), '2021-06-01').primarySharedKey]"
+                  }
+                },
+                "vnetConfiguration": "[if(variables('hasSubnetId'), createObject('infrastructureSubnetId', parameters('subnetId'), 'internal', false()), null())]",
+                "zoneRedundant": false
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsWorkspaceName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "containerAppEnvId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppEnvName'))]"
+            },
+            "containerAppDefaultDomain": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.App/managedEnvironments', parameters('containerAppEnvName')), '2023-05-01').defaultDomain]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'vnetMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "containerAppBackend",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerAppName": {
+            "value": "[parameters('containerAppNameBackend')]"
+          },
+          "containerAppEnvId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod'), '2025-04-01').outputs.containerAppEnvId.value]"
+          },
+          "targetPort": {
+            "value": 80
+          },
+          "deployNew": {
+            "value": true
+          },
+          "AZURE_BLOB_SERVICE_URL": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value]"
+          },
+          "AZURE_STORAGE_ACCOUNT_NAME": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "AZURE_BLOB_IMAGE_CONTAINER": {
+            "value": "images"
+          },
+          "CDN_BLOB_URL": {
+            "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'frontDoorMod'), '2025-04-01').outputs.frontDoorEndpointHostName.value)]"
+          },
+          "DOCKER_IMAGE": {
+            "value": "[parameters('DOCKER_IMAGE_BACKEND')]"
+          },
+          "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryLoginServer.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_USERNAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryUsername.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryPassword.value]"
+          },
+          "AI_FOUNDRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryEndpoint.value]"
+          },
+          "LLM_DEPLOYMENT": {
+            "value": "[parameters('LLM_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_15_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_1_MINI_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+          },
+          "SORA_DEPLOYMENT": {
+            "value": "[parameters('SORA_DEPLOYMENT')]"
+          },
+          "FLUX_KONTEXT_DEPLOYMENT": {
+            "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+          },
+          "COSMOS_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.cosmosAccountEndpoint.value]"
+          },
+          "COSMOS_DATABASE_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.databaseName.value]"
+          },
+          "COSMOS_CONTAINER_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.containerName.value]"
+          },
+          "azdServiceName": {
+            "value": "backend"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "5428454923103479925"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "containerAppName": {
+              "type": "string"
+            },
+            "containerAppEnvId": {
+              "type": "string"
+            },
+            "DOCKER_IMAGE": {
+              "type": "string"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "azdServiceName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "customDomainName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "certificateId": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "enableAuth": {
+              "type": "bool",
+              "defaultValue": false
+            },
+            "authClientId": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "authClientSecret": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "authIssuer": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AI_FOUNDRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "LLM_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-5-4"
+            },
+            "IMAGEGEN_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-image-2"
+            },
+            "IMAGEGEN_15_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "IMAGEGEN_1_MINI_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "SORA_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "sora-2"
+            },
+            "FLUX_KONTEXT_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_BLOB_SERVICE_URL": {
+              "type": "string"
+            },
+            "AZURE_STORAGE_ACCOUNT_NAME": {
+              "type": "string"
+            },
+            "AZURE_BLOB_IMAGE_CONTAINER": {
+              "type": "string",
+              "defaultValue": "images"
+            },
+            "CDN_BLOB_URL": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "targetPort": {
+              "type": "int",
+              "defaultValue": 80
+            },
+            "API_PROTOCOL": {
+              "type": "string",
+              "defaultValue": "http"
+            },
+            "API_HOSTNAME": {
+              "type": "string",
+              "defaultValue": "localhost"
+            },
+            "API_PORT": {
+              "type": "string",
+              "defaultValue": "80"
+            },
+            "COSMOS_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_DATABASE_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_CONTAINER_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_USERNAME": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+              "type": "securestring",
+              "defaultValue": ""
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2024-03-01",
+              "name": "[parameters('containerAppName')]",
+              "location": "[parameters('location')]",
+              "tags": "[if(not(equals(parameters('azdServiceName'), '')), createObject('azd-service-name', parameters('azdServiceName')), createObject())]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "managedEnvironmentId": "[parameters('containerAppEnvId')]",
+                "configuration": {
+                  "ingress": {
+                    "external": true,
+                    "targetPort": "[parameters('targetPort')]",
+                    "transport": "Auto",
+                    "traffic": [
+                      {
+                        "weight": 100,
+                        "latestRevision": true
+                      }
+                    ],
+                    "customDomains": "[if(not(equals(parameters('customDomainName'), '')), createArray(createObject('name', parameters('customDomainName'), 'certificateId', parameters('certificateId'), 'bindingType', if(not(equals(parameters('certificateId'), '')), 'SniEnabled', 'Disabled'))), createArray())]"
+                  },
+                  "registries": "[if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('server', parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), 'username', parameters('AZURE_CONTAINER_REGISTRY_USERNAME'), 'passwordSecretRef', 'acr-password')), createArray())]",
+                  "secrets": "[concat(if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('name', 'acr-password', 'value', parameters('AZURE_CONTAINER_REGISTRY_PASSWORD'))), createArray()), if(parameters('enableAuth'), createArray(createObject('name', 'microsoft-provider-authentication-secret', 'value', parameters('authClientSecret'))), createArray()))]"
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "[parameters('containerAppName')]",
+                      "image": "[parameters('DOCKER_IMAGE')]",
+                      "resources": {
+                        "cpu": 1,
+                        "memory": "2Gi"
+                      },
+                      "probes": [
+                        {
+                          "type": "Readiness",
+                          "httpGet": {
+                            "path": "/",
+                            "port": "[parameters('targetPort')]",
+                            "scheme": "HTTP"
+                          },
+                          "initialDelaySeconds": 10,
+                          "periodSeconds": 10
+                        }
+                      ],
+                      "env": [
+                        {
+                          "name": "AI_FOUNDRY_ENDPOINT",
+                          "value": "[parameters('AI_FOUNDRY_ENDPOINT')]"
+                        },
+                        {
+                          "name": "LLM_DEPLOYMENT",
+                          "value": "[parameters('LLM_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_15_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_1_MINI_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "SORA_DEPLOYMENT",
+                          "value": "[parameters('SORA_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "FLUX_KONTEXT_DEPLOYMENT",
+                          "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_SERVICE_URL",
+                          "value": "[parameters('AZURE_BLOB_SERVICE_URL')]"
+                        },
+                        {
+                          "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                          "value": "[parameters('AZURE_STORAGE_ACCOUNT_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_IMAGE_CONTAINER",
+                          "value": "[parameters('AZURE_BLOB_IMAGE_CONTAINER')]"
+                        },
+                        {
+                          "name": "API_PROTOCOL",
+                          "value": "[parameters('API_PROTOCOL')]"
+                        },
+                        {
+                          "name": "API_HOSTNAME",
+                          "value": "[parameters('API_HOSTNAME')]"
+                        },
+                        {
+                          "name": "API_PORT",
+                          "value": "[parameters('API_PORT')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_PROTOCOL",
+                          "value": "[parameters('API_PROTOCOL')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_HOSTNAME",
+                          "value": "[parameters('API_HOSTNAME')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_PORT",
+                          "value": "[parameters('API_PORT')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ENDPOINT",
+                          "value": "[parameters('COSMOS_ENDPOINT')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ID",
+                          "value": "[parameters('COSMOS_DATABASE_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_CONTAINER_ID",
+                          "value": "[parameters('COSMOS_CONTAINER_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_CONTAINER_REGISTRY_ENDPOINT",
+                          "value": "[parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT')]"
+                        },
+                        {
+                          "name": "CDN_BLOB_URL",
+                          "value": "[parameters('CDN_BLOB_URL')]"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1
+                  }
+                }
+              }
+            },
+            {
+              "condition": "[and(parameters('deployNew'), parameters('enableAuth'))]",
+              "type": "Microsoft.App/containerApps/authConfigs",
+              "apiVersion": "2024-03-01",
+              "name": "[format('{0}/{1}', parameters('containerAppName'), 'current')]",
+              "properties": {
+                "platform": {
+                  "enabled": true
+                },
+                "globalValidation": {
+                  "unauthenticatedClientAction": "RedirectToLoginPage",
+                  "redirectToProvider": "azureactivedirectory",
+                  "excludedPaths": [
+                    "/manifest.json",
+                    "/sw.js",
+                    "/favicon.ico",
+                    "/_next/*"
+                  ]
+                },
+                "login": {
+                  "preserveUrlFragmentsForLogins": true
+                },
+                "identityProviders": {
+                  "azureActiveDirectory": {
+                    "registration": {
+                      "clientId": "[parameters('authClientId')]",
+                      "clientSecretSettingName": "microsoft-provider-authentication-secret",
+                      "openIdIssuer": "[parameters('authIssuer')]"
+                    },
+                    "validation": {
+                      "allowedAudiences": [
+                        "[format('api://{0}', parameters('authClientId'))]",
+                        "[parameters('authClientId')]"
+                      ]
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "containerAppId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+            },
+            "containerAppFqdn": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn]"
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'full').identity.principalId, '')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerRegistryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDbMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'frontDoorMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "containerAppFrontend",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerAppName": {
+            "value": "[parameters('containerAppNameFrontend')]"
+          },
+          "containerAppEnvId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod'), '2025-04-01').outputs.containerAppEnvId.value]"
+          },
+          "targetPort": {
+            "value": 3000
+          },
+          "deployNew": {
+            "value": true
+          },
+          "AZURE_BLOB_SERVICE_URL": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value]"
+          },
+          "AZURE_STORAGE_ACCOUNT_NAME": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "AZURE_BLOB_IMAGE_CONTAINER": {
+            "value": "images"
+          },
+          "CDN_BLOB_URL": {
+            "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'frontDoorMod'), '2025-04-01').outputs.frontDoorEndpointHostName.value)]"
+          },
+          "DOCKER_IMAGE": {
+            "value": "[parameters('DOCKER_IMAGE_FRONTEND')]"
+          },
+          "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryLoginServer.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_USERNAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryUsername.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryPassword.value]"
+          },
+          "AI_FOUNDRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryEndpoint.value]"
+          },
+          "LLM_DEPLOYMENT": {
+            "value": "[parameters('LLM_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_15_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_1_MINI_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+          },
+          "SORA_DEPLOYMENT": {
+            "value": "[parameters('SORA_DEPLOYMENT')]"
+          },
+          "FLUX_KONTEXT_DEPLOYMENT": {
+            "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+          },
+          "API_PROTOCOL": "[if(equals(parameters('API_PROTOCOL'), ''), createObject('value', 'https'), createObject('value', parameters('API_PROTOCOL')))]",
+          "API_PORT": "[if(equals(parameters('API_PORT'), ''), createObject('value', '443'), createObject('value', parameters('API_PORT')))]",
+          "API_HOSTNAME": "[if(equals(parameters('API_HOSTNAME'), ''), createObject('value', format('{0}.{1}', parameters('containerAppNameBackend'), reference(resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod'), '2025-04-01').outputs.containerAppDefaultDomain.value)), createObject('value', parameters('API_HOSTNAME')))]",
+          "enableAuth": {
+            "value": "[not(equals(parameters('AUTH_CLIENT_ID'), ''))]"
+          },
+          "authClientId": {
+            "value": "[parameters('AUTH_CLIENT_ID')]"
+          },
+          "authClientSecret": {
+            "value": "[parameters('AUTH_CLIENT_SECRET')]"
+          },
+          "authIssuer": {
+            "value": "[parameters('AUTH_ISSUER')]"
+          },
+          "customDomainName": {
+            "value": "[parameters('frontendCustomDomain')]"
+          },
+          "certificateId": {
+            "value": "[parameters('frontendCertificateId')]"
+          },
+          "azdServiceName": {
+            "value": "frontend"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "5428454923103479925"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "containerAppName": {
+              "type": "string"
+            },
+            "containerAppEnvId": {
+              "type": "string"
+            },
+            "DOCKER_IMAGE": {
+              "type": "string"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "azdServiceName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "customDomainName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "certificateId": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "enableAuth": {
+              "type": "bool",
+              "defaultValue": false
+            },
+            "authClientId": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "authClientSecret": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "authIssuer": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AI_FOUNDRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "LLM_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-5-4"
+            },
+            "IMAGEGEN_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-image-2"
+            },
+            "IMAGEGEN_15_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "IMAGEGEN_1_MINI_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "SORA_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "sora-2"
+            },
+            "FLUX_KONTEXT_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_BLOB_SERVICE_URL": {
+              "type": "string"
+            },
+            "AZURE_STORAGE_ACCOUNT_NAME": {
+              "type": "string"
+            },
+            "AZURE_BLOB_IMAGE_CONTAINER": {
+              "type": "string",
+              "defaultValue": "images"
+            },
+            "CDN_BLOB_URL": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "targetPort": {
+              "type": "int",
+              "defaultValue": 80
+            },
+            "API_PROTOCOL": {
+              "type": "string",
+              "defaultValue": "http"
+            },
+            "API_HOSTNAME": {
+              "type": "string",
+              "defaultValue": "localhost"
+            },
+            "API_PORT": {
+              "type": "string",
+              "defaultValue": "80"
+            },
+            "COSMOS_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_DATABASE_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_CONTAINER_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_USERNAME": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+              "type": "securestring",
+              "defaultValue": ""
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2024-03-01",
+              "name": "[parameters('containerAppName')]",
+              "location": "[parameters('location')]",
+              "tags": "[if(not(equals(parameters('azdServiceName'), '')), createObject('azd-service-name', parameters('azdServiceName')), createObject())]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "managedEnvironmentId": "[parameters('containerAppEnvId')]",
+                "configuration": {
+                  "ingress": {
+                    "external": true,
+                    "targetPort": "[parameters('targetPort')]",
+                    "transport": "Auto",
+                    "traffic": [
+                      {
+                        "weight": 100,
+                        "latestRevision": true
+                      }
+                    ],
+                    "customDomains": "[if(not(equals(parameters('customDomainName'), '')), createArray(createObject('name', parameters('customDomainName'), 'certificateId', parameters('certificateId'), 'bindingType', if(not(equals(parameters('certificateId'), '')), 'SniEnabled', 'Disabled'))), createArray())]"
+                  },
+                  "registries": "[if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('server', parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), 'username', parameters('AZURE_CONTAINER_REGISTRY_USERNAME'), 'passwordSecretRef', 'acr-password')), createArray())]",
+                  "secrets": "[concat(if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('name', 'acr-password', 'value', parameters('AZURE_CONTAINER_REGISTRY_PASSWORD'))), createArray()), if(parameters('enableAuth'), createArray(createObject('name', 'microsoft-provider-authentication-secret', 'value', parameters('authClientSecret'))), createArray()))]"
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "[parameters('containerAppName')]",
+                      "image": "[parameters('DOCKER_IMAGE')]",
+                      "resources": {
+                        "cpu": 1,
+                        "memory": "2Gi"
+                      },
+                      "probes": [
+                        {
+                          "type": "Readiness",
+                          "httpGet": {
+                            "path": "/",
+                            "port": "[parameters('targetPort')]",
+                            "scheme": "HTTP"
+                          },
+                          "initialDelaySeconds": 10,
+                          "periodSeconds": 10
+                        }
+                      ],
+                      "env": [
+                        {
+                          "name": "AI_FOUNDRY_ENDPOINT",
+                          "value": "[parameters('AI_FOUNDRY_ENDPOINT')]"
+                        },
+                        {
+                          "name": "LLM_DEPLOYMENT",
+                          "value": "[parameters('LLM_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_15_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_1_MINI_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "SORA_DEPLOYMENT",
+                          "value": "[parameters('SORA_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "FLUX_KONTEXT_DEPLOYMENT",
+                          "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_SERVICE_URL",
+                          "value": "[parameters('AZURE_BLOB_SERVICE_URL')]"
+                        },
+                        {
+                          "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                          "value": "[parameters('AZURE_STORAGE_ACCOUNT_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_IMAGE_CONTAINER",
+                          "value": "[parameters('AZURE_BLOB_IMAGE_CONTAINER')]"
+                        },
+                        {
+                          "name": "API_PROTOCOL",
+                          "value": "[parameters('API_PROTOCOL')]"
+                        },
+                        {
+                          "name": "API_HOSTNAME",
+                          "value": "[parameters('API_HOSTNAME')]"
+                        },
+                        {
+                          "name": "API_PORT",
+                          "value": "[parameters('API_PORT')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_PROTOCOL",
+                          "value": "[parameters('API_PROTOCOL')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_HOSTNAME",
+                          "value": "[parameters('API_HOSTNAME')]"
+                        },
+                        {
+                          "name": "NEXT_PUBLIC_API_PORT",
+                          "value": "[parameters('API_PORT')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ENDPOINT",
+                          "value": "[parameters('COSMOS_ENDPOINT')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ID",
+                          "value": "[parameters('COSMOS_DATABASE_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_CONTAINER_ID",
+                          "value": "[parameters('COSMOS_CONTAINER_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_CONTAINER_REGISTRY_ENDPOINT",
+                          "value": "[parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT')]"
+                        },
+                        {
+                          "name": "CDN_BLOB_URL",
+                          "value": "[parameters('CDN_BLOB_URL')]"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1
+                  }
+                }
+              }
+            },
+            {
+              "condition": "[and(parameters('deployNew'), parameters('enableAuth'))]",
+              "type": "Microsoft.App/containerApps/authConfigs",
+              "apiVersion": "2024-03-01",
+              "name": "[format('{0}/{1}', parameters('containerAppName'), 'current')]",
+              "properties": {
+                "platform": {
+                  "enabled": true
+                },
+                "globalValidation": {
+                  "unauthenticatedClientAction": "RedirectToLoginPage",
+                  "redirectToProvider": "azureactivedirectory",
+                  "excludedPaths": [
+                    "/manifest.json",
+                    "/sw.js",
+                    "/favicon.ico",
+                    "/_next/*"
+                  ]
+                },
+                "login": {
+                  "preserveUrlFragmentsForLogins": true
+                },
+                "identityProviders": {
+                  "azureActiveDirectory": {
+                    "registration": {
+                      "clientId": "[parameters('authClientId')]",
+                      "clientSecretSettingName": "microsoft-provider-authentication-secret",
+                      "openIdIssuer": "[parameters('authIssuer')]"
+                    },
+                    "validation": {
+                      "allowedAudiences": [
+                        "[format('api://{0}', parameters('authClientId'))]",
+                        "[parameters('authClientId')]"
+                      ]
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "containerAppId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+            },
+            "containerAppFqdn": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn]"
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'full').identity.principalId, '')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerRegistryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'frontDoorMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "cosmosRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "cosmosAccountName": {
+            "value": "[variables('cosmosAccountNamePrefixed')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppBackend'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          },
+          "dataContributorRoleId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.dataContributorRoleId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "16635995319012366928"
+            }
+          },
+          "parameters": {
+            "cosmosAccountName": {
+              "type": "string"
+            },
+            "containerAppPrincipalId": {
+              "type": "string"
+            },
+            "dataContributorRoleId": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}', parameters('cosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), parameters('containerAppPrincipalId'), 'container-app-assignment'))]",
+              "properties": {
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "roleDefinitionId": "[parameters('dataContributorRoleId')]",
+                "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName'))]"
+              }
+            }
+          ],
+          "outputs": {
+            "roleAssignmentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments', parameters('cosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), parameters('containerAppPrincipalId'), 'container-app-assignment'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppBackend')]",
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDbMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "aiFoundryRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryId.value]"
+          },
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppBackend'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "1455866470436997523"
+            }
+          },
+          "parameters": {
+            "aiFoundryId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the AI Foundry resource"
+              }
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the Container App managed identity"
+              }
+            },
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the AI Foundry resource"
+              }
+            }
+          },
+          "variables": {
+            "cognitiveServicesOpenAIUserRoleId": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.CognitiveServices/accounts/{0}', parameters('aiFoundryName'))]",
+              "name": "[guid(parameters('aiFoundryId'), parameters('containerAppPrincipalId'), variables('cognitiveServicesOpenAIUserRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('cognitiveServicesOpenAIUserRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            }
+          ],
+          "outputs": {
+            "roleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), 'Microsoft.Authorization/roleAssignments', guid(parameters('aiFoundryId'), parameters('containerAppPrincipalId'), variables('cognitiveServicesOpenAIUserRoleId')))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppBackend')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "storageRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "storageAccountName": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppBackend'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "7307478725998366282"
+            }
+          },
+          "parameters": {
+            "storageAccountName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Storage Account"
+              }
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the Container App managed identity"
+              }
+            }
+          },
+          "variables": {
+            "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+            "storageBlobDelegatorRoleId": "db58b8e5-c6ad-4a2a-8342-4190687cbf4a"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDataContributorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataContributorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDelegatorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDelegatorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            }
+          ],
+          "outputs": {
+            "blobContributorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDataContributorRoleId')))]"
+            },
+            "blobDelegatorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDelegatorRoleId')))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppBackend')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "AZURE_LOCATION": {
+      "type": "string",
+      "value": "[parameters('location')]"
+    },
+    "AZURE_CONTAINER_ENVIRONMENT_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod'), '2025-04-01').outputs.containerAppEnvId.value]"
+    },
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryLoginServer.value]"
+    },
+    "BACKEND_URI": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'containerAppBackend'), '2025-04-01').outputs.containerAppFqdn.value)]"
+    },
+    "BACKEND_INTERNAL_URI": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'containerAppBackend'), '2025-04-01').outputs.containerAppFqdn.value)]"
+    },
+    "FRONTEND_URI": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'containerAppFrontend'), '2025-04-01').outputs.containerAppFqdn.value)]"
+    },
+    "AZURE_STORAGE_ACCOUNT_NAME": {
+      "type": "string",
+      "value": "[parameters('storageAccountName')]"
+    },
+    "AZURE_BLOB_SERVICE_URL": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value]"
+    },
+    "AI_FOUNDRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryEndpoint.value]"
+    },
+    "AI_FOUNDRY_NAME": {
+      "type": "string",
+      "value": "[parameters('aiFoundryName')]"
+    },
+    "COSMOS_DB_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.cosmosAccountEndpoint.value]"
+    },
+    "COSMOS_DB_DATABASE_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.databaseName.value]"
+    },
+    "COSMOS_DB_CONTAINER_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.containerName.value]"
+    },
+    "CDN_BLOB_URL": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'frontDoorMod'), '2025-04-01').outputs.frontDoorEndpointHostName.value)]"
+    }
+  }
+}

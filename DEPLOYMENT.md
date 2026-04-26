@@ -31,7 +31,7 @@ This guide shows how to deploy the Visionary Lab to Azure using the Azure Develo
 
    - **AI_FOUNDRY_NAME**: Name for your AI Foundry resource (must be globally unique)
    - **AI_FOUNDRY_LOCATION**: Azure region for AI Foundry (default: `swedencentral`)
-   - **LLM_DEPLOYMENT**: LLM deployment name (default: `gpt-4o`)
+   - **LLM_DEPLOYMENT**: LLM deployment name (default: `gpt-5-4`)
    - **IMAGEGEN_DEPLOYMENT**: Image generation deployment name (default: `gpt-image-1-5`)
    - **SORA_DEPLOYMENT**: Video generation deployment name (default: `sora`)
 
@@ -62,7 +62,7 @@ azd env set AI_FOUNDRY_NAME "your-foundry-name"
 azd env set AI_FOUNDRY_LOCATION "swedencentral"
 
 # Model deployments (names must match what gets deployed)
-azd env set LLM_DEPLOYMENT "gpt-4o"
+azd env set LLM_DEPLOYMENT "gpt-5-4"
 azd env set IMAGEGEN_DEPLOYMENT "gpt-image-1-5"
 azd env set IMAGEGEN_15_DEPLOYMENT "gpt-image-1-5"
 azd env set IMAGEGEN_1_MINI_DEPLOYMENT "gpt-image-1-mini"

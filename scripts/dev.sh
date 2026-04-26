@@ -45,7 +45,7 @@ ensure_env() {
     "SORA_AOAI_API_KEY:Sora API key"
     "IMAGEGEN_AOAI_RESOURCE:Image generation resource name"
     "IMAGEGEN_DEPLOYMENT:Image generation deployment name (e.g. gpt-image-1)"
-    "IMAGEGEN_15_DEPLOYMENT:Image 1.5 deployment name (e.g. gpt-image-1.5)"
+    "IMAGEGEN_15_DEPLOYMENT:Legacy image deployment name (legacy, optional)"
     "IMAGEGEN_1_MINI_DEPLOYMENT:Image 1 Mini deployment name (e.g. gpt-image-1-mini)"
     "IMAGEGEN_AOAI_API_KEY:Image generation API key"
     "LLM_AOAI_RESOURCE:LLM resource name"

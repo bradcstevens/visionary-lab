@@ -102,7 +102,7 @@ class ImagePipelineService:
             if request.model == "gpt-image-1-mini":
                 raise HTTPException(
                     status_code=400,
-                    detail="gpt-image-1-mini does not support image editing. Please use gpt-image-1 or gpt-image-1.5 for image editing operations."
+                    detail="gpt-image-1-mini does not support image editing. Please use gpt-image-2 for image editing operations."
                 )
             
             # Import here to avoid circular dependencies
@@ -180,7 +180,7 @@ class ImagePipelineService:
         if model == "gpt-image-1-mini":
             raise HTTPException(
                 status_code=400,
-                detail="gpt-image-1-mini does not support image editing. Please use gpt-image-1 or gpt-image-1.5 for image editing operations."
+                detail="gpt-image-1-mini does not support image editing. Please use gpt-image-2 for image editing operations."
             )
 
         if input_fidelity not in ["low", "high"]:

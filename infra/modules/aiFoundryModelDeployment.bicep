@@ -6,7 +6,7 @@ param aiFoundryName string
 @description('Deployment name (used to reference the model in API calls)')
 param deploymentName string
 
-@description('Model name (e.g., gpt-4o, gpt-image-1.5, sora)')
+@description('Model name (e.g., gpt-5.4, gpt-image-2, sora)')
 param modelName string
 
 @description('Model format')

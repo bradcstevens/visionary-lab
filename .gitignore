@@ -183,3 +183,9 @@ notebooks/video-generations/
 frontend/lighthouse-report.html
 scripts/allow-local-access.sh
 .agents
+# Playwright
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
+frontend/playwright/.cache/
+.superpowers/

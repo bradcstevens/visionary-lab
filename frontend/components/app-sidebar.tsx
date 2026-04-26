@@ -1,6 +1,6 @@
 "use client"
 
-import { FileVideo, List, ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDown, Pencil, CirclePlay, Loader2, Search } from "lucide-react"
+import { FileVideo, List, ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDown, Pencil, CirclePlay, Loader2, Search, FolderKanban } from "lucide-react"
 import Link from 'next/link';
 import Image from 'next/image';
 import { useTheme } from "next-themes";
@@ -45,6 +45,12 @@ const createItems = [
     url: "/edit-image",
     icon: Pencil,
     description: "Edit and enhance existing images"
+  },
+  {
+    title: "Projects",
+    url: "/projects",
+    icon: FolderKanban,
+    description: "Virtual staging projects"
   },
   {
     title: "Analyze",

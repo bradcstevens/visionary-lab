@@ -566,6 +566,11 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
       return tempId;
     } catch (error) {
       console.error("Error adding to queue:", error);
+      toast.error("Failed to create video generation job", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+      // Remove the optimistic queue item so the UI doesn't show a stuck job
+      setQueueItems(prev => prev.filter(item => item.id !== tempId));
       return "";
     }
   };

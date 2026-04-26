@@ -18,11 +18,11 @@ param authIssuer string = ''
 // AI Foundry endpoint (unified for all AI services)
 param AI_FOUNDRY_ENDPOINT string = ''
 // Model deployment names
-param LLM_DEPLOYMENT string = 'gpt-4o'
-param IMAGEGEN_DEPLOYMENT string = 'gpt-image-1-5'
+param LLM_DEPLOYMENT string = 'gpt-5-4'
+param IMAGEGEN_DEPLOYMENT string = 'gpt-image-2'
 param IMAGEGEN_15_DEPLOYMENT string = ''
 param IMAGEGEN_1_MINI_DEPLOYMENT string = ''
-param SORA_DEPLOYMENT string = 'sora'
+param SORA_DEPLOYMENT string = 'sora-2'
 param FLUX_KONTEXT_DEPLOYMENT string = ''
 
 // Azure Blob Storage (managed identity — no keys)

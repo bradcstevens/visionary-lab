@@ -345,7 +345,7 @@ export function ImageCreationContainer({ className = "", onImagesSaved }: ImageC
     outputFormat: string = "png",
     background: string = "auto",
     imageSize: string,
-    model: string = "gpt-image-1.5",
+    model: string = "gpt-image-2",
     preAnalysisResults?: ImageAnalysis[] 
   ) => {
     try {
