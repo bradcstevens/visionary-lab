@@ -224,8 +224,28 @@ async def regenerate_room(
         v.image_url = None
         v.error = None
 
+    # Compute brief prompts if design brief exists
+    brief_prompts = None
+    if project.design_brief:
+        from backend.core.brief_generator import BriefGeneratorService
+        from backend.core import async_llm_client
+        from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+
+        brief = DBModel(**project.design_brief)
+        analyses = [ImageAnalysis(**a) for a in (project.analyses or [])]
+        if analyses:
+            brief_service = BriefGeneratorService(
+                async_llm_client=async_llm_client,
+                llm_deployment=settings.LLM_DEPLOYMENT,
+            )
+            brief_prompts = await brief_service.brief_to_prompts(
+                brief=brief,
+                image_analyses=analyses,
+                n_variations=project.settings.variations_per_room,
+            )
+
     async def event_stream():
-        async for event in pipeline.process_room(project, room, brief_prompts=None):
+        async for event in pipeline.process_room(project, room, brief_prompts=brief_prompts):
             yield _sse_event(event["type"], event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -277,10 +297,13 @@ async def analyze_project_images(
 
     analyses = await asyncio.gather(*[analyze_one(r) for r in rooms], return_exceptions=True)
     valid_analyses = [a for a in analyses if isinstance(a, dict)]
+    failed_count = len(analyses) - len(valid_analyses)
+    if failed_count > 0:
+        logger.warning(f"analyze_project_images: {failed_count}/{len(analyses)} image analyses failed")
 
     storage.update_project(project_id, {"analyses": valid_analyses})
 
-    return {"analyses": valid_analyses}
+    return {"analyses": valid_analyses, "failed_count": failed_count if failed_count > 0 else 0}
 
 
 @router.post("/projects/{project_id}/chat", response_model=ChatResponse)

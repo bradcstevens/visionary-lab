@@ -165,6 +165,7 @@ class BriefGeneratorService:
                     logger.warning(f"Prompt generation attempt {attempt + 1} for {analysis.room_id} failed")
                     continue
             else:
+                logger.warning(f"All prompt generation attempts failed for image {analysis.room_id}, using global instructions as fallback")
                 result[analysis.room_id] = [brief.global_instructions] * n_variations
 
         return result
