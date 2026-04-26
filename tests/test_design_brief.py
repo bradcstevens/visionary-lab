@@ -189,3 +189,13 @@ async def test_brief_to_prompts_produces_specific_prompts():
     assert "r1" in prompts
     assert len(prompts["r1"]) == 2
     assert any("Vanderwolf" in p or "silvery" in p.lower() for p in prompts["r1"])
+
+
+def test_outdoor_prompt_template_detects_landscape_context():
+    from backend.core.staging_pipeline import build_adaptation_template
+
+    template = build_adaptation_template(
+        room_analysis="A backyard with wooden fence, turf, and patio",
+        is_outdoor=True,
+    )
+    assert "landscape" in template.lower() or "outdoor" in template.lower()

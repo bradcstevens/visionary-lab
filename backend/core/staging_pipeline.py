@@ -19,19 +19,47 @@ from backend.models.staging import ItemStatus, ProjectStatus, Room, StagingProje
 
 logger = logging.getLogger(__name__)
 
-PROMPT_ADAPTATION_TEMPLATE = """You are a virtual staging assistant. The user wants to visualize decorating ideas for their space.
+INDOOR_PROMPT_TEMPLATE = """You are a virtual staging assistant. The user wants to visualize decorating ideas for their space.
 
 ROOM ANALYSIS: {room_analysis}
 USER'S STYLE DIRECTION: {user_prompt}
 
 Generate {n} distinct variation prompts for an image editing model. Each prompt should:
-- ADD items to the existing scene (furniture, decor, plants, landscaping)
+- ADD items to the existing scene (furniture, decor, plants)
 - NOT remove or replace existing structures visible in the analysis
 - Interpret the user's style direction differently in each variation
 - Be specific about what to add and where to place it
 - Reference the existing room features from the analysis
 
 Return ONLY a JSON array of {n} strings. No other text."""
+
+OUTDOOR_PROMPT_TEMPLATE = """You are a landscape visualization assistant. The user wants to visualize landscaping and outdoor design ideas.
+
+SCENE ANALYSIS: {room_analysis}
+USER'S DESIGN DIRECTION: {user_prompt}
+
+Generate {n} distinct variation prompts for an image editing model. Each prompt should:
+- ADD plants, trees, shrubs, hardscaping, or outdoor elements to the existing scene
+- NOT remove or replace existing structures (patios, fences, pergolas, fire pits)
+- Specify plant species with visual characteristics (leaf color, form, texture, size)
+- Describe placement using landscape terms (back row, border, along fence, flanking)
+- Interpret the design direction differently in each variation
+- Reference the existing outdoor features from the analysis
+
+Return ONLY a JSON array of {n} strings. No other text."""
+
+OUTDOOR_KEYWORDS = {"backyard", "fence", "patio", "pergola", "turf", "lawn", "garden",
+                     "yard", "outdoor", "landscape", "deck", "driveway", "tree", "shrub"}
+
+
+def build_adaptation_template(room_analysis: str, is_outdoor: bool = False) -> str:
+    """Return the appropriate prompt template based on context."""
+    if is_outdoor:
+        return OUTDOOR_PROMPT_TEMPLATE
+    analysis_lower = room_analysis.lower()
+    if any(kw in analysis_lower for kw in OUTDOOR_KEYWORDS):
+        return OUTDOOR_PROMPT_TEMPLATE
+    return INDOOR_PROMPT_TEMPLATE
 
 
 class StagingPipeline:
@@ -71,7 +99,8 @@ class StagingPipeline:
         self, user_prompt: str, room_analysis: str, n_variations: int,
     ) -> List[str]:
         """Use LLM to create n distinct variation prompts for this room."""
-        system_content = PROMPT_ADAPTATION_TEMPLATE.format(
+        template = build_adaptation_template(room_analysis)
+        system_content = template.format(
             room_analysis=room_analysis,
             user_prompt=user_prompt,
             n=n_variations,
