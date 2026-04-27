@@ -3,9 +3,16 @@
 import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2 } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2, MoreHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { getProject, deleteProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
@@ -189,27 +196,50 @@ export default function ProjectDetailPage() {
             )}
           </div>
 
-          <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={handleAddRooms} disabled={isGenerating}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Rooms
-            </Button>
-            {!allPending && (
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Primary action — most common action gets the prominent button */}
+            {allPending && project.rooms.length > 0 ? (
+              <Button onClick={startGeneration} disabled={isGenerating}>
+                {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
+                Generate
+              </Button>
+            ) : !allPending ? (
               <Button variant="outline" onClick={handleRegenerateAll} disabled={isGenerating}>
                 {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
                 Regenerate All
               </Button>
-            )}
-            <Button
-              variant="outline"
-              size="icon"
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              onClick={() => setShowDeleteConfirm(true)}
-              disabled={isGenerating || isDeleting}
-              title="Delete project"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            ) : null}
+
+            {/* Overflow menu — secondary and destructive actions */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon" disabled={isGenerating || isDeleting}>
+                  <MoreHorizontal className="h-4 w-4" />
+                  <span className="sr-only">More actions</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={handleAddRooms} disabled={isGenerating}>
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add more images
+                </DropdownMenuItem>
+                {!allPending && (
+                  <DropdownMenuItem onClick={handleRegenerateAll} disabled={isGenerating}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Regenerate all
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="text-destructive focus:text-destructive"
+                  onClick={() => setShowDeleteConfirm(true)}
+                  disabled={isGenerating || isDeleting}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete project
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </div>

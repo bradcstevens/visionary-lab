@@ -91,7 +91,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
       )}
 
       {/* Room Grid */}
-      <div className="grid grid-cols-6 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
         {/* Original Image */}
         <div className="relative">
           <div className="aspect-square w-full min-h-[120px] relative">
