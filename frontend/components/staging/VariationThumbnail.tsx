@@ -56,23 +56,26 @@ export function VariationThumbnail({
       case 'failed':
         return (
           <div className="w-full h-full bg-destructive/10 rounded-lg flex items-center justify-center border-2 border-destructive/20">
-            <div className="flex flex-col items-center gap-2">
-              <AlertCircle className="h-6 w-6 text-destructive" />
+            <div className="flex flex-col items-center gap-1.5 p-2">
+              <AlertCircle className="h-5 w-5 text-destructive" />
               <Badge variant="destructive" className="text-xs">
                 {index + 1}
               </Badge>
+              <span className="text-[10px] text-destructive/80 text-center leading-tight max-w-[90%] line-clamp-2">
+                {error || "Generation failed"}
+              </span>
               {onRetry && (
                 <Button
                   size="sm"
                   variant="ghost"
-                  className="h-6 w-6 p-0 hover:bg-destructive/20"
+                  className="h-7 px-2 text-xs hover:bg-destructive/20 mt-0.5"
                   onClick={(e) => {
                     e.stopPropagation();
                     onRetry();
                   }}
-                  title={error || "Retry generation"}
                 >
-                  <RefreshCw className="h-3 w-3" />
+                  <RefreshCw className="h-3 w-3 mr-1" />
+                  Retry
                 </Button>
               )}
             </div>
@@ -83,9 +86,14 @@ export function VariationThumbnail({
       default:
         return (
           <div className="w-full h-full bg-muted/50 rounded-lg border-2 border-dashed border-muted-foreground/30 flex items-center justify-center">
-            <Badge variant="outline" className="text-xs bg-background">
-              {index + 1}
-            </Badge>
+            <div className="flex flex-col items-center gap-1.5 p-2">
+              <Badge variant="outline" className="text-xs bg-background">
+                {index + 1}
+              </Badge>
+              <span className="text-[10px] text-muted-foreground text-center leading-tight">
+                Awaiting generation
+              </span>
+            </div>
           </div>
         );
     }

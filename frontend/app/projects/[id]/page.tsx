@@ -3,8 +3,9 @@
 import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Plus, RefreshCw, Loader2 } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { getProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
@@ -18,7 +19,8 @@ export default function ProjectDetailPage() {
 
   const [project, setProject] = useState<StagingProject | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generationError, setGenerationError] = useState<string | null>(null);
 
   useEffect(() => {
     if (projectId) {
@@ -26,33 +28,33 @@ export default function ProjectDetailPage() {
     }
   }, [projectId]);
 
+  const resolveImageUrls = async (data: StagingProject) => {
+    try {
+      const tokens = await sasTokenService.getTokens();
+      for (const room of data.rooms) {
+        if (room.original_image_url && !room.original_image_url.includes('?')) {
+          room.original_image_url = `${room.original_image_url}?${tokens.imageSasToken}`;
+        }
+        for (const variation of room.variations) {
+          if (variation.image_url && !variation.image_url.includes('?')) {
+            variation.image_url = `${variation.image_url}?${tokens.imageSasToken}`;
+          }
+        }
+      }
+    } catch (sasError) {
+      console.warn('Failed to get SAS tokens, images may not load:', sasError);
+    }
+  };
+
   const loadProject = async () => {
     try {
       setIsLoading(true);
       const data = await getProject(projectId);
-
-      // Resolve blob URLs with SAS tokens so <img> tags can load them
-      try {
-        const tokens = await sasTokenService.getTokens();
-        for (const room of data.rooms) {
-          if (room.original_image_url && !room.original_image_url.includes('?')) {
-            room.original_image_url = `${room.original_image_url}?${tokens.imageSasToken}`;
-          }
-          for (const variation of room.variations) {
-            if (variation.image_url && !variation.image_url.includes('?')) {
-              variation.image_url = `${variation.image_url}?${tokens.imageSasToken}`;
-            }
-          }
-        }
-      } catch (sasError) {
-        console.warn('Failed to get SAS tokens, images may not load:', sasError);
-      }
-
+      await resolveImageUrls(data);
       setProject(data);
 
-      // Start streaming if project is processing
       if (data.status === 'processing') {
-        startStreaming();
+        startGeneration();
       }
     } catch (error) {
       console.error('Failed to load project:', error);
@@ -63,76 +65,69 @@ export default function ProjectDetailPage() {
     }
   };
 
-  const startStreaming = () => {
-    if (isStreaming) return;
-
-    setIsStreaming(true);
-    const cleanup = streamGeneration(projectId, handleStreamEvent);
-
-    // Cleanup function will be called when component unmounts
-    return cleanup;
-  };
-
   const handleStreamEvent = (event: StagingStreamEvent) => {
-    console.log('Stream event:', event);
-
     switch (event.type) {
       case 'variation_completed':
       case 'variation_failed':
       case 'room_uploaded':
-        // Refresh project data to get latest state
         loadProject();
         break;
-
       case 'project_completed':
-        setIsStreaming(false);
-        toast.success('Project generation completed!');
+        setIsGenerating(false);
+        setGenerationError(null);
+        toast.success('Generation completed!');
         loadProject();
         break;
-
       case 'error':
-        setIsStreaming(false);
+        setIsGenerating(false);
+        setGenerationError(event.error || 'Generation failed');
         toast.error(event.error || 'Generation failed');
-        break;
-
-      default:
+        loadProject();
         break;
     }
+  };
+
+  const startGeneration = () => {
+    if (isGenerating) return;
+    setIsGenerating(true);
+    setGenerationError(null);
+    streamGeneration(projectId, handleStreamEvent);
+  };
+
+  const handleRegenerateRoom = (room: Room) => {
+    if (isGenerating) return;
+    setIsGenerating(true);
+    setGenerationError(null);
+    toast.info(`Regenerating ${room.label}...`);
+    streamRoomRegeneration(projectId, room.id, handleStreamEvent);
+  };
+
+  const handleRegenerateAll = () => {
+    if (isGenerating) return;
+    startGeneration();
+    toast.info('Regenerating all rooms...');
   };
 
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
     if (variation.status === 'completed' && variation.image_url) {
-      // Open image in a modal or new tab
       window.open(variation.image_url, '_blank');
     }
   };
 
-  const handleRetryVariation = async (room: Room, variationIndex: number) => {
-    try {
-      toast.info('Retrying variation generation...');
-      // Start room regeneration stream
-      const cleanup = streamRoomRegeneration(projectId, room.id, handleStreamEvent);
-      
-      // Cleanup after some time or when component unmounts
-      setTimeout(() => {
-        if (cleanup) cleanup();
-      }, 30000);
-    } catch (error) {
-      console.error('Failed to retry variation:', error);
-      toast.error('Failed to retry variation');
-    }
+  const handleRetryVariation = (room: Room, _variationIndex: number) => {
+    handleRegenerateRoom(room);
   };
 
   const handleAddRooms = () => {
-    // Navigate to add rooms page (could be implemented later)
     toast.info('Add rooms feature coming soon');
   };
 
-  const handleRegenerateAll = () => {
-    // Start regeneration for all rooms
-    toast.info('Regenerate all feature coming soon');
-  };
+  // Computed state
+  const allPending = project?.rooms.every(r => r.status === 'pending') ?? false;
+  const hasFailed = project?.rooms.some(r => r.status === 'failed' || r.variations.some(v => v.status === 'failed')) ?? false;
+  const totalVariations = project?.rooms.reduce((sum, r) => sum + r.variations.length, 0) ?? 0;
+  const completedVariations = project?.rooms.reduce((sum, r) => sum + r.variations.filter(v => v.status === 'completed').length, 0) ?? 0;
 
   if (isLoading || !project) {
     return (
@@ -162,26 +157,83 @@ export default function ProjectDetailPage() {
 
         <div className="flex items-start justify-between">
           <div className="space-y-2">
-            <h1 className="text-3xl font-bold">{project.name}</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-3xl font-bold">{project.name}</h1>
+              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : 'outline'} className="text-xs">
+                {project.status}
+              </Badge>
+            </div>
             <p className="text-muted-foreground leading-relaxed max-w-3xl">
               {project.prompt}
             </p>
+            {totalVariations > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {completedVariations}/{totalVariations} variations complete across {project.rooms.length} images
+              </p>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={handleAddRooms}>
+            <Button variant="outline" onClick={handleAddRooms} disabled={isGenerating}>
               <Plus className="h-4 w-4 mr-2" />
               Add Rooms
             </Button>
-            <Button variant="outline" onClick={handleRegenerateAll}>
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Regenerate All
-            </Button>
+            {!allPending && (
+              <Button variant="outline" onClick={handleRegenerateAll} disabled={isGenerating}>
+                {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                Regenerate All
+              </Button>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Progress Tracker (only visible if processing) */}
+      {/* Generation error banner */}
+      {generationError && (
+        <div className="flex items-center gap-3 p-4 bg-destructive/10 border border-destructive/20 rounded-lg">
+          <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-destructive">Generation encountered an error</p>
+            <p className="text-xs text-destructive/80 mt-0.5">{generationError}</p>
+          </div>
+          <Button size="sm" variant="outline" onClick={handleRegenerateAll}>
+            <RefreshCw className="h-3.5 w-3.5 mr-1" />
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {/* Call-to-action for pending projects */}
+      {allPending && project.rooms.length > 0 && !isGenerating && (
+        <div className="flex flex-col items-center gap-4 py-8 px-6 bg-muted/30 border border-dashed border-muted-foreground/25 rounded-xl">
+          <div className="text-center space-y-2">
+            <h3 className="text-lg font-semibold">Ready to generate</h3>
+            <p className="text-sm text-muted-foreground max-w-md">
+              {project.rooms.length} image{project.rooms.length !== 1 ? 's' : ''} uploaded with {totalVariations} variations queued. 
+              Click generate to start the AI image generation pipeline.
+            </p>
+          </div>
+          <Button size="lg" onClick={startGeneration}>
+            <Play className="h-4 w-4 mr-2" />
+            Generate {totalVariations} Variations
+          </Button>
+        </div>
+      )}
+
+      {/* Generating progress */}
+      {isGenerating && (
+        <div className="flex items-center gap-3 p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+          <Loader2 className="h-5 w-5 animate-spin text-blue-500 flex-shrink-0" />
+          <div>
+            <p className="text-sm font-medium">Generating variations...</p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {completedVariations}/{totalVariations} complete — this may take a few minutes per image
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Progress Tracker */}
       <ProgressTracker project={project} />
 
       {/* Room Groups */}
@@ -206,6 +258,8 @@ export default function ProjectDetailPage() {
               room={room}
               onVariationClick={handleVariationClick}
               onRetryVariation={handleRetryVariation}
+              onRegenerateRoom={handleRegenerateRoom}
+              isGenerating={isGenerating}
             />
           ))
         )}
