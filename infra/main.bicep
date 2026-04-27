@@ -91,7 +91,7 @@ param frontendCustomDomain string = ''
 param frontendCertificateId string = ''
 
 // Parameters for Cosmos DB
-param cosmosAccountName string = 'visionary-lab-cosmos'
+param cosmosAccountName string = 'cosmos-${environmentName}'
 param cosmosDatabaseName string = 'VisionaryLabDB'
 param cosmosContainerName string = 'visionarylab'
 
