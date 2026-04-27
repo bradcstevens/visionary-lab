@@ -29,7 +29,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation }: RoomGrou
     <div className="space-y-4">
       {/* Room Header */}
       <div className="flex items-center gap-3">
-        <h3 className="text-lg font-semibold">{room.name}</h3>
+        <h3 className="text-lg font-semibold">{room.label}</h3>
         <Badge variant={getStatusVariant(room.status)} className="text-xs">
           {room.status}
         </Badge>
@@ -42,7 +42,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation }: RoomGrou
           <div className="aspect-square w-full min-h-[120px] relative">
             <img 
               src={room.original_image_url} 
-              alt={`${room.name} original`}
+              alt={`${room.label} original`}
               className="w-full h-full object-cover rounded-lg border-2 border-amber-400"
             />
             <Badge 

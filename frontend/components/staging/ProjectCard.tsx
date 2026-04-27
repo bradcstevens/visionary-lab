@@ -48,7 +48,7 @@ export function ProjectCard({ project }: ProjectCardProps) {
               <div key={room.id} className="aspect-square relative">
                 <img
                   src={room.original_image_url}
-                  alt={`${room.name} preview`}
+                  alt={`${room.label} preview`}
                   className="w-full h-full object-cover rounded-md bg-muted"
                 />
                 {/* Show a small indicator if room has completed variations */}

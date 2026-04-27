@@ -57,25 +57,25 @@ export interface Variation {
 
 export interface Room {
   id: string;
-  name: string;
+  label: string;
   original_image_url: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   variations: Variation[];
-  created_at: string;
-  updated_at: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface StagingProject {
   id: string;
   name: string;
   prompt: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  status: 'uploading' | 'processing' | 'completed' | 'failed';
   settings: StagingSettings;
   rooms: Room[];
-  created_at: string;
-  updated_at: string;
-  total_variations: number;
-  completed_variations: number;
+  created_at?: string;
+  updated_at?: string;
+  total_variations?: number;
+  completed_variations?: number;
 }
 
 export interface CreateProjectRequest {

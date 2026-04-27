@@ -66,7 +66,7 @@ export function ProgressTracker({ project }: ProgressTrackerProps) {
             return (
               <div key={room.id} className="flex items-center gap-2">
                 <Badge variant={getRoomStatusVariant(room.status)} className="text-xs">
-                  {room.name}
+                  {room.label}
                 </Badge>
                 <span className="text-xs text-muted-foreground">
                   {roomCompletedVariations}/{roomTotalVariations}
