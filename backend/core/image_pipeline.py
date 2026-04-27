@@ -895,7 +895,14 @@ class ImagePipelineService:
         if request.source_image_urls:
             images.extend([str(url) for url in request.source_image_urls])
         if request.source_image_base64:
-            images.extend(request.source_image_base64)
+            import base64 as b64
+            import tempfile
+            for idx, b64_data in enumerate(request.source_image_base64):
+                raw_bytes = b64.b64decode(b64_data)
+                temp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+                with os.fdopen(temp_fd, "wb") as f:
+                    f.write(raw_bytes)
+                images.append(temp_path)
         if not images:
             raise HTTPException(
                 status_code=400,
