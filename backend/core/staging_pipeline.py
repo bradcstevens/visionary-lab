@@ -181,6 +181,7 @@ class StagingPipeline:
                             quality=project.settings.quality,
                             response_format="b64_json",
                             output_format="png",
+                            source_image_base64=[image_b64],
                             save_options=PipelineSaveOptions(
                                 enabled=True,
                                 folder_path=f"staging/{project.id}/variations/{room.id}",
