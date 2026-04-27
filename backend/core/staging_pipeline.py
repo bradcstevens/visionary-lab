@@ -138,7 +138,7 @@ class StagingPipeline:
 
             try:
                 image_bytes = await self.blob_service.get_asset_content(
-                    blob_name=room.original_image_url.split("/")[-2] + "/" + room.original_image_url.split("/")[-1],
+                    blob_name=self._extract_blob_name(room.original_image_url),
                     container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
                 )
                 image_b64 = base64.b64encode(image_bytes).decode("utf-8") if isinstance(image_bytes, bytes) else image_bytes
@@ -259,6 +259,27 @@ class StagingPipeline:
         project.status = ProjectStatus.COMPLETED if all_completed else ProjectStatus.FAILED
         self.storage_service.update_project(project.id, project.dict())
         yield {"type": "project_completed", "status": project.status}
+
+    @staticmethod
+    def _extract_blob_name(blob_url: str) -> str:
+        """Extract blob name from a full Azure Blob Storage URL.
+
+        Input:  https://account.blob.core.windows.net/images/staging/proj/originals/file.png
+        Output: staging/proj/originals/file.png
+        """
+        # Find the container name segment and return everything after it
+        parts = blob_url.split("/")
+        try:
+            # URL format: https://account.blob.core.windows.net/{container}/{blob_path...}
+            # The container is at index 3 (after protocol, empty, host)
+            net_idx = next(i for i, p in enumerate(parts) if p.endswith(".net"))
+            return "/".join(parts[net_idx + 2:])  # skip container name
+        except (StopIteration, IndexError):
+            # Fallback: assume the last 2+ segments after /images/ or /videos/
+            for container in ("images", "videos"):
+                if f"/{container}/" in blob_url:
+                    return blob_url.split(f"/{container}/")[1]
+            return "/".join(parts[-2:])
 
     def _update_room_in_project(self, project: StagingProject, room: Room):
         """Persist room updates to Cosmos DB."""

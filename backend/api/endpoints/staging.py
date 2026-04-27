@@ -305,7 +305,13 @@ async def analyze_project_images(
 
     async def analyze_one(room: dict) -> dict:
         url = room["original_image_url"]
-        blob_name = "/".join(url.split("/")[-2:])
+        # Extract blob name: everything after the container name in the URL
+        for container in ("images", "videos"):
+            if f"/{container}/" in url:
+                blob_name = url.split(f"/{container}/")[1]
+                break
+        else:
+            blob_name = "/".join(url.split("/")[-2:])
         image_bytes = await blob_service.get_asset_content(
             blob_name=blob_name,
             container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
