@@ -1,11 +1,29 @@
 # Agents
 
-Before any action, check available skills via the skill tool and follow them.
+## Skills & Documentation
 
-Always say when you are searching for a skill to use.
+- Check available skills before any action. Announce which skill you are using.
+- Use `microsoft-docs` and Azure-related skills for latest Microsoft best practices.
+- Use Context7 MCP for library/repo documentation before falling back to web search.
 
-Always say when you are using a skill.
+## Local Testing (Required Before Every Commit)
 
-Always check the latest Microsoft Documentation and best practices to ensure you have the latest information by using the microsoft-docs, and all other azure related skills available to you.
+Run the full test suite locally after every feature or component change:
 
-Use the context7 MCP to streamline any other documentation or github repository for any web searches first before using a search engine.
+- **Backend:** `uv run pytest tests/ --ignore=tests/integration -v`
+- **Frontend:** `cd frontend && npx playwright test`
+- **Build:** `cd frontend && npm run build`
+- **Lint:** `cd frontend && npx next lint`
+
+Playwright reports must include screenshots, multi-browser coverage, and pass/fail results. Save reports to `tests/playwright/<YYYY-MM-DD-HHMMSS>/`.
+
+Only commit and push when all local tests pass.
+
+## CI/CD (Triggered on Push)
+
+GitHub Actions runs on every push and must:
+
+1. Deploy via `azd up`
+2. Run full Playwright E2E suite against the deployed environment (using `tests/projects/` scenario data)
+3. Tear down all resources if any step fails
+4. Tear down after all tests pass on success
