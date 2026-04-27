@@ -7,6 +7,7 @@ import { Plus, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ProjectCard } from "@/components/staging/ProjectCard";
 import { listProjects, StagingProject } from "@/services/stagingApi";
+import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 
 function ProjectsList() {
@@ -22,7 +23,23 @@ function ProjectsList() {
     try {
       setIsLoading(true);
       const data = await listProjects();
-      setProjects(Array.isArray(data) ? data : []);
+      const projectList = Array.isArray(data) ? data : [];
+
+      // Resolve blob URLs with SAS tokens
+      try {
+        const tokens = await sasTokenService.getTokens();
+        for (const project of projectList) {
+          for (const room of project.rooms) {
+            if (room.original_image_url && !room.original_image_url.includes('?')) {
+              room.original_image_url = `${room.original_image_url}?${tokens.imageSasToken}`;
+            }
+          }
+        }
+      } catch (sasError) {
+        console.warn('Failed to get SAS tokens for project list:', sasError);
+      }
+
+      setProjects(projectList);
     } catch (error) {
       console.error('Failed to load projects:', error);
       toast.error('Failed to load projects');

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { getProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 
 export default function ProjectDetailPage() {
@@ -29,6 +30,24 @@ export default function ProjectDetailPage() {
     try {
       setIsLoading(true);
       const data = await getProject(projectId);
+
+      // Resolve blob URLs with SAS tokens so <img> tags can load them
+      try {
+        const tokens = await sasTokenService.getTokens();
+        for (const room of data.rooms) {
+          if (room.original_image_url && !room.original_image_url.includes('?')) {
+            room.original_image_url = `${room.original_image_url}?${tokens.imageSasToken}`;
+          }
+          for (const variation of room.variations) {
+            if (variation.image_url && !variation.image_url.includes('?')) {
+              variation.image_url = `${variation.image_url}?${tokens.imageSasToken}`;
+            }
+          }
+        }
+      } catch (sasError) {
+        console.warn('Failed to get SAS tokens, images may not load:', sasError);
+      }
+
       setProject(data);
 
       // Start streaming if project is processing
