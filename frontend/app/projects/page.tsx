@@ -6,7 +6,7 @@ import Link from "next/link";
 import { Plus, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ProjectCard } from "@/components/staging/ProjectCard";
-import { listProjects, StagingProject } from "@/services/stagingApi";
+import { listProjects, deleteProject, StagingProject } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 
@@ -45,6 +45,18 @@ function ProjectsList() {
       toast.error('Failed to load projects');
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleDeleteProject = async (projectId: string) => {
+    const project = projects.find(p => p.id === projectId);
+    if (!confirm(`Delete "${project?.name ?? 'this project'}" and all its Azure artifacts? This cannot be undone.`)) return;
+    try {
+      await deleteProject(projectId);
+      toast.success('Project deleted');
+      loadProjects();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to delete project');
     }
   };
 
@@ -96,7 +108,7 @@ function ProjectsList() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
           {projects.map((project) => (
-            <ProjectCard key={project.id} project={project} />
+            <ProjectCard key={project.id} project={project} onDelete={handleDeleteProject} />
           ))}
         </div>
       )}

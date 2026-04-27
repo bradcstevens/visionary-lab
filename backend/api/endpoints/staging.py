@@ -122,9 +122,33 @@ async def delete_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
 ):
+    """Delete a project and all associated blob storage artifacts."""
+    # Get project first to find blob paths
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Delete all blobs under staging/{project_id}/
+    deleted_blobs = 0
+    try:
+        blob_service = AzureBlobStorageService()
+        container_client = blob_service.blob_service_client.get_container_client(settings.AZURE_BLOB_IMAGE_CONTAINER)
+        prefix = f"staging/{project_id}/"
+        blobs = container_client.list_blobs(name_starts_with=prefix)
+        for blob in blobs:
+            try:
+                container_client.delete_blob(blob.name)
+                deleted_blobs += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete blob {blob.name}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to clean up blobs for project {project_id}: {e}")
+
+    # Delete Cosmos document
     if not storage.delete_project(project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return {"status": "deleted", "project_id": project_id}
+
+    return {"status": "deleted", "project_id": project_id, "blobs_deleted": deleted_blobs}
 
 
 @router.post("/projects/{project_id}/rooms", response_model=UploadRoomsResponse)

@@ -3,12 +3,12 @@
 import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
-import { getProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { getProject, deleteProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 
@@ -21,6 +21,8 @@ export default function ProjectDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   useEffect(() => {
     if (projectId) {
@@ -123,6 +125,20 @@ export default function ProjectDetailPage() {
     toast.info('Add rooms feature coming soon');
   };
 
+  const handleDeleteProject = async () => {
+    setIsDeleting(true);
+    try {
+      await deleteProject(projectId);
+      toast.success('Project and all artifacts deleted');
+      router.push('/projects');
+    } catch (error) {
+      console.error('Failed to delete project:', error);
+      toast.error(error instanceof Error ? error.message : 'Failed to delete project');
+      setIsDeleting(false);
+      setShowDeleteConfirm(false);
+    }
+  };
+
   // Computed state
   const allPending = project?.rooms.every(r => r.status === 'pending') ?? false;
   const hasFailed = project?.rooms.some(r => r.status === 'failed' || r.variations.some(v => v.status === 'failed')) ?? false;
@@ -184,6 +200,16 @@ export default function ProjectDetailPage() {
                 Regenerate All
               </Button>
             )}
+            <Button
+              variant="outline"
+              size="icon"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={() => setShowDeleteConfirm(true)}
+              disabled={isGenerating || isDeleting}
+              title="Delete project"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
           </div>
         </div>
       </div>
@@ -264,6 +290,32 @@ export default function ProjectDetailPage() {
           ))
         )}
       </div>
+
+      {/* Delete confirmation dialog */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-background border rounded-xl shadow-lg p-6 max-w-md mx-4 space-y-4">
+            <div className="space-y-2">
+              <h3 className="text-lg font-semibold">Delete project?</h3>
+              <p className="text-sm text-muted-foreground">
+                This will permanently delete <strong>{project.name}</strong>, including all {project.rooms.length} uploaded images and {totalVariations} generated variations from Azure storage. This cannot be undone.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setShowDeleteConfirm(false)} disabled={isDeleting}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={handleDeleteProject} disabled={isDeleting}>
+                {isDeleting ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Deleting...</>
+                ) : (
+                  <><Trash2 className="h-4 w-4 mr-2" />Delete Project</>
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
