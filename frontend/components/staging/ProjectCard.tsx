@@ -25,7 +25,20 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
       case 'completed': return 'default';
       case 'processing': return 'secondary';
       case 'failed': return 'destructive';
+      case 'pending': return 'outline';
+      case 'uploading': return 'outline';
       default: return 'outline';
+    }
+  };
+
+  const getStatusLabel = (status: string): string => {
+    switch (status) {
+      case 'uploading': return 'uploading';
+      case 'pending': return 'ready';
+      case 'processing': return 'processing';
+      case 'completed': return 'completed';
+      case 'failed': return 'failed';
+      default: return status;
     }
   };
 
@@ -41,7 +54,7 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
           <div className="flex items-start justify-between gap-2">
             <CardTitle className="text-lg line-clamp-2">{project.name}</CardTitle>
             <Badge variant={getStatusVariant(project.status)} className="text-xs shrink-0">
-              {project.status}
+              {getStatusLabel(project.status)}
             </Badge>
           </div>
         </CardHeader>

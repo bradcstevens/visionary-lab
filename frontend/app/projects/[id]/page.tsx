@@ -292,8 +292,8 @@ export default function ProjectDetailPage() {
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <h1 className="text-3xl font-bold">{project.name}</h1>
-              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : 'outline'} className="text-xs">
-                {project.status}
+              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : project.status === 'processing' ? 'secondary' : 'outline'} className="text-xs">
+                {project.status === 'pending' ? 'ready' : project.status}
               </Badge>
             </div>
             <p className="text-muted-foreground leading-relaxed max-w-3xl">
