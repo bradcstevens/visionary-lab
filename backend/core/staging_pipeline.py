@@ -119,8 +119,15 @@ class StagingPipeline:
                 parsed = json.loads(content)
                 if isinstance(parsed, list):
                     return [str(p) for p in parsed[:n_variations]]
-                if isinstance(parsed, dict) and "prompts" in parsed:
-                    return [str(p) for p in parsed["prompts"][:n_variations]]
+                if isinstance(parsed, dict):
+                    # Try common key names the LLM might use
+                    for key in ("prompts", "variations", "results", "data"):
+                        if key in parsed and isinstance(parsed[key], list):
+                            return [str(p) for p in parsed[key][:n_variations]]
+                    # If dict has string values, collect them
+                    values = [v for v in parsed.values() if isinstance(v, (str, list))]
+                    if values and isinstance(values[0], list):
+                        return [str(p) for p in values[0][:n_variations]]
             except (json.JSONDecodeError, KeyError, IndexError):
                 logger.warning(f"Prompt adaptation attempt {attempt+1} returned invalid JSON, retrying")
                 continue
@@ -231,7 +238,7 @@ class StagingPipeline:
     async def generate_project(self, project: StagingProject) -> AsyncGenerator[Dict[str, Any], None]:
         """Process all pending rooms in the project. Yields SSE events."""
         project.status = ProjectStatus.PROCESSING
-        self.storage_service.update_project(project.id, project.dict())
+        self.storage_service.update_project(project.id, self._serialize_project(project))
 
         pending_rooms = [r for r in project.rooms if r.status in (ItemStatus.PENDING, ItemStatus.FAILED)]
 
@@ -259,7 +266,7 @@ class StagingPipeline:
 
         all_completed = all(r.status == ItemStatus.COMPLETED for r in project.rooms)
         project.status = ProjectStatus.COMPLETED if all_completed else ProjectStatus.FAILED
-        self.storage_service.update_project(project.id, project.dict())
+        self.storage_service.update_project(project.id, self._serialize_project(project))
         yield {"type": "project_completed", "status": project.status}
 
     @staticmethod
@@ -283,6 +290,11 @@ class StagingPipeline:
                     return blob_url.split(f"/{container}/")[1]
             return "/".join(parts[-2:])
 
+    @staticmethod
+    def _serialize_project(project: StagingProject) -> dict:
+        """Serialize project to a JSON-safe dict (datetime → ISO string)."""
+        return json.loads(project.json())
+
     def _update_room_in_project(self, project: StagingProject, room: Room):
         """Persist room updates to Cosmos DB."""
         for i, r in enumerate(project.rooms):
@@ -290,6 +302,6 @@ class StagingPipeline:
                 project.rooms[i] = room
                 break
         try:
-            self.storage_service.update_project(project.id, project.dict())
+            self.storage_service.update_project(project.id, self._serialize_project(project))
         except Exception as e:
             logger.error(f"Failed to persist room update: {e}")
