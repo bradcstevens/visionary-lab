@@ -137,11 +137,13 @@ class StagingPipeline:
             self._update_room_in_project(project, room)
 
             try:
-                image_bytes = await self.blob_service.get_asset_content(
+                image_content, _ = self.blob_service.get_asset_content(
                     blob_name=self._extract_blob_name(room.original_image_url),
                     container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
                 )
-                image_b64 = base64.b64encode(image_bytes).decode("utf-8") if isinstance(image_bytes, bytes) else image_bytes
+                if image_content is None:
+                    raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
+                image_b64 = base64.b64encode(image_content).decode("utf-8")
 
                 analysis = await self.analyze_room(image_b64)
                 room_description = analysis.get("description", "A room")

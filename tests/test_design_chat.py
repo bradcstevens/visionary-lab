@@ -151,9 +151,9 @@ def test_analyze_endpoint_returns_analyses(client, mock_staging_deps):
         })
 
         with patch("backend.api.endpoints.staging.AzureBlobStorageService") as mock_blob_cls:
-            mock_blob = AsyncMock()
+            mock_blob = MagicMock()
             mock_blob_cls.return_value = mock_blob
-            mock_blob.get_asset_content = AsyncMock(return_value=b"fake-image-bytes")
+            mock_blob.get_asset_content = MagicMock(return_value=(b"fake-image-bytes", "image/png"))
 
             response = client.post("/api/v1/staging/projects/proj-analyze/analyze")
 

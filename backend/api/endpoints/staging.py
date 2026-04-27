@@ -312,11 +312,13 @@ async def analyze_project_images(
                 break
         else:
             blob_name = "/".join(url.split("/")[-2:])
-        image_bytes = await blob_service.get_asset_content(
+        image_content, _ = blob_service.get_asset_content(
             blob_name=blob_name,
             container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
         )
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8") if isinstance(image_bytes, bytes) else image_bytes
+        if image_content is None:
+            raise RuntimeError(f"Image not found in blob storage: {url}")
+        image_b64 = base64.b64encode(image_content).decode("utf-8")
         result = await analyzer.async_image_chat(image_base64=image_b64, system_message=system_msg)
         return {
             "room_id": room["id"],
