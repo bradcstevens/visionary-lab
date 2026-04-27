@@ -69,7 +69,7 @@ export interface StagingProject {
   id: string;
   name: string;
   prompt: string;
-  status: 'uploading' | 'processing' | 'completed' | 'failed';
+  status: 'uploading' | 'pending' | 'processing' | 'completed' | 'failed';
   settings: StagingSettings;
   rooms: Room[];
   created_at?: string;
@@ -93,10 +93,14 @@ export interface CreateProjectRequest {
 export type StagingStreamEventType = 
   | 'project_created' 
   | 'room_uploaded' 
+  | 'room_started'
+  | 'room_completed'
+  | 'room_failed'
   | 'variation_started' 
   | 'variation_completed' 
   | 'variation_failed' 
   | 'project_completed' 
+  | 'stream_ended'
   | 'error';
 
 export interface StagingStreamEvent {
@@ -302,6 +306,7 @@ export function streamGeneration(
 
   // Create AbortController for cleanup
   const abortController = new AbortController();
+  let receivedTerminalEvent = false;
 
   // Use fetch with ReadableStream to handle SSE from POST request
   // (EventSource only supports GET requests)
@@ -358,6 +363,10 @@ export function streamGeneration(
                 ...parsedData,
               };
               
+              if (currentEventType === 'project_completed' || currentEventType === 'error') {
+                receivedTerminalEvent = true;
+              }
+
               if (API_DEBUG) {
                 console.log('SSE event:', event);
               }
@@ -371,6 +380,11 @@ export function streamGeneration(
             currentData = null;
           }
         }
+      }
+
+      // Stream ended — dispatch fallback event if no terminal event was received
+      if (!receivedTerminalEvent) {
+        onEvent({ type: 'stream_ended' });
       }
     })
     .catch((error) => {
@@ -410,6 +424,7 @@ export function streamRoomRegeneration(
 
   // Create AbortController for cleanup
   const abortController = new AbortController();
+  let receivedTerminalEvent = false;
 
   // Use fetch with ReadableStream to handle SSE from POST request
   fetch(url, {
@@ -464,7 +479,11 @@ export function streamRoomRegeneration(
                 type: currentEventType as StagingStreamEventType,
                 ...parsedData,
               };
-              
+
+              if (currentEventType === 'project_completed' || currentEventType === 'error') {
+                receivedTerminalEvent = true;
+              }
+
               if (API_DEBUG) {
                 console.log('SSE event:', event);
               }
@@ -478,6 +497,11 @@ export function streamRoomRegeneration(
             currentData = null;
           }
         }
+      }
+
+      // Stream ended — dispatch fallback event if no terminal event was received
+      if (!receivedTerminalEvent) {
+        onEvent({ type: 'stream_ended' });
       }
     })
     .catch((error) => {

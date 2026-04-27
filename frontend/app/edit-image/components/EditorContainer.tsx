@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Tabs, TabsContent } from '@/components/ui/tabs';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -11,6 +11,7 @@ import ResultDisplay from './ResultDisplay';
 import { Skeleton } from '@/components/ui/skeleton';
 import { editImage, saveGeneratedImage, getImageFromResponse, getTokenUsage, ImageGenerationResponse } from '@/services/imageService';
 import { toast } from "sonner";
+import { useActivityLog } from "@/context/activity-log-context";
 
 type EditorState = 'draw' | 'result';
 
@@ -36,6 +37,13 @@ export default function EditorContainer() {
     } | null;
     rawResponse?: ImageGenerationResponse;
   } | null>(null);
+
+  const activityLog = useActivityLog();
+
+  useEffect(() => {
+    activityLog.clear();
+    return () => activityLog.clear();
+  }, []);
   
   // Handle the image upload
   const handleImageUpload = (imageFile: File) => {
@@ -85,6 +93,13 @@ export default function EditorContainer() {
   // Handle form submission
   const handleSubmit = async (formData: FormData) => {
     setIsLoading(true);
+
+    activityLog.log({
+      level: 'info',
+      icon: '🎨',
+      message: 'Editing image...',
+      detail: `${formData.get('model') ?? 'gpt-image-2'} · ${formData.get('quality') ?? 'auto'} quality · ${formData.get('size') ?? 'auto'}`,
+    });
     
     try {
       // Call the API to edit the image
@@ -107,8 +122,21 @@ export default function EditorContainer() {
       
       // Update the editor state
       setEditorState('result');
+
+      activityLog.log({
+        level: 'success',
+        icon: '✓',
+        message: 'Image generated',
+        detail: tokenUsage ? `${tokenUsage.total.toLocaleString()} tokens` : undefined,
+      });
     } catch (error) {
       console.error('Error editing image:', error);
+      activityLog.log({
+        level: 'error',
+        icon: '✕',
+        message: 'Edit failed',
+        detail: error instanceof Error ? error.message : 'Unknown error',
+      });
       toast.error("Error editing image", {
         description: error instanceof Error ? error.message : "An unknown error occurred"
       });
@@ -127,6 +155,13 @@ export default function EditorContainer() {
     }
     
     try {
+      activityLog.log({
+        level: 'info',
+        icon: '💾',
+        message: 'Saving to gallery...',
+        detail: folder ? `Folder: ${folder}` : 'Root folder',
+      });
+
       // Save the image to the gallery
       await saveGeneratedImage(
         resultData.rawResponse,
@@ -142,6 +177,13 @@ export default function EditorContainer() {
       // Show success toast
       toast.success("Image saved", {
         description: `Successfully saved to gallery${folder ? ` in folder: ${folder}` : ''}`
+      });
+
+      activityLog.log({
+        level: 'success',
+        icon: '✓',
+        message: 'Saved to gallery',
+        detail: folder ? `Folder: ${folder}` : 'Root folder',
       });
     } catch (error: unknown) {
       console.error('Error saving image:', error);

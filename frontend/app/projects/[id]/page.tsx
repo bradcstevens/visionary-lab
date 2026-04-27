@@ -1,9 +1,9 @@
 "use client"
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2, MoreHorizontal } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2, MoreHorizontal, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -13,11 +13,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { getProject, deleteProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
+import { parseApiError } from "@/utils/error-utils";
+import { useActivityLog } from "@/context/activity-log-context";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -30,6 +33,24 @@ export default function ProjectDetailPage() {
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const streamCleanupRef = useRef<(() => void) | null>(null);
+  const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestLoadIdRef = useRef(0);
+
+  const activityLog = useActivityLog();
+
+  useEffect(() => {
+    activityLog.clear();
+    return () => activityLog.clear();
+  }, []);
+
+  // Abort any active stream and pending reloads on unmount
+  useEffect(() => {
+    return () => {
+      streamCleanupRef.current?.();
+      if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (projectId) {
@@ -55,61 +76,150 @@ export default function ProjectDetailPage() {
     }
   };
 
-  const loadProject = async () => {
+  const loadProject = useCallback(async () => {
+    const loadId = ++latestLoadIdRef.current;
     try {
       setIsLoading(true);
       const data = await getProject(projectId);
+      // Discard stale responses from overlapping fetches
+      if (loadId !== latestLoadIdRef.current) return;
       await resolveImageUrls(data);
+      if (loadId !== latestLoadIdRef.current) return;
       setProject(data);
-
-      if (data.status === 'processing') {
-        startGeneration();
-      }
     } catch (error) {
+      if (loadId !== latestLoadIdRef.current) return;
       console.error('Failed to load project:', error);
       toast.error('Failed to load project');
       router.push('/projects');
     } finally {
-      setIsLoading(false);
+      if (loadId === latestLoadIdRef.current) {
+        setIsLoading(false);
+      }
     }
-  };
+  }, [projectId]);
 
-  const handleStreamEvent = (event: StagingStreamEvent) => {
+  /** Debounced reload — coalesces rapid SSE events into a single fetch. */
+  const debouncedReload = useCallback(() => {
+    if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+    reloadTimerRef.current = setTimeout(() => {
+      reloadTimerRef.current = null;
+      loadProject();
+    }, 500);
+  }, [loadProject]);
+
+  const handleStreamEvent = useCallback((event: StagingStreamEvent) => {
     switch (event.type) {
+      case 'room_started':
+        activityLog.log({
+          level: 'info',
+          icon: '▶',
+          message: `Starting generation for "${(event as any).label ?? 'room'}"`,
+          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
+        });
+        debouncedReload();
+        break;
       case 'variation_completed':
+        activityLog.log({
+          level: 'success',
+          icon: '✓',
+          message: `Variation ${((event as any).variation_index ?? 0) + 1} saved`,
+          detail: [
+            (event as any).model,
+            (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
+            (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
+          ].filter(Boolean).join(' · ') || undefined,
+        });
+        debouncedReload();
+        break;
       case 'variation_failed':
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: `Variation ${((event as any).variation_index ?? 0) + 1} failed`,
+          detail: (event as any).error || 'Unknown error',
+        });
+        debouncedReload();
+        break;
       case 'room_uploaded':
-        loadProject();
+        debouncedReload();
+        break;
+      case 'room_completed':
+        activityLog.log({
+          level: 'success',
+          icon: '✓',
+          message: 'Room complete',
+          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
+        });
+        debouncedReload();
+        break;
+      case 'room_failed':
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: 'Room failed',
+          detail: (event as any).error || 'Unknown error',
+        });
+        debouncedReload();
         break;
       case 'project_completed':
+        // Cancel any pending debounced reload
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        activityLog.log({
+          level: 'success',
+          icon: '🎉',
+          message: 'Generation complete!',
+        });
         setIsGenerating(false);
         setGenerationError(null);
         toast.success('Generation completed!');
         loadProject();
         break;
+      case 'stream_ended':
+        // Fallback: stream closed without a terminal event — reconcile state
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        setIsGenerating(false);
+        loadProject();
+        break;
       case 'error':
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: 'Generation error',
+          detail: event.error || 'Unknown error',
+        });
         setIsGenerating(false);
         setGenerationError(event.error || 'Generation failed');
         toast.error(event.error || 'Generation failed');
         loadProject();
         break;
     }
-  };
+  }, [activityLog, debouncedReload, loadProject]);
 
-  const startGeneration = () => {
+  const startGeneration = useCallback(() => {
     if (isGenerating) return;
+    // Abort any existing stream before starting a new one
+    streamCleanupRef.current?.();
     setIsGenerating(true);
     setGenerationError(null);
-    streamGeneration(projectId, handleStreamEvent);
-  };
+    activityLog.log({
+      level: 'info',
+      icon: '▶',
+      message: `Starting generation for "${project?.name}"`,
+      detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
+    });
+    streamCleanupRef.current = streamGeneration(projectId, handleStreamEvent);
+  }, [activityLog, project, totalVariations, isGenerating, projectId, handleStreamEvent]);
 
-  const handleRegenerateRoom = (room: Room) => {
+  const handleRegenerateRoom = useCallback((room: Room) => {
     if (isGenerating) return;
+    // Abort any existing stream before starting a new one
+    streamCleanupRef.current?.();
     setIsGenerating(true);
     setGenerationError(null);
     toast.info(`Regenerating ${room.label}...`);
-    streamRoomRegeneration(projectId, room.id, handleStreamEvent);
-  };
+    streamCleanupRef.current = streamRoomRegeneration(projectId, room.id, handleStreamEvent);
+  }, [isGenerating, projectId, handleStreamEvent]);
 
   const handleRegenerateAll = () => {
     if (isGenerating) return;
@@ -182,8 +292,8 @@ export default function ProjectDetailPage() {
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <h1 className="text-3xl font-bold">{project.name}</h1>
-              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : 'outline'} className="text-xs">
-                {project.status}
+              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : project.status === 'processing' ? 'secondary' : 'outline'} className="text-xs">
+                {project.status === 'pending' ? 'ready' : project.status}
               </Badge>
             </div>
             <p className="text-muted-foreground leading-relaxed max-w-3xl">
@@ -245,19 +355,44 @@ export default function ProjectDetailPage() {
       </div>
 
       {/* Generation error banner */}
-      {generationError && (
-        <div className="flex items-center gap-3 p-4 bg-destructive/10 border border-destructive/20 rounded-lg">
-          <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0" />
-          <div className="flex-1">
-            <p className="text-sm font-medium text-destructive">Generation encountered an error</p>
-            <p className="text-xs text-destructive/80 mt-0.5">{generationError}</p>
+      {generationError && (() => {
+        const parsed = parseApiError(generationError);
+        return (
+          <div className="overflow-hidden rounded-lg border border-destructive/20 bg-destructive/[0.04]">
+            <div className="flex items-start gap-3 p-4">
+              <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0 space-y-1">
+                <p className="text-sm font-medium text-destructive">
+                  Generation encountered an error
+                  {parsed.statusCode ? ` (${parsed.statusCode})` : ""}
+                </p>
+                {parsed.detail && (
+                  <Collapsible>
+                    <p className="text-xs text-destructive/80 line-clamp-2 break-words">
+                      {parsed.detail}
+                    </p>
+                    {(parsed.isTruncated || (parsed.detail?.length ?? 0) > 120) && (
+                      <CollapsibleTrigger className="group inline-flex items-center gap-1 text-[11px] text-destructive/60 hover:text-destructive transition-colors mt-1 cursor-pointer">
+                        <ChevronDown className="h-3 w-3 transition-transform group-data-[state=open]:rotate-180" />
+                        Full error
+                      </CollapsibleTrigger>
+                    )}
+                    <CollapsibleContent>
+                      <pre className="mt-2 rounded-md bg-destructive/[0.06] border border-destructive/10 px-3 py-2 text-[11px] text-destructive/70 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+                        {parsed.detail}{parsed.isTruncated && "…"}
+                      </pre>
+                    </CollapsibleContent>
+                  </Collapsible>
+                )}
+              </div>
+              <Button size="sm" variant="outline" onClick={handleRegenerateAll} className="shrink-0">
+                <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                Retry
+              </Button>
+            </div>
           </div>
-          <Button size="sm" variant="outline" onClick={handleRegenerateAll}>
-            <RefreshCw className="h-3.5 w-3.5 mr-1" />
-            Retry
-          </Button>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Call-to-action for pending projects */}
       {allPending && project.rooms.length > 0 && !isGenerating && (

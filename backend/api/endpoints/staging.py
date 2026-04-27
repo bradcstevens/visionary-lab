@@ -192,7 +192,13 @@ async def upload_rooms(
 
     existing_rooms = project_data.get("rooms", [])
     existing_rooms.extend([r.dict() for r in new_rooms])
-    storage.update_project(project_id, {"rooms": existing_rooms})
+
+    # Transition status from "uploading" to "pending" now that rooms exist
+    updates = {"rooms": existing_rooms}
+    if project_data.get("status") == "uploading":
+        updates["status"] = "pending"
+
+    storage.update_project(project_id, updates)
 
     return UploadRoomsResponse(project_id=project_id, rooms_added=len(new_rooms), rooms=new_rooms)
 
@@ -269,8 +275,23 @@ async def regenerate_room(
             )
 
     async def event_stream():
-        async for event in pipeline.process_room(project, room, brief_prompts=brief_prompts):
-            yield _sse_event(event["type"], event)
+        try:
+            async for event in pipeline.process_room(project, room, brief_prompts=brief_prompts):
+                yield _sse_event(event["type"], event)
+        finally:
+            # Recalculate project-level status after room regeneration
+            fresh = storage.get_project(project_id)
+            if fresh:
+                clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+                fresh_project = StagingProject(**clean_fresh)
+                any_processing = any(
+                    r.status in ("pending", "processing") for r in fresh_project.rooms
+                )
+                if not any_processing:
+                    any_completed = any(r.status == "completed" for r in fresh_project.rooms)
+                    fresh_project.status = "completed" if any_completed else "failed"
+                    storage.update_project(project_id, json.loads(fresh_project.json()))
+        yield _sse_event("project_completed", {"status": project.status})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

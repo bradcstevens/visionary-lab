@@ -15,6 +15,7 @@ import {
   VideoStreamEvent,
 } from "@/services/api";
 import { toast } from "sonner";
+import { useActivityLog } from "@/context/activity-log-context";
 
 // Global set to track which generation IDs have already been uploaded
 // This survives component re-renders and ensures each generation is only uploaded once
@@ -119,6 +120,7 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
   const [isClient, setIsClient] = useState(false);
   // Track active SSE streams so we can abort on completion/removal
   const streamCleanupRef = useRef<Record<string, () => void>>({});
+  const activityLog = useActivityLog();
 
   // This effect runs once on client-side to mark that we're now on the client
   useEffect(() => {
@@ -232,6 +234,12 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
               if (uploadPromises.length > 0) {
                 // Use a loading toast that transforms into success/error
                 const uploadToastId = toast.loading(`Uploading ${formatVideoCount(uploadPromises.length)} to gallery...`);
+                activityLog.log({
+                  level: 'info',
+                  icon: '🎬',
+                  message: 'Video generation started',
+                  detail: 'Processing video request',
+                });
                 
                 try {
                   // Wait for all uploads to complete
@@ -252,6 +260,12 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
                       description,
                       duration: 5000
                     });
+                    activityLog.log({
+                      level: 'success',
+                      icon: '✓',
+                      message: 'Video ready',
+                      detail: 'Video generation completed',
+                    });
                     
                     // Set flag to notify galleries about new content
                     uploadCompleted = true;
@@ -262,11 +276,23 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
                     toast.error(`${formatVideoCount(failedCount)} failed to upload`, {
                       id: uploadToastId
                     });
+                    activityLog.log({
+                      level: 'error',
+                      icon: '✕',
+                      message: 'Video generation failed',
+                      detail: `${formatVideoCount(failedCount)} failed to upload`,
+                    });
                   }
                 } catch (uploadError) {
                   console.error(`Error handling uploads:`, uploadError);
                   toast.error(`Some videos failed to upload`, {
                     id: uploadToastId
+                  });
+                  activityLog.log({
+                    level: 'error',
+                    icon: '✕',
+                    message: 'Video generation failed',
+                    detail: uploadError instanceof Error ? uploadError.message : typeof uploadError === 'string' ? uploadError : 'Unknown error',
                   });
                 }
               } else {
@@ -507,6 +533,12 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
                       : 'Video ready in your gallery',
                     duration: 5000,
                   });
+                  activityLog.log({
+                    level: 'success',
+                    icon: '✓',
+                    message: 'Video ready',
+                    detail: 'Video generation completed',
+                  });
                   
                   // Notify gallery to refresh
                   setTimeout(() => {
@@ -531,6 +563,12 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
                   delete streamCleanupRef.current[jobId || tempId];
                   toast.error('Video generation failed', {
                     description: event.error,
+                  });
+                  activityLog.log({
+                    level: 'error',
+                    icon: '✕',
+                    message: 'Video generation failed',
+                    detail: event.error || 'Unknown error',
                   });
                   reject(new Error(event.error));
                   break;
@@ -568,6 +606,12 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
       console.error("Error adding to queue:", error);
       toast.error("Failed to create video generation job", {
         description: error instanceof Error ? error.message : String(error),
+      });
+      activityLog.log({
+        level: 'error',
+        icon: '✕',
+        message: 'Video generation failed',
+        detail: error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error',
       });
       // Remove the optimistic queue item so the UI doesn't show a stuck job
       setQueueItems(prev => prev.filter(item => item.id !== tempId));

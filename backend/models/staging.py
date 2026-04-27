@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, validator
 
 class ProjectStatus(str, Enum):
     UPLOADING = "uploading"
+    PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
