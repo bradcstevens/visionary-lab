@@ -20,8 +20,12 @@ class StagingStorageService:
         if container is not None:
             self.container = container
             return
-        credential = DefaultAzureCredential()
-        client = CosmosClient(url=settings.AZURE_COSMOS_DB_ENDPOINT, credential=credential)
+        cosmos_key = getattr(settings, 'AZURE_COSMOS_DB_KEY', None) or None
+        if cosmos_key:
+            client = CosmosClient(url=settings.AZURE_COSMOS_DB_ENDPOINT, credential=cosmos_key)
+        else:
+            credential = DefaultAzureCredential()
+            client = CosmosClient(url=settings.AZURE_COSMOS_DB_ENDPOINT, credential=credential)
         database = client.get_database_client(settings.AZURE_COSMOS_DB_ID)
         self.container = database.create_container_if_not_exists(
             id=settings.STAGING_COSMOS_CONTAINER_ID,

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # Azure Cosmos DB Settings (managed identity — no keys)
     AZURE_COSMOS_DB_ENDPOINT: Optional[str] = None
+    AZURE_COSMOS_DB_KEY: Optional[str] = None
     AZURE_COSMOS_DB_ID: str = "visionarylab"
     AZURE_COSMOS_CONTAINER_ID: str = "metadata"
 

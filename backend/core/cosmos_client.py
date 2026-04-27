@@ -28,9 +28,14 @@ class CosmosDBService:
         self.container_id = settings.AZURE_COSMOS_CONTAINER_ID
 
         try:
-            credential = DefaultAzureCredential(logging_enable=True)
-            self.logger.info("Using managed identity authentication for Cosmos DB")
-            self.client = CosmosClient(url=self.endpoint, credential=credential)
+            cosmos_key = getattr(settings, 'AZURE_COSMOS_DB_KEY', None) or None
+            if cosmos_key:
+                self.logger.info("Using key authentication for Cosmos DB")
+                self.client = CosmosClient(url=self.endpoint, credential=cosmos_key)
+            else:
+                credential = DefaultAzureCredential(logging_enable=True)
+                self.logger.info("Using managed identity authentication for Cosmos DB")
+                self.client = CosmosClient(url=self.endpoint, credential=credential)
         except Exception as e:
             self.logger.error(f"Failed to authenticate with Cosmos DB: {str(e)}")
             raise DatabaseError(f"Cosmos DB authentication error: {str(e)}")
