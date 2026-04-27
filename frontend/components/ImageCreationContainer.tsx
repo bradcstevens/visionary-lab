@@ -14,6 +14,7 @@ import {
   protectImagePrompt,
   generateImagesWithAnalysis,
 } from "@/services/api";
+import { useActivityLog } from "@/context/activity-log-context";
 
 interface ImageCreationContainerProps {
   className?: string;
@@ -96,6 +97,13 @@ function formatBrandProtectionNote(isApplied: boolean): string {
 }
 
 export function ImageCreationContainer({ className = "", onImagesSaved }: ImageCreationContainerProps) {
+  const activityLog = useActivityLog();
+
+  useEffect(() => {
+    activityLog.clear();
+    return () => activityLog.clear();
+  }, []);
+
   const [isGenerating, setIsGenerating] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -138,6 +146,14 @@ export function ImageCreationContainer({ className = "", onImagesSaved }: ImageC
   const handleGenerate = async (newSettings: ImageGenerationSettings) => {
     try {
       setIsGenerating(true);
+      activityLog.log({
+        level: 'info',
+        icon: '🎨',
+        message: newSettings.sourceImages?.length
+          ? `Editing ${newSettings.sourceImages.length} image(s)...`
+          : `Generating ${newSettings.variations} image(s)...`,
+        detail: `${newSettings.model ?? 'gpt-image-2'} · ${newSettings.quality} quality · ${newSettings.imageSize}`,
+      });
       setSettings({ 
         ...newSettings, 
         sourceImages: newSettings.sourceImages || [],
@@ -202,6 +218,12 @@ export function ImageCreationContainer({ className = "", onImagesSaved }: ImageC
           id: editingToast,
           description: `Successfully edited ${formatImageCount(newSettings.variations)}`
         });
+        activityLog.log({
+          level: 'success',
+          icon: '✓',
+          message: 'Image editing completed',
+          detail: `${formatImageCount(newSettings.variations)} created`,
+        });
       } else {
         // If we are saving to gallery, use unified endpoint; otherwise generate preview only
         if (newSettings.saveImages) {
@@ -226,6 +248,12 @@ export function ImageCreationContainer({ className = "", onImagesSaved }: ImageC
           toast.success(`${saveResp.total_saved} images saved${saveResp.analyzed ? ' with AI analysis' : ''}`, {
             id: savingToast,
             description: newSettings.folder && newSettings.folder !== 'root' ? `Saved to folder: ${newSettings.folder}` : 'Saved to root folder',
+          });
+          activityLog.log({
+            level: 'success',
+            icon: '✓',
+            message: `${saveResp.total_saved} images saved${saveResp.analyzed ? ' with AI analysis' : ''}`,
+            detail: normalizedFolder ? `Folder: ${normalizedFolder}` : 'Root folder',
           });
 
           // Trigger gallery refresh callback
@@ -328,6 +356,12 @@ export function ImageCreationContainer({ className = "", onImagesSaved }: ImageC
       
     } catch (error) {
       console.error('Error in image operation:', error);
+      activityLog.log({
+        level: 'error',
+        icon: '✕',
+        message: 'Generation failed',
+        detail: error instanceof Error ? error.message : 'Unknown error',
+      });
       const hasSourceImages = newSettings.sourceImages && newSettings.sourceImages.length > 0;
       toast.error(hasSourceImages ? "Image editing failed" : "Image generation failed", {
         description: error instanceof Error ? error.message : "Unknown error occurred"
