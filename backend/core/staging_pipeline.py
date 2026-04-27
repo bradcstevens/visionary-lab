@@ -166,11 +166,20 @@ class StagingPipeline:
                     )
 
                 for idx, adapted_prompt in enumerate(adapted_prompts):
+                    if idx >= len(room.variations):
+                        logger.warning(
+                            "More adapted prompts (%d) than variations (%d) for room %s; "
+                            "ignoring excess prompts",
+                            len(adapted_prompts), len(room.variations), room.id,
+                        )
+                        break
                     variation = room.variations[idx]
                     variation.status = ItemStatus.PROCESSING
                     self._update_room_in_project(project, room)
 
                     start_time = time.monotonic()
+                    result = None
+                    elapsed_ms = 0
                     try:
                         pipeline_request = ImagePipelineRequest(
                             action=PipelineAction.EDIT,
@@ -198,13 +207,22 @@ class StagingPipeline:
 
                         if result.generation and result.save:
                             saved = result.save
-                            variation.image_url = saved.files[0].url if saved.files else None
-                            variation.status = ItemStatus.COMPLETED
-                            variation.generation_metadata = {
-                                "model": project.settings.model,
-                                "adapted_prompt": adapted_prompt,
-                                "generation_time_ms": elapsed_ms,
-                            }
+                            saved_url = (
+                                saved.saved_images[0].get("url")
+                                if saved.saved_images
+                                else None
+                            )
+                            if saved_url:
+                                variation.image_url = saved_url
+                                variation.status = ItemStatus.COMPLETED
+                                variation.generation_metadata = {
+                                    "model": project.settings.model,
+                                    "adapted_prompt": adapted_prompt,
+                                    "generation_time_ms": elapsed_ms,
+                                }
+                            else:
+                                variation.status = ItemStatus.FAILED
+                                variation.error = "Save succeeded but no image URL returned"
                         else:
                             variation.status = ItemStatus.FAILED
                             variation.error = "Pipeline returned no generation result"
@@ -213,6 +231,13 @@ class StagingPipeline:
                         logger.error(f"Variation {idx} failed for room {room.id}: {e}")
                         variation.status = ItemStatus.FAILED
                         variation.error = str(e)
+                        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+                    # Extract token usage from generation response
+                    token_usage = None
+                    if result and result.generation and result.generation.token_usage:
+                        tu = result.generation.token_usage
+                        token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
 
                     self._update_room_in_project(project, room)
 
@@ -222,10 +247,19 @@ class StagingPipeline:
                         "variation_index": idx,
                         "image_url": variation.image_url,
                         "error": variation.error,
+                        "elapsed_ms": elapsed_ms,
+                        "tokens_used": token_usage,
+                        "model": project.settings.model,
                     }
 
-                all_done = all(v.status == ItemStatus.COMPLETED for v in room.variations)
-                room.status = ItemStatus.COMPLETED if all_done else ItemStatus.FAILED
+                # Mark any unprocessed variations (fewer prompts than variations) as failed
+                for v in room.variations[len(adapted_prompts):]:
+                    if v.status == ItemStatus.PENDING:
+                        v.status = ItemStatus.FAILED
+                        v.error = "No adapted prompt generated for this variation"
+
+                any_completed = any(v.status == ItemStatus.COMPLETED for v in room.variations)
+                room.status = ItemStatus.COMPLETED if any_completed else ItemStatus.FAILED
                 self._update_room_in_project(project, room)
                 yield {"type": "room_completed", "room_id": room.id, "status": room.status}
 
@@ -265,8 +299,8 @@ class StagingPipeline:
             async for event in self.process_room(project, room, brief_prompts=brief_prompts):
                 yield event
 
-        all_completed = all(r.status == ItemStatus.COMPLETED for r in project.rooms)
-        project.status = ProjectStatus.COMPLETED if all_completed else ProjectStatus.FAILED
+        any_room_completed = any(r.status == ItemStatus.COMPLETED for r in project.rooms)
+        project.status = ProjectStatus.COMPLETED if any_room_completed else ProjectStatus.FAILED
         self.storage_service.update_project(project.id, self._serialize_project(project))
         yield {"type": "project_completed", "status": project.status}
 
