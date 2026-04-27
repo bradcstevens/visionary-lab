@@ -10,6 +10,9 @@ import { VideoQueueProvider } from "@/context/video-queue-context";
 import { JobsProvider } from "@/context/jobs-context";
 import { ImageSettingsProvider } from "@/context/image-settings-context";
 import { FolderProvider } from "@/context/folder-context";
+import { ActivityLogProvider } from "@/context/activity-log-context";
+import { ActivityLogToggle } from "@/components/activity-log/ActivityLogToggle";
+import { ActivityLogPanel } from "@/components/activity-log/ActivityLogPanel";
 import { VideoQueueClient } from "@/components/video-queue-client";
 import { RefreshJobsButton } from "@/components/refresh-jobs-button";
 import { Toaster } from "@/components/ui/sonner";
@@ -79,6 +82,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                 <JobsProvider>
                   <ImageSettingsProvider>
                     <FolderProvider>
+                    <ActivityLogProvider>
                     {/* Main layout with sidebar */}
                     <div className="relative flex min-h-screen h-screen">              
                       {/* Content area with sidebar */}
@@ -101,6 +105,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                             <SidebarTrigger />
                             <Separator orientation="vertical" className="mx-2 h-4" />
                             <div className="ml-auto flex items-center space-x-2">
+                              <ActivityLogToggle />
                               <RefreshJobsButton />
                               <VideoQueueClient />
                             </div>
@@ -113,7 +118,9 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                         </SidebarInset>
                       </SidebarProvider>
                     </div>
+                    <ActivityLogPanel />
                     <Toaster />
+                    </ActivityLogProvider>
                     </FolderProvider>
                   </ImageSettingsProvider>
                 </JobsProvider>
