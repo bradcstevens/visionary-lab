@@ -372,7 +372,7 @@ class StagingPipeline:
             }
 
     async def generate_project(self, project: StagingProject) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process all pending rooms in the project. Yields SSE events."""
+        """Process all pending rooms in parallel. Yields SSE events as they arrive."""
         project.status = ProjectStatus.PROCESSING
         self.storage_service.update_project(project.id, self._serialize_project(project))
 
@@ -396,9 +396,51 @@ class StagingPipeline:
                 n_variations=project.settings.variations_per_room,
             )
 
-        for room in pending_rooms:
-            async for event in self.process_room(project, room, brief_prompts=brief_prompts):
+        if not pending_rooms:
+            project.status = ProjectStatus.COMPLETED
+            self.storage_service.update_project(project.id, self._serialize_project(project))
+            yield {"type": "project_completed", "status": project.status}
+            return
+
+        # _WORKER_DONE sentinel pushed in `finally` so we count worker completion
+        # rather than semantic events — robust against task cancellation.
+        _WORKER_DONE = object()
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _room_worker(room: Room) -> None:
+            """Process one room, pushing all its events to the shared queue."""
+            try:
+                async for event in self.process_room(project, room, brief_prompts=brief_prompts):
+                    await event_queue.put(event)
+            except BaseException as exc:
+                # BaseException catches CancelledError too — prevents silent hangs.
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Room %s failed: %s", room.id, exc)
+                room.status = ItemStatus.FAILED
+                room.error = str(exc) if not isinstance(exc, asyncio.CancelledError) else "cancelled"
+                self._update_room_in_project(project, room)
+                await event_queue.put({"type": "room_failed", "room_id": room.id, "error": str(exc)})
+            finally:
+                await event_queue.put(_WORKER_DONE)
+
+        # Launch all rooms concurrently; the semaphore inside process_room gates real concurrency
+        tasks = [asyncio.create_task(_room_worker(room)) for room in pending_rooms]
+        try:
+            # Drain the queue, yielding events as they arrive, until every worker signals done
+            workers_done = 0
+            total_workers = len(pending_rooms)
+            while workers_done < total_workers:
+                event = await event_queue.get()
+                if event is _WORKER_DONE:
+                    workers_done += 1
+                    continue
                 yield event
+        finally:
+            # Ensure tasks are cancelled if the generator is closed early (consumer disconnect)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         any_room_completed = any(r.status == ItemStatus.COMPLETED for r in project.rooms)
         project.status = ProjectStatus.COMPLETED if any_room_completed else ProjectStatus.FAILED
