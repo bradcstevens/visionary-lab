@@ -14,8 +14,8 @@
 
 | File | Status | Responsibility |
 |---|---|---|
-| `backend/models/staging.py` | Modify | Add `UpdateProjectRequest`, `UpdateRoomRequest`, `CreateVersionRequest`, `VersionSnapshot`, `StagingProjectVersion`; add `conversation_history` to `StagingProject`. |
-| `backend/models/design_brief.py` | Modify | Call `StagingProject.model_rebuild()` so `ChatMessage` resolves the forward ref. |
+| `backend/models/staging.py` | Modify | Add `UpdateProjectRequest`, `UpdateRoomRequest`, `CreateVersionRequest`, `VersionSnapshot`, `StagingProjectVersion`; add `conversation_history: Optional[List[Dict[str, Any]]]` to `StagingProject`. |
+| `backend/models/design_brief.py` | (no change) | No edits required — `staging.py` stores chat history as plain dicts to avoid the import cycle. |
 | `backend/core/staging_storage.py` | Modify | Add `create_version`, `list_versions`, `get_version`, `delete_version`. |
 | `backend/api/endpoints/staging.py` | Modify | Add 7 endpoints (PATCH project, DELETE room, PATCH room, POST/GET/DELETE version, POST revert) + persist `conversation_history` from chat. |
 | `frontend/services/stagingApi.ts` | Modify | Add update/room/version client functions and types; add `conversation_history` to `StagingProject`. |
@@ -49,7 +49,6 @@
 
 **Files:**
 - Modify: `backend/models/staging.py`
-- Modify: `backend/models/design_brief.py`
 - Test: `tests/test_staging_models.py` (Create)
 
 - [ ] **Step 1.1: Write the failing test**
@@ -78,6 +77,8 @@ def test_update_project_request_all_fields_optional():
     assert req.name is None
     assert req.prompt is None
     assert req.settings is None
+    assert req.design_brief is None
+    assert req.conversation_history is None
 
 
 def test_update_project_request_accepts_partial():
@@ -137,8 +138,10 @@ def test_staging_project_includes_conversation_history():
         conversation_history=[{"role": "user", "content": "hi"}],
     )
     assert p2.conversation_history is not None
-    assert p2.conversation_history[0].role == "user"
+    assert p2.conversation_history[0]["role"] == "user"
 ```
+
+> **Note on dict shape:** `conversation_history` is stored as a list of plain dicts to avoid the staging↔design_brief import cycle. The above test reflects that — the assertion uses `["role"]` (dict access), not `.role` (attribute access).
 
 - [ ] **Step 1.2: Run test to verify it fails**
 
@@ -148,12 +151,6 @@ uv run pytest tests/test_staging_models.py -v
 Expected: ImportError / AttributeError — new models don't exist yet.
 
 - [ ] **Step 1.3: Add models in `backend/models/staging.py`**
-
-Insert at the very top after the existing `from typing import …` line:
-
-```python
-from __future__ import annotations
-```
 
 Replace the `StagingProject` block (lines 63-74) with:
 
@@ -170,8 +167,8 @@ class StagingProject(BaseModel):
     folder_path: Optional[str] = None
     design_brief: Optional[Dict[str, Any]] = Field(None, description="Structured design brief from AI conversation")
     analyses: Optional[List[Dict[str, Any]]] = Field(None, description="Image analysis results")
-    conversation_history: Optional[List["ChatMessage"]] = Field(
-        None, description="Persisted design-chat history so the conversation can be resumed."
+    conversation_history: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Persisted design-chat history (denormalized ChatMessage dicts)."
     )
 ```
 
@@ -182,6 +179,8 @@ class UpdateProjectRequest(BaseModel):
     name: Optional[str] = Field(None, description="New project name.")
     prompt: Optional[str] = Field(None, description="New overall styling prompt.")
     settings: Optional[StagingSettings] = Field(None, description="Updated generation settings.")
+    design_brief: Optional[Dict[str, Any]] = Field(None, description="Replacement design brief (denormalized dict).")
+    conversation_history: Optional[List[Dict[str, Any]]] = Field(None, description="Replacement chat history (denormalized).")
 
 
 class UpdateRoomRequest(BaseModel):
@@ -199,7 +198,7 @@ class VersionSnapshot(BaseModel):
     settings: StagingSettings
     design_brief: Optional[Dict[str, Any]] = None
     room_labels: Dict[str, str] = Field(default_factory=dict, description="room_id -> label at snapshot time")
-    conversation_history: Optional[List["ChatMessage"]] = None
+    conversation_history: Optional[List[Dict[str, Any]]] = None
 
 
 class StagingProjectVersion(BaseModel):
@@ -211,16 +210,22 @@ class StagingProjectVersion(BaseModel):
     created_at: Optional[datetime] = None
 ```
 
-- [ ] **Step 1.4: Resolve the forward reference**
+> **Note:** `conversation_history` is stored as `List[Dict[str, Any]]` rather than `List[ChatMessage]` to avoid an import cycle between `staging.py` and `design_brief.py`. The chat endpoint receives validated `ChatMessage` instances from `ChatRequest` and serializes them to dicts before persisting.
 
-Append to the end of `backend/models/design_brief.py`:
+- [ ] **Step 1.4: Update the conversation_history test to match dict shape**
+
+In the test you wrote in Step 1.1, change the final assertion in `test_staging_project_includes_conversation_history` to read the dict directly (not via attribute access):
 
 ```python
-# Resolve forward references for models that import ChatMessage.
-from backend.models.staging import StagingProject, VersionSnapshot
-
-StagingProject.model_rebuild()
-VersionSnapshot.model_rebuild()
+def test_staging_project_includes_conversation_history():
+    p = StagingProject(id="p1", name="N", prompt="P")
+    assert p.conversation_history is None
+    p2 = StagingProject(
+        id="p2", name="N", prompt="P",
+        conversation_history=[{"role": "user", "content": "hi"}],
+    )
+    assert p2.conversation_history is not None
+    assert p2.conversation_history[0]["role"] == "user"
 ```
 
 - [ ] **Step 1.5: Run test to verify it passes**
@@ -240,7 +245,7 @@ Expected: All previously-passing tests still pass.
 - [ ] **Step 1.7: Commit**
 
 ```
-git add backend/models/staging.py backend/models/design_brief.py tests/test_staging_models.py
+git add backend/models/staging.py tests/test_staging_models.py
 git commit -m "feat(staging): add edit, room, and version request/snapshot models
 
 Adds UpdateProjectRequest, UpdateRoomRequest, CreateVersionRequest,
@@ -486,6 +491,31 @@ def test_patch_project_updates_prompt_and_settings(client, mock_staging_deps):
     assert body["settings"]["variations_per_room"] == 3
 
 
+def test_patch_project_updates_design_brief_and_history(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = _completed_project()
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-123",
+        json={
+            "design_brief": {
+                "global_instructions": "Modern",
+                "plant_palette": [],
+                "placement_guide": {"back_row": ""},
+                "per_image_notes": {},
+                "preserve_elements": [],
+                "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+            },
+            "conversation_history": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()["project"]
+    assert body["design_brief"]["global_instructions"] == "Modern"
+    assert body["conversation_history"][0]["content"] == "hello"
+
+
 def test_patch_project_404(client, mock_staging_deps):
     from azure.cosmos.exceptions import CosmosResourceNotFoundError
     mock_container = mock_staging_deps["container"]
@@ -555,6 +585,10 @@ async def update_project(
         updates["prompt"] = payload["prompt"]
     if "settings" in payload and payload["settings"] is not None:
         updates["settings"] = payload["settings"]
+    if "design_brief" in payload and payload["design_brief"] is not None:
+        updates["design_brief"] = payload["design_brief"]
+    if "conversation_history" in payload and payload["conversation_history"] is not None:
+        updates["conversation_history"] = payload["conversation_history"]
 
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -1441,6 +1475,8 @@ export interface UpdateProjectRequest {
     quality: string;
     size: string;
   }>;
+  design_brief?: DesignBrief | null;
+  conversation_history?: ChatMessage[] | null;
 }
 
 export interface UpdateRoomRequest {
@@ -2859,7 +2895,7 @@ export interface ProjectGalleryTabProps {
 }
 
 export function ProjectGalleryTab({ project, isRegenerating, onRegenerate }: ProjectGalleryTabProps) {
-  const rooms = project.brief?.rooms ?? [];
+  const rooms = project.rooms ?? [];
 
   return (
     <div className="space-y-6">
@@ -2897,9 +2933,9 @@ export function ProjectGalleryTab({ project, isRegenerating, onRegenerate }: Pro
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {room.variations.map((variation) => (
                   <div key={variation.id} className="border rounded-md overflow-hidden bg-muted/30">
-                    {variation.url ? (
+                    {variation.status === "completed" && variation.image_url ? (
                       <Image
-                        src={variation.url}
+                        src={variation.image_url}
                         alt={`${room.label} variation`}
                         width={512}
                         height={512}
@@ -2908,7 +2944,7 @@ export function ProjectGalleryTab({ project, isRegenerating, onRegenerate }: Pro
                       />
                     ) : (
                       <div className="aspect-square flex items-center justify-center text-muted-foreground text-xs">
-                        No image
+                        {variation.status === "failed" ? "Failed" : "Pending"}
                       </div>
                     )}
                   </div>
@@ -2923,7 +2959,7 @@ export function ProjectGalleryTab({ project, isRegenerating, onRegenerate }: Pro
 }
 ```
 
-> **Note:** This component assumes `StagingProject.brief.rooms[i].variations[j].url` exists. If the canonical shape differs (e.g., variations live on `project.rooms` instead of `project.brief.rooms`), match the shape used by the current page when extracting in Task 25 and adjust this component before committing.
+> **Note:** `Variation.image_url` is a blob-storage URL. If the deployment relies on `sasTokenService` (see existing `[id]/page.tsx`), wrap the URL through it before rendering. Match the helper used by the page you're replacing.
 
 - [ ] **Step 21.2: Build + commit**
 
@@ -2961,7 +2997,7 @@ import { RegeneratePrompt } from "./RegeneratePrompt";
 import { useBriefEditor } from "@/hooks/staging/useBriefEditor";
 import { useDesignChat } from "@/hooks/staging/useDesignChat";
 import { updateProject } from "@/services/stagingApi";
-import type { ChatMessage, StagingProject } from "@/services/stagingApi";
+import type { StagingProject } from "@/services/stagingApi";
 
 interface ProjectBriefTabProps {
   project: StagingProject;
@@ -2983,27 +3019,20 @@ export function ProjectBriefTab({
   const [chatInput, setChatInput] = useState("");
 
   const editor = useBriefEditor({
-    initialBrief: project.brief ?? null,
+    initialBrief: project.design_brief ?? null,
     onSave: async (brief) => {
-      const updated = await updateProject(project.id, { brief });
+      const updated = await updateProject(project.id, { design_brief: brief });
       onProjectUpdate(updated);
       setShowRegeneratePrompt(true);
     },
   });
 
-  const persistHistory = async (history: ChatMessage[]) => {
-    try {
-      const updated = await updateProject(project.id, { conversation_history: history });
-      onProjectUpdate(updated);
-    } catch {
-      // Silent — chat continues client-side; user can retry later.
-    }
-  };
+  // Chat history is persisted server-side by the chat endpoint (see Task 8),
+  // so the Brief tab does not need to PATCH /projects after every message.
 
   const chat = useDesignChat({
     projectId: project.id,
     initialHistory: project.conversation_history ?? [],
-    onHistoryChange: persistHistory,
   });
 
   useEffect(() => {
@@ -3563,7 +3592,7 @@ If the page already builds `imageLabels` (a `Record<string, string>` keyed by im
 ```tsx
 const imageLabels = useMemo(() => {
   const map: Record<string, string> = {};
-  project.brief?.rooms?.forEach((room) => {
+  project.rooms?.forEach((room) => {
     room.variations.forEach((v, i) => {
       map[v.id] = `${room.label} #${i + 1}`;
     });
