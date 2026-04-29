@@ -60,7 +60,7 @@ Generate {n} variation prompts. Each should:
 - NOT remove or change elements listed in preserve
 - Vary the interpretation: different arrangements, densities, or seasonal looks
 
-Return ONLY a JSON array of {n} strings."""
+Return a JSON object with a "prompts" key containing an array of {n} strings. Example: {{"prompts": ["prompt 1", "prompt 2"]}}"""
 
 
 class BriefGeneratorService:
@@ -155,14 +155,36 @@ class BriefGeneratorService:
                 try:
                     content = response.choices[0].message.content
                     parsed = json.loads(content)
+                    prompts = None
                     if isinstance(parsed, list):
-                        result[analysis.room_id] = [str(p) for p in parsed[:n_variations]]
+                        prompts = parsed
+                    elif isinstance(parsed, dict):
+                        # Try common key names the LLM might use
+                        for key in ("prompts", "variations", "results", "data"):
+                            if key in parsed and isinstance(parsed[key], list):
+                                prompts = parsed[key]
+                                break
+                        # Fallback: grab the first list value in the dict
+                        if prompts is None:
+                            for v in parsed.values():
+                                if isinstance(v, list):
+                                    prompts = v
+                                    break
+                        # Last resort: if all values are non-empty strings,
+                        # treat them as prompts (LLM returned {"1": "...", "2": "..."})
+                        if prompts is None:
+                            str_vals = [v for v in parsed.values() if isinstance(v, str) and len(v) > 20]
+                            if len(str_vals) >= n_variations:
+                                prompts = str_vals
+                    if prompts is not None:
+                        result[analysis.room_id] = [str(p) for p in prompts[:n_variations]]
                         break
-                    if isinstance(parsed, dict) and "prompts" in parsed:
-                        result[analysis.room_id] = [str(p) for p in parsed["prompts"][:n_variations]]
-                        break
-                except (json.JSONDecodeError, KeyError):
-                    logger.warning(f"Prompt generation attempt {attempt + 1} for {analysis.room_id} failed")
+                    logger.warning(
+                        "Prompt generation attempt %d for %s returned unexpected structure: %s",
+                        attempt + 1, analysis.room_id, type(parsed).__name__,
+                    )
+                except (json.JSONDecodeError, KeyError, IndexError) as e:
+                    logger.warning(f"Prompt generation attempt {attempt + 1} for {analysis.room_id} failed: {e}")
                     continue
             else:
                 logger.warning(f"All prompt generation attempts failed for image {analysis.room_id}, using global instructions as fallback")

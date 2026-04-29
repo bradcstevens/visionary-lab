@@ -2,8 +2,9 @@
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { RefreshCw, Play, Clock, Info } from "lucide-react";
+import { RefreshCw, Clock, Info, AlertTriangle } from "lucide-react";
 import { VariationThumbnail } from "./VariationThumbnail";
+import { StorageImage } from "./StorageImage";
 import { Room } from "@/services/stagingApi";
 
 interface RoomGroupProps {
@@ -40,6 +41,9 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
       case 'processing':
         return `Generating variations... ${completedCount}/${totalCount} done`;
       case 'completed':
+        if (failedCount > 0) {
+          return `${completedCount}/${totalCount} variations generated — ${failedCount} failed`;
+        }
         return `All ${totalCount} variations generated`;
       case 'failed':
         return `${failedCount} variation${failedCount !== 1 ? 's' : ''} failed — click retry to regenerate`;
@@ -63,7 +67,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
             </span>
           )}
         </div>
-        {onRegenerateRoom && (room.status === 'failed' || room.status === 'completed') && (
+        {onRegenerateRoom && (room.status === 'failed' || room.status === 'completed' || room.status === 'processing') && (
           <Button
             size="sm"
             variant="ghost"
@@ -77,15 +81,17 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
       </div>
 
       {/* Status insight message */}
-      {room.status !== 'completed' && (
+      {(room.status !== 'completed' || failedCount > 0) && (
         <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-md ${
           room.status === 'pending' ? 'bg-muted/50 text-muted-foreground' :
           room.status === 'processing' ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400' :
-          room.status === 'failed' ? 'bg-destructive/10 text-destructive' : ''
+          room.status === 'failed' ? 'bg-destructive/10 text-destructive' :
+          failedCount > 0 ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : ''
         }`}>
           {room.status === 'pending' && <Clock className="h-3.5 w-3.5" />}
           {room.status === 'processing' && <Info className="h-3.5 w-3.5" />}
           {room.status === 'failed' && <Info className="h-3.5 w-3.5" />}
+          {room.status === 'completed' && failedCount > 0 && <AlertTriangle className="h-3.5 w-3.5" />}
           {getStatusMessage()}
         </div>
       )}
@@ -95,23 +101,21 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
         {/* Original Image */}
         <div className="relative">
           <div className="aspect-square w-full min-h-[120px] relative">
-            <img 
-              src={room.original_image_url} 
+            <StorageImage
+              src={room.original_image_url}
               alt={`${room.label} original`}
               className="w-full h-full object-cover rounded-lg border-2 border-amber-400"
-              onError={(e) => {
-                const target = e.target as HTMLImageElement;
-                target.style.display = 'none';
-                target.parentElement!.classList.add('bg-muted', 'flex', 'items-center', 'justify-content-center');
-                target.parentElement!.innerHTML = '<span class="text-xs text-muted-foreground p-2 text-center">Image unavailable — check storage access</span>';
-              }}
+              fallbackClassName="w-full h-full rounded-lg border-2 border-amber-400"
+              fallbackText="Image unavailable — check storage access"
+              overlay={
+                <Badge 
+                  variant="secondary" 
+                  className="absolute top-2 right-2 bg-amber-400 text-amber-900 text-xs font-medium"
+                >
+                  ORIGINAL
+                </Badge>
+              }
             />
-            <Badge 
-              variant="secondary" 
-              className="absolute top-2 right-2 bg-amber-400 text-amber-900 text-xs font-medium"
-            >
-              ORIGINAL
-            </Badge>
           </div>
         </div>
 

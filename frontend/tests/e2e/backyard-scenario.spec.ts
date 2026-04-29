@@ -70,8 +70,8 @@ test.describe('Backyard Landscaping — Full Scenario', () => {
     await page.waitForTimeout(1000);
     await page.screenshot({ path: `${SCREENSHOT_DIR}/06-step2-images-uploaded.png`, fullPage: true });
 
-    // Verify images appear — look for any image elements or the "Uploaded Photos" label
-    const uploadedLabel = page.locator('text=/Uploaded Photos/');
+    // Verify images appear — the wizard shows "Photos (N)" after upload
+    const uploadedLabel = page.locator('text=/Photos \\(\\d+\\)/');
     await expect(uploadedLabel).toBeVisible({ timeout: 5_000 });
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/07-step2-images-grid.png`, fullPage: true });

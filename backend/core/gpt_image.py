@@ -296,6 +296,12 @@ class GPTImageClient:
                 # Send the request
                 response = requests.post(
                     url, headers=headers, files=files, data=data)
+                if not response.ok:
+                    logger.error(
+                        "Image edit API error (status %s): %s",
+                        response.status_code,
+                        response.text[:2000],
+                    )
                 response.raise_for_status()
 
                 # Parse the response and add deployment metadata

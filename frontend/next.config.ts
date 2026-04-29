@@ -47,24 +47,20 @@ const nextConfig: NextConfig = {
     serverActions: {
       bodySizeLimit: '26mb', // Increased for large image uploads
     },
-    // Enable modern bundling optimizations
     optimizePackageImports: ['lucide-react', '@radix-ui/react-icons', 'framer-motion'],
-    // Enable turbo mode for faster builds
-    turbo: {
-      rules: {
-        '*.svg': {
-          loaders: ['@svgr/webpack'],
-          as: '*.js',
-        },
+  },
+
+  // Turbopack configuration
+  turbopack: {
+    rules: {
+      '*.svg': {
+        loaders: ['@svgr/webpack'],
+        as: '*.js',
       },
     },
   },
   
   
-  // Disable ESLint during builds
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
   // Disable TypeScript checks during builds
   typescript: {
     ignoreBuildErrors: true,
@@ -123,4 +119,4 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withBundleAnalyzer(nextConfig);
+export default process.env.ANALYZE === 'true' ? withBundleAnalyzer(nextConfig) : nextConfig;

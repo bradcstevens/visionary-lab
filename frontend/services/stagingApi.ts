@@ -259,6 +259,27 @@ export async function deleteProject(projectId: string): Promise<void> {
 }
 
 /**
+ * Reset a stuck project (force-reconcile all processing/failed items back to pending)
+ */
+export async function resetProject(projectId: string): Promise<StagingProject> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/reset`;
+  
+  if (API_DEBUG) {
+    console.log(`POST ${url}`);
+  }
+
+  const response = await fetch(url, { method: 'POST' });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to reset project: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data.project ?? data;
+}
+
+/**
  * Upload rooms to a project
  */
 export async function uploadRooms(projectId: string, roomFiles: { file: File; name: string }[]): Promise<Room[]> {
@@ -329,6 +350,9 @@ export function streamGeneration(
 
       const decoder = new TextDecoder();
       let buffer = '';
+      // Persist across chunks so events split across reads aren't lost
+      let currentEventType: string | null = null;
+      let currentData: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -345,9 +369,6 @@ export function streamGeneration(
         // Parse SSE events from buffer
         const lines = buffer.split('\n');
         buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-        let currentEventType: string | null = null;
-        let currentData: string | null = null;
 
         for (const line of lines) {
           if (line.startsWith('event: ')) {
@@ -446,6 +467,9 @@ export function streamRoomRegeneration(
 
       const decoder = new TextDecoder();
       let buffer = '';
+      // Persist across chunks so events split across reads aren't lost
+      let currentEventType: string | null = null;
+      let currentData: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -462,9 +486,6 @@ export function streamRoomRegeneration(
         // Parse SSE events from buffer
         const lines = buffer.split('\n');
         buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-        let currentEventType: string | null = null;
-        let currentData: string | null = null;
 
         for (const line of lines) {
           if (line.startsWith('event: ')) {

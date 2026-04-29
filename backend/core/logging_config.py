@@ -29,3 +29,10 @@ def setup_logging() -> None:
     logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
         logging.WARNING
     )
+
+    # Prevent uvicorn loggers from propagating to the root logger,
+    # which would cause every uvicorn message to be printed twice
+    # (once by uvicorn's own handler and again by the root handler
+    # installed via basicConfig above).
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).propagate = False

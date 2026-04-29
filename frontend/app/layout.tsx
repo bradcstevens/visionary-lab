@@ -16,7 +16,6 @@ import { ActivityLogPanel } from "@/components/activity-log/ActivityLogPanel";
 import { VideoQueueClient } from "@/components/video-queue-client";
 import { RefreshJobsButton } from "@/components/refresh-jobs-button";
 import { Toaster } from "@/components/ui/sonner";
-import dynamic from "next/dynamic";
 import { AnimatedLayout } from "@/components/animated-layout";
 import Script from "next/script";
 
@@ -110,15 +109,17 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                               <VideoQueueClient />
                             </div>
                           </div>
-                          <main className="flex-1 overflow-auto w-full transition-all duration-200">
-                            <AnimatedLayout>
-                              {children}
-                            </AnimatedLayout>
-                          </main>
+                          <div className="flex flex-1 min-h-0">
+                            <div className="flex-1 overflow-auto transition-all duration-200">
+                              <AnimatedLayout>
+                                {children}
+                              </AnimatedLayout>
+                            </div>
+                            <ActivityLogPanel />
+                          </div>
                         </SidebarInset>
                       </SidebarProvider>
                     </div>
-                    <ActivityLogPanel />
                     <Toaster />
                     </ActivityLogProvider>
                     </FolderProvider>
@@ -135,6 +136,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           dangerouslySetInnerHTML={{
             __html: `
               if ('serviceWorker' in navigator) {
+                ${process.env.NODE_ENV === 'production' ? `
                 window.addEventListener('load', function() {
                   navigator.serviceWorker.register('/sw.js')
                     .then(function(registration) {
@@ -144,6 +146,18 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                       console.log('SW registration failed: ', registrationError);
                     });
                 });
+                ` : `
+                // Development: unregister any service worker from prior production builds
+                // and clear all caches to prevent stale chunk intercepts (404s on /_next/...).
+                navigator.serviceWorker.getRegistrations().then(function(registrations) {
+                  registrations.forEach(function(r) { r.unregister(); });
+                });
+                if (typeof caches !== 'undefined') {
+                  caches.keys().then(function(keys) {
+                    keys.forEach(function(k) { caches.delete(k); });
+                  });
+                }
+                `}
               }
             `,
           }}

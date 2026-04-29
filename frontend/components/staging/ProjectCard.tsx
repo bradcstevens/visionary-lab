@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { StagingProject } from "@/services/stagingApi";
+import { StorageImage } from "./StorageImage";
 import { formatDistanceToNow } from "date-fns";
 
 interface ProjectCardProps {
@@ -63,11 +64,11 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
           <div className="grid grid-cols-4 gap-2 mb-3">
             {previewRooms.map((room) => (
               <div key={room.id} className="aspect-square relative rounded-md overflow-hidden bg-muted">
-                <img
+                <StorageImage
                   src={room.original_image_url}
                   alt={`${room.label} preview`}
                   className="w-full h-full object-cover"
-                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  fallbackClassName="w-full h-full rounded-md"
                 />
                 {room.variations.some(v => v.status === 'completed') && (
                   <div className="absolute -top-1 -right-1 w-3 h-3 bg-green-500 rounded-full border-2 border-background" />

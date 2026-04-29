@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     STAGING_MAX_VARIATIONS: int = 10
     STAGING_CONCURRENT_ROOMS: int = 3
     STAGING_COSMOS_CONTAINER_ID: str = "staging-projects"
+    STAGING_STALE_PROCESSING_MINUTES: int = 5  # Consider processing stale after this many minutes
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"

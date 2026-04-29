@@ -16,7 +16,8 @@ import {
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
-import { getProject, deleteProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
+import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -32,7 +33,9 @@ export default function ProjectDetailPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const streamCleanupRef = useRef<(() => void) | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestLoadIdRef = useRef(0);
@@ -73,6 +76,10 @@ export default function ProjectDetailPage() {
       }
     } catch (sasError) {
       console.warn('Failed to get SAS tokens, images may not load:', sasError);
+      toast.warning('Image previews may not load — storage access token unavailable', {
+        id: 'sas-token-warning',
+        duration: 8000,
+      });
     }
   };
 
@@ -106,6 +113,12 @@ export default function ProjectDetailPage() {
       loadProject();
     }, 500);
   }, [loadProject]);
+
+  // Computed state (must be before callbacks that reference these values)
+  const allPending = project?.rooms.every(r => r.status === 'pending') ?? false;
+  const hasFailed = project?.rooms.some(r => r.status === 'failed' || r.variations.some(v => v.status === 'failed')) ?? false;
+  const totalVariations = project?.rooms.reduce((sum, r) => sum + r.variations.length, 0) ?? 0;
+  const completedVariations = project?.rooms.reduce((sum, r) => sum + r.variations.filter(v => v.status === 'completed').length, 0) ?? 0;
 
   const handleStreamEvent = useCallback((event: StagingStreamEvent) => {
     switch (event.type) {
@@ -230,7 +243,22 @@ export default function ProjectDetailPage() {
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
     if (variation.status === 'completed' && variation.image_url) {
-      window.open(variation.image_url, '_blank');
+      setLightboxImage({
+        url: variation.image_url,
+        roomLabel: room.label,
+        variationIndex,
+        variations: room.variations,
+      });
+    }
+  };
+
+  const handleLightboxNavigate = (variationIndex: number) => {
+    if (!lightboxImage) return;
+    const variation = lightboxImage.variations[variationIndex];
+    if (variation?.status === 'completed' && variation.image_url) {
+      setLightboxImage((prev) =>
+        prev ? { ...prev, variationIndex, url: variation.image_url! } : null
+      );
     }
   };
 
@@ -256,11 +284,23 @@ export default function ProjectDetailPage() {
     }
   };
 
-  // Computed state
-  const allPending = project?.rooms.every(r => r.status === 'pending') ?? false;
-  const hasFailed = project?.rooms.some(r => r.status === 'failed' || r.variations.some(v => v.status === 'failed')) ?? false;
-  const totalVariations = project?.rooms.reduce((sum, r) => sum + r.variations.length, 0) ?? 0;
-  const completedVariations = project?.rooms.reduce((sum, r) => sum + r.variations.filter(v => v.status === 'completed').length, 0) ?? 0;
+  const handleResetProject = async () => {
+    setIsResetting(true);
+    try {
+      const updated = await resetProject(projectId);
+      await resolveImageUrls(updated);
+      setProject(updated);
+      toast.success('Project reset — ready to generate');
+    } catch (error) {
+      console.error('Failed to reset project:', error);
+      toast.error(error instanceof Error ? error.message : 'Failed to reset project');
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
+  // Detect stale processing: project loaded with 'processing' but no active SSE stream
+  const isStaleProcessing = project?.status === 'processing' && !isGenerating;
 
   if (isLoading || !project) {
     return (
@@ -394,6 +434,29 @@ export default function ProjectDetailPage() {
         );
       })()}
 
+      {/* Stale processing recovery banner */}
+      {isStaleProcessing && (
+        <div className="flex items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+          <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm font-medium">Generation was interrupted</p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              A previous generation didn&apos;t finish. Reset to try again, or regenerate individual rooms.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button size="sm" variant="outline" onClick={loadProject} disabled={isResetting}>
+              <RefreshCw className="h-3.5 w-3.5 mr-1" />
+              Refresh
+            </Button>
+            <Button size="sm" onClick={handleResetProject} disabled={isResetting}>
+              {isResetting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1" />}
+              Reset &amp; Retry
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Call-to-action for pending projects */}
       {allPending && project.rooms.length > 0 && !isGenerating && (
         <div className="flex flex-col items-center gap-4 py-8 px-6 bg-muted/30 border border-dashed border-muted-foreground/25 rounded-xl">
@@ -425,7 +488,7 @@ export default function ProjectDetailPage() {
       )}
 
       {/* Progress Tracker */}
-      <ProgressTracker project={project} />
+      <ProgressTracker project={project} isGenerating={isGenerating} />
 
       {/* Room Groups */}
       <div className="space-y-12">
@@ -481,6 +544,13 @@ export default function ProjectDetailPage() {
           </div>
         </div>
       )}
+
+      {/* Image lightbox */}
+      <ImageLightbox
+        image={lightboxImage}
+        onClose={() => setLightboxImage(null)}
+        onNavigate={handleLightboxNavigate}
+      />
     </div>
   );
 }

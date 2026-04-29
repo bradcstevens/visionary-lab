@@ -17,6 +17,14 @@ class SasTokenService {
   private fetchPromise: Promise<SasTokens> | null = null;
 
   /**
+   * Discard cached tokens so the next getTokens() call fetches fresh ones.
+   * Useful when an image load fails and a token refresh may fix it.
+   */
+  invalidate(): void {
+    this.tokens = null;
+  }
+
+  /**
    * Get valid SAS tokens, refreshing if needed
    * @returns Promise resolving to valid SAS tokens
    */

@@ -1,7 +1,7 @@
-const CACHE_NAME = 'visionary-lab-v1';
-const STATIC_CACHE = 'static-v1';
-const IMAGE_CACHE = 'images-v1';
-const API_CACHE = 'api-v1';
+const CACHE_NAME = 'visionary-lab-v2';
+const STATIC_CACHE = 'static-v2';
+const IMAGE_CACHE = 'images-v2';
+const API_CACHE = 'api-v2';
 
 // Assets to cache immediately
 const STATIC_ASSETS = [
@@ -62,8 +62,12 @@ self.addEventListener('fetch', (event) => {
   } else if (url.pathname.startsWith('/api/')) {
     // API calls - network first with short TTL
     event.respondWith(networkFirst(request, API_CACHE, 5 * 60 * 1000)); // 5 minutes
+  } else if (request.mode === 'navigate') {
+    // Navigation requests (HTML pages) — always network-first to prevent
+    // stale HTML from referencing non-existent _next/static chunks (black screen)
+    event.respondWith(networkFirst(request, CACHE_NAME, 60 * 60 * 1000)); // 1 hour fallback
   } else if (url.origin === self.location.origin) {
-    // Same origin requests - stale while revalidate
+    // Other same-origin requests (fonts, images, etc.) - stale while revalidate
     event.respondWith(staleWhileRevalidate(request, CACHE_NAME));
   }
 });

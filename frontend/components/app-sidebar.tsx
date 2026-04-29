@@ -242,14 +242,12 @@ export function AppSidebar() {
             <SidebarMenu>
               {createItems.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <Link href={item.url} passHref legacyBehavior>
-                    <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
-                      <a title={item.description}>
-                        <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
-                        <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </Link>
+                  <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
+                    <Link href={item.url} title={item.description}>
+                      <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                      <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
+                    </Link>
+                  </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>
@@ -284,18 +282,16 @@ export function AppSidebar() {
                   <SidebarMenu>
                     {/* Show All Videos option */}
                     <SidebarMenuItem>
-                      <Link href="/new-video" passHref legacyBehavior>
-                        <SidebarMenuButton 
+                      <SidebarMenuButton 
                           asChild
                           data-active={isVideoFolderActive(null)}
                           className="data-[active=true]:bg-accent"
                         >
-                          <a>
+                          <Link href="/new-video">
                             <FileVideo className="h-4 w-4 mr-2" />
                             <span>All Videos</span>
-                          </a>
+                          </Link>
                         </SidebarMenuButton>
-                      </Link>
                     </SidebarMenuItem>
                     
                     {/* Video Folder List */}
@@ -361,18 +357,16 @@ export function AppSidebar() {
                   <SidebarMenu>
                     {/* Show All Images option */}
                     <SidebarMenuItem>
-                      <Link href="/new-image" passHref legacyBehavior>
-                        <SidebarMenuButton 
+                      <SidebarMenuButton 
                           asChild
                           data-active={isImageFolderActive(null)}
                           className="data-[active=true]:bg-accent"
                         >
-                          <a>
+                          <Link href="/new-image">
                             <ImageIcon className="h-4 w-4 mr-2" />
                             <span>All Images</span>
-                          </a>
+                          </Link>
                         </SidebarMenuButton>
-                      </Link>
                     </SidebarMenuItem>
                     
                     {/* Image Folder List */}
@@ -417,14 +411,12 @@ export function AppSidebar() {
             <SidebarMenu>
               {manageItems.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <Link href={item.url} passHref legacyBehavior>
-                    <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
-                      <a title={item.description}>
-                        <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
-                        <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </Link>
+                  <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
+                    <Link href={item.url} title={item.description}>
+                      <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                      <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
+                    </Link>
+                  </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>

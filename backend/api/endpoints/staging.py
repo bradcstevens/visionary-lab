@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
+from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
 from backend.models.design_brief import (
     ChatRequest,
@@ -100,6 +101,12 @@ async def list_projects(
     total = storage.count_projects()
     projects = []
     for p in projects_raw:
+        # Auto-heal stale processing states on list too
+        if reconcile_project(p):
+            try:
+                storage.update_project(p["id"], p)
+            except Exception as e:
+                logger.warning("Failed to persist reconciled project %s: %s", p.get("id"), e)
         clean = {k: v for k, v in p.items() if k != "doc_type" and not k.startswith("_")}
         projects.append(StagingProject(**clean))
     return ProjectListResponse(projects=projects, total=total)
@@ -113,6 +120,14 @@ async def get_project(
     project = storage.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Auto-heal stale processing states (server crashed mid-generation)
+    if reconcile_project(project):
+        try:
+            storage.update_project(project_id, project)
+        except Exception as e:
+            logger.warning("Failed to persist reconciled project %s: %s", project_id, e)
+
     clean = {k: v for k, v in project.items() if k != "doc_type" and not k.startswith("_")}
     return ProjectResponse(project=StagingProject(**clean))
 
@@ -149,6 +164,27 @@ async def delete_project(
         raise HTTPException(status_code=404, detail="Project not found")
 
     return {"status": "deleted", "project_id": project_id, "blobs_deleted": deleted_blobs}
+
+
+@router.post("/projects/{project_id}/reset", response_model=ProjectResponse)
+async def reset_project(
+    project_id: str,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Force-reset a stuck project: all processing/failed items → pending."""
+    project = storage.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    reconcile_project(project, force=True)
+    try:
+        storage.update_project(project_id, project)
+    except Exception as e:
+        logger.error("Failed to persist reset for project %s: %s", project_id, e)
+        raise HTTPException(status_code=500, detail="Failed to reset project")
+
+    clean = {k: v for k, v in project.items() if k != "doc_type" and not k.startswith("_")}
+    return ProjectResponse(project=StagingProject(**clean))
 
 
 @router.post("/projects/{project_id}/rooms", response_model=UploadRoomsResponse)
@@ -216,6 +252,13 @@ async def generate_project(
     project_data = storage.get_project(project_id)
     if not project_data:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Auto-heal stale processing before starting
+    if reconcile_project(project_data):
+        try:
+            storage.update_project(project_id, project_data)
+        except Exception as e:
+            logger.warning("Failed to persist reconciled project %s: %s", project_id, e)
 
     clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
     project = StagingProject(**clean)
@@ -292,6 +335,140 @@ async def regenerate_room(
                     fresh_project.status = "completed" if any_completed else "failed"
                     storage.update_project(project_id, json.loads(fresh_project.json()))
         yield _sse_event("project_completed", {"status": project.status})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/projects/{project_id}/rooms/{room_id}/variations/{variation_id}/regenerate")
+async def regenerate_variation(
+    project_id: str,
+    room_id: str,
+    variation_id: str,
+    strategy: str = "fresh",
+    storage: StagingStorageService = Depends(get_staging_storage),
+    pipeline=Depends(get_staging_pipeline),
+):
+    """Regenerate a single variation. strategy=retry reuses the previous prompt; strategy=fresh generates a new one."""
+    if strategy not in ("retry", "fresh"):
+        raise HTTPException(status_code=400, detail="strategy must be 'retry' or 'fresh'")
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
+    project = StagingProject(**clean)
+
+    room = next((r for r in project.rooms if r.id == room_id), None)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    variation = next((v for v in room.variations if v.id == variation_id), None)
+    if not variation:
+        raise HTTPException(status_code=404, detail="Variation not found")
+
+    if variation.status == ItemStatus.PROCESSING:
+        raise HTTPException(status_code=409, detail="Variation is already being processed")
+
+    # Determine the prompt to use
+    adapted_prompt = None
+    fallback_to_fresh = False
+
+    if strategy == "retry":
+        if variation.generation_metadata and isinstance(variation.generation_metadata, dict):
+            adapted_prompt = variation.generation_metadata.get("adapted_prompt")
+        elif hasattr(variation.generation_metadata, "adapted_prompt"):
+            adapted_prompt = variation.generation_metadata.adapted_prompt
+        if not adapted_prompt:
+            fallback_to_fresh = True
+
+    # Reset the variation
+    variation.status = ItemStatus.PENDING
+    variation.image_url = None
+    variation.error = None
+
+    # Update room status to processing
+    room.status = ItemStatus.PROCESSING
+    storage.update_project(project_id, json.loads(project.json()))
+
+    async def event_stream():
+        nonlocal adapted_prompt
+        final_status = "completed"
+
+        try:
+            if strategy == "fresh" or fallback_to_fresh:
+                # Check for design brief first
+                if project.design_brief:
+                    from backend.core.brief_generator import BriefGeneratorService
+                    from backend.core import async_llm_client
+                    from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+
+                    brief = DBModel(**project.design_brief)
+                    analyses = [ImageAnalysis(**a) for a in (project.analyses or [])]
+                    if analyses:
+                        brief_service = BriefGeneratorService(
+                            async_llm_client=async_llm_client,
+                            llm_deployment=settings.LLM_DEPLOYMENT,
+                        )
+                        brief_prompts = await brief_service.brief_to_prompts(
+                            brief=brief,
+                            image_analyses=analyses,
+                            n_variations=1,
+                        )
+                        if room.id in brief_prompts and brief_prompts[room.id]:
+                            adapted_prompt = brief_prompts[room.id][0]
+
+                if not adapted_prompt:
+                    import base64
+                    image_content, _ = pipeline.blob_service.get_asset_content(
+                        blob_name=pipeline._extract_blob_name(room.original_image_url),
+                        container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+                    )
+                    if image_content is None:
+                        raise RuntimeError("Original image not found in storage")
+                    image_b64 = base64.b64encode(image_content).decode("utf-8")
+                    analysis = await pipeline.analyze_room(image_b64)
+                    room_description = analysis.get("description", "A room")
+                    prompts = await pipeline.adapt_prompt(
+                        user_prompt=project.prompt,
+                        room_analysis=room_description,
+                        n_variations=1,
+                    )
+                    adapted_prompt = prompts[0]
+
+            if not adapted_prompt:
+                yield _sse_event("error", {"error": "Failed to generate or retrieve adapted prompt"})
+                return
+
+            async for event in pipeline.process_single_variation(
+                project, room, variation, adapted_prompt
+            ):
+                yield _sse_event(event["type"], event)
+
+        finally:
+            # Recalculate room and project status
+            fresh = storage.get_project(project_id)
+            if fresh:
+                clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+                fresh_project = StagingProject(**clean_fresh)
+                target_room = next((r for r in fresh_project.rooms if r.id == room_id), None)
+                if target_room:
+                    any_completed = any(v.status == "completed" for v in target_room.variations)
+                    any_pending = any(v.status in ("pending", "processing") for v in target_room.variations)
+                    if any_pending:
+                        target_room.status = "processing"
+                    elif any_completed:
+                        target_room.status = "completed"
+                    else:
+                        target_room.status = "failed"
+                any_room_processing = any(r.status in ("pending", "processing") for r in fresh_project.rooms)
+                if not any_room_processing:
+                    any_room_completed = any(r.status == "completed" for r in fresh_project.rooms)
+                    fresh_project.status = "completed" if any_room_completed else "failed"
+                storage.update_project(project_id, json.loads(fresh_project.json()))
+                final_status = fresh_project.status
+
+        yield _sse_event("project_completed", {"status": final_status})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -3,6 +3,8 @@
 import { AlertCircle, RefreshCw, Loader2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import { StorageImage } from "./StorageImage";
 import { cn } from "@/utils/cn";
 
 interface VariationThumbnailProps {
@@ -27,17 +29,21 @@ export function VariationThumbnail({
       case 'completed':
         return (
           <div className="relative w-full h-full group cursor-pointer" onClick={onClick}>
-            <img 
-              src={imageUrl} 
+            <StorageImage
+              src={imageUrl}
               alt={`Variation ${index + 1}`}
               className="w-full h-full object-cover rounded-lg"
+              fallbackClassName="w-full h-full rounded-lg"
+              fallbackText="Preview unavailable"
+              overlay={
+                <Badge 
+                  variant="secondary" 
+                  className="absolute top-2 right-2 bg-black/70 text-white text-xs"
+                >
+                  {index + 1}
+                </Badge>
+              }
             />
-            <Badge 
-              variant="secondary" 
-              className="absolute top-2 right-2 bg-black/70 text-white text-xs"
-            >
-              {index + 1}
-            </Badge>
           </div>
         );
 
@@ -53,34 +59,52 @@ export function VariationThumbnail({
           </div>
         );
 
-      case 'failed':
-        return (
-          <div className="w-full h-full bg-destructive/10 rounded-lg flex items-center justify-center border-2 border-destructive/20">
-            <div className="flex flex-col items-center gap-1.5 p-2">
-              <AlertCircle className="h-5 w-5 text-destructive" />
-              <Badge variant="destructive" className="text-xs">
-                {index + 1}
-              </Badge>
-              <span className="text-[10px] text-destructive/80 text-center leading-tight max-w-[90%] line-clamp-2">
-                {error || "Generation failed"}
-              </span>
-              {onRetry && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2 text-xs hover:bg-destructive/20 mt-0.5"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onRetry();
-                  }}
-                >
-                  <RefreshCw className="h-3 w-3 mr-1" />
-                  Retry
-                </Button>
-              )}
-            </div>
+      case 'failed': {
+        const shortError = error
+          ? error.length > 60 ? error.slice(0, 57) + "…" : error
+          : "Generation failed";
+
+        const thumbnail = (
+          <div className="w-full h-full bg-destructive/10 rounded-lg border-2 border-destructive/20 flex flex-col items-center justify-center overflow-hidden p-2 gap-1">
+            <AlertCircle className="h-5 w-5 text-destructive shrink-0" />
+            <Badge variant="destructive" className="text-xs shrink-0">
+              {index + 1}
+            </Badge>
+            <span className="text-[10px] text-destructive/80 text-center leading-tight line-clamp-2 break-words w-full px-1">
+              {shortError}
+            </span>
+            {onRetry && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[10px] hover:bg-destructive/20 shrink-0"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRetry();
+                }}
+              >
+                <RefreshCw className="h-3 w-3 mr-1" />
+                Retry
+              </Button>
+            )}
           </div>
         );
+
+        if (error && error.length > 60) {
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                {thumbnail}
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-xs break-words whitespace-pre-wrap text-xs">
+                {error}
+              </TooltipContent>
+            </Tooltip>
+          );
+        }
+
+        return thumbnail;
+      }
 
       case 'pending':
       default:

@@ -6,16 +6,23 @@ import { StagingProject } from "@/services/stagingApi";
 
 interface ProgressTrackerProps {
   project: StagingProject;
+  isGenerating?: boolean;
 }
 
-export function ProgressTracker({ project }: ProgressTrackerProps) {
+export function ProgressTracker({ project, isGenerating }: ProgressTrackerProps) {
   // Only show if project is processing
   if (project.status !== 'processing') {
     return null;
   }
 
-  const progressPercentage = project.total_variations > 0 
-    ? (project.completed_variations / project.total_variations) * 100 
+  // Compute totals from rooms data (backend doesn't populate top-level fields)
+  const totalVariations = project.rooms.reduce((sum, r) => sum + r.variations.length, 0);
+  const completedVariations = project.rooms.reduce(
+    (sum, r) => sum + r.variations.filter(v => v.status === 'completed').length, 0
+  );
+
+  const progressPercentage = totalVariations > 0 
+    ? (completedVariations / totalVariations) * 100 
     : 0;
 
   const getRoomStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
@@ -32,13 +39,22 @@ export function ProgressTracker({ project }: ProgressTrackerProps) {
     }
   };
 
+  // Stale = project is processing but no active SSE stream in this tab
+  const isStale = !isGenerating;
+
   return (
     <div className="space-y-4 p-4 bg-muted/30 rounded-lg border">
       <div className="flex items-center justify-between">
         <h3 className="font-medium text-sm text-muted-foreground">Generation Progress</h3>
-        <Badge variant="secondary" className="animate-pulse">
-          Processing...
-        </Badge>
+        {isStale ? (
+          <Badge variant="outline" className="text-amber-600 border-amber-500/30">
+            Interrupted
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className="animate-pulse">
+            Processing...
+          </Badge>
+        )}
       </div>
 
       {/* Overall Progress Bar */}
@@ -46,7 +62,7 @@ export function ProgressTracker({ project }: ProgressTrackerProps) {
         <div className="flex items-center justify-between text-sm">
           <span>Overall Progress</span>
           <span className="font-medium">
-            {project.completed_variations}/{project.total_variations} variations
+            {completedVariations}/{totalVariations} variations
           </span>
         </div>
         <Progress value={progressPercentage} className="h-2" />

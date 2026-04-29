@@ -175,7 +175,7 @@ test.describe('Component Source Verification', () => {
     expect(source).toContain('MAX_ENTRIES');
   });
 
-  test('ActivityLogPanel component exists and uses Sheet', async () => {
+  test('ActivityLogPanel component exists as embedded panel', async () => {
     const { readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
 
@@ -184,12 +184,12 @@ test.describe('Component Source Verification', () => {
       'utf-8',
     );
 
-    expect(source).toContain('Sheet');
-    expect(source).toContain('SheetContent');
-    expect(source).toContain('side="right"');
-    expect(source).toContain('Activity Log');
+    expect(source).toContain('Activity');
     expect(source).toContain('autoScroll');
     expect(source).toContain('No activity yet');
+    // Embedded panel uses flex column, not Sheet overlay
+    expect(source).toContain('flex flex-col');
+    expect(source).not.toContain('Sheet');
   });
 
   test('ActivityLogToggle component exists and uses Terminal icon', async () => {
@@ -203,10 +203,10 @@ test.describe('Component Source Verification', () => {
 
     expect(source).toContain('Terminal');
     expect(source).toContain('useActivityLog');
-    expect(source).toContain('hasActivity');
+    expect(source).toContain('entries.length');
   });
 
-  test('LogEntry component exists with level-based color mapping', async () => {
+  test('LogEntry component exists with theme-responsive level colors', async () => {
     const { readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
 
@@ -215,10 +215,16 @@ test.describe('Component Source Verification', () => {
       'utf-8',
     );
 
-    expect(source).toContain('text-blue-400');
-    expect(source).toContain('text-green-400');
-    expect(source).toContain('text-red-400');
-    expect(source).toContain('text-amber-400');
+    // Light mode text colors (700 shade)
+    expect(source).toContain('text-blue-700');
+    expect(source).toContain('text-emerald-700');
+    expect(source).toContain('text-red-700');
+    expect(source).toContain('text-amber-700');
+    // Dark mode text colors via dark: prefix
+    expect(source).toContain('dark:text-blue-300');
+    expect(source).toContain('dark:text-emerald-300');
+    expect(source).toContain('dark:text-red-300');
+    expect(source).toContain('dark:text-amber-300');
     expect(source).toContain('formatTime');
   });
 
@@ -277,5 +283,100 @@ test.describe('Component Source Verification', () => {
     );
 
     expect(source).toContain('updates["status"] = "pending"');
+  });
+});
+
+test.describe('Activity Log Theme Responsiveness', () => {
+
+  test('ActivityLogPanel uses semantic theme tokens instead of hardcoded dark colors', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const source = readFileSync(
+      join(__dirname, '..', '..', 'components', 'activity-log', 'ActivityLogPanel.tsx'),
+      'utf-8',
+    );
+
+    // Must use semantic background token, NOT hardcoded dark hex
+    expect(source).toContain('bg-background');
+    expect(source).not.toContain('bg-[#0a0e14]');
+
+    // Borders must use semantic border token
+    expect(source).toContain('border-border');
+    expect(source).not.toContain("border-white/[0.06]");
+    expect(source).not.toContain("border-white/[0.04]");
+
+    // Badge/summary backgrounds use semantic muted token
+    expect(source).toContain('bg-muted');
+    expect(source).not.toContain("bg-white/[0.06]");
+    expect(source).not.toContain("bg-white/[0.01]");
+
+    // Jump-to-bottom button uses semantic tokens
+    expect(source).toContain('bg-card');
+    expect(source).not.toContain('bg-[#161b22]');
+    expect(source).not.toContain('hover:bg-[#1c2128]');
+  });
+
+  test('ActivityLogPanel status indicators have light and dark variants', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const source = readFileSync(
+      join(__dirname, '..', '..', 'components', 'activity-log', 'ActivityLogPanel.tsx'),
+      'utf-8',
+    );
+
+    // Each status color must have both a light-mode and dark-mode variant
+    expect(source).toContain('text-emerald-600');
+    expect(source).toContain('dark:text-emerald-400');
+    expect(source).toContain('text-red-600');
+    expect(source).toContain('dark:text-red-400');
+    expect(source).toContain('text-amber-600');
+    expect(source).toContain('dark:text-amber-400');
+    expect(source).toContain('text-blue-600');
+    expect(source).toContain('dark:text-blue-400');
+
+    // Live indicator has dark: variant
+    expect(source).toContain('bg-emerald-500');
+    expect(source).toContain('dark:bg-emerald-400');
+  });
+
+  test('LogEntry level config has light and dark hover backgrounds', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const source = readFileSync(
+      join(__dirname, '..', '..', 'components', 'activity-log', 'LogEntry.tsx'),
+      'utf-8',
+    );
+
+    // Light mode hover uses -50 shade, dark mode uses opacity-based
+    expect(source).toContain('hover:bg-blue-50');
+    expect(source).toContain('dark:hover:bg-blue-400');
+    expect(source).toContain('hover:bg-emerald-50');
+    expect(source).toContain('dark:hover:bg-emerald-400');
+    expect(source).toContain('hover:bg-red-50');
+    expect(source).toContain('dark:hover:bg-red-400');
+    expect(source).toContain('hover:bg-amber-50');
+    expect(source).toContain('dark:hover:bg-amber-400');
+  });
+
+  test('LogEntry chips and borders use semantic tokens', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const source = readFileSync(
+      join(__dirname, '..', '..', 'components', 'activity-log', 'LogEntry.tsx'),
+      'utf-8',
+    );
+
+    // Row borders should use semantic border token
+    expect(source).toContain('border-border');
+    expect(source).not.toContain("border-white/[0.04]");
+
+    // Detail chips use semantic bg-muted instead of hardcoded white-alpha
+    expect(source).toContain('bg-muted');
+    expect(source).not.toContain("bg-white/[0.04]");
+    expect(source).not.toContain("border-white/[0.06]");
   });
 });

@@ -147,8 +147,38 @@ class ImagePipelineService:
                         "Using multiple reference images requires organization verification"
                     )
 
-            # Run sync SDK call in thread pool to not block event loop
-            response = await asyncio.to_thread(client.edit_image, **params)
+            # Run sync SDK call in thread pool, opening file paths as needed
+            def _sync_edit():
+                open_files = []
+                try:
+                    img = params.get("image")
+                    if isinstance(img, list):
+                        opened = []
+                        for item in img:
+                            if isinstance(item, str) and os.path.isfile(item):
+                                f = open(item, "rb")
+                                open_files.append(f)
+                                opened.append(f)
+                            else:
+                                opened.append(item)
+                        params["image"] = opened
+                    elif isinstance(img, str) and os.path.isfile(img):
+                        f = open(img, "rb")
+                        open_files.append(f)
+                        params["image"] = f
+
+                    mask_val = params.get("mask")
+                    if isinstance(mask_val, str) and os.path.isfile(mask_val):
+                        f = open(mask_val, "rb")
+                        open_files.append(f)
+                        params["mask"] = f
+
+                    return client.edit_image(**params)
+                finally:
+                    for f in open_files:
+                        f.close()
+
+            response = await asyncio.to_thread(_sync_edit)
             token_usage = self._extract_token_usage(response)
 
             return ImageGenerationResponse(
@@ -391,23 +421,32 @@ class ImagePipelineService:
                         mask=mask,
                     )
                 else:
-                    edit_request = ImageEditRequest(
-                        prompt=pipeline_request.prompt,
-                        model=pipeline_request.model,
-                        n=pipeline_request.n,
-                        size=pipeline_request.size,
-                        response_format=pipeline_request.response_format,
-                        quality=pipeline_request.quality,
-                        output_format=pipeline_request.output_format,
-                        output_compression=pipeline_request.output_compression,
-                        background=pipeline_request.background,
-                        moderation=pipeline_request.moderation,
-                        user=pipeline_request.user,
-                        input_fidelity=pipeline_request.input_fidelity,
-                        image=self._resolve_edit_images(pipeline_request),
-                        mask=pipeline_request.mask_image_url,
-                    )
-                    generation_response = await self.edit(edit_request)
+                    resolved_image_paths = self._resolve_edit_images(pipeline_request)
+                    try:
+                        edit_request = ImageEditRequest(
+                            prompt=pipeline_request.prompt,
+                            model=pipeline_request.model,
+                            n=pipeline_request.n,
+                            size=pipeline_request.size,
+                            response_format=pipeline_request.response_format,
+                            quality=pipeline_request.quality,
+                            output_format=pipeline_request.output_format,
+                            output_compression=pipeline_request.output_compression,
+                            background=pipeline_request.background,
+                            moderation=pipeline_request.moderation,
+                            user=pipeline_request.user,
+                            input_fidelity=pipeline_request.input_fidelity,
+                            image=resolved_image_paths,
+                            mask=pipeline_request.mask_image_url,
+                        )
+                        generation_response = await self.edit(edit_request)
+                    finally:
+                        for path in resolved_image_paths:
+                            if isinstance(path, str) and os.path.isfile(path):
+                                try:
+                                    os.remove(path)
+                                except OSError:
+                                    pass
                 steps.append(
                     PipelineStepResult(
                         step="edit",
