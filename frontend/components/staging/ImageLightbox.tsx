@@ -3,7 +3,13 @@
 import { useEffect, useCallback, useMemo } from "react";
 import { Dialog, DialogPortal, DialogOverlay, DialogTitle } from "@/components/ui/dialog";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { X, ExternalLink, ChevronLeft, ChevronRight, ImageOff } from "lucide-react";
+import { X, ExternalLink, RefreshCw, RotateCcw, Sparkles, Loader2, ChevronLeft, ChevronRight, ImageOff } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { StorageImage } from "./StorageImage";
 import { cn } from "@/utils/cn";
@@ -21,9 +27,11 @@ interface ImageLightboxProps {
   image: LightboxImage | null;
   onClose: () => void;
   onNavigate: (variationIndex: number) => void;
+  onRegenerate?: (strategy: 'retry' | 'fresh') => void;
+  isRegenerating?: boolean;
 }
 
-export function ImageLightbox({ image, onClose, onNavigate }: ImageLightboxProps) {
+export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRegenerating }: ImageLightboxProps) {
   // Completed variations for navigation
   const completedIndices = useMemo(() => {
     if (!image) return [];
@@ -94,6 +102,35 @@ export function ImageLightbox({ image, onClose, onNavigate }: ImageLightboxProps
 
             {/* Right: actions */}
             <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
+              {onRegenerate && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-white/70 hover:text-white hover:bg-white/10 h-8 px-2"
+                      disabled={isRegenerating}
+                      aria-label="Regenerate this variation"
+                    >
+                      {isRegenerating ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-48">
+                    <DropdownMenuItem onClick={() => onRegenerate('retry')}>
+                      <RotateCcw className="h-4 w-4 mr-2" />
+                      Retry Same Prompt
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => onRegenerate('fresh')}>
+                      <Sparkles className="h-4 w-4 mr-2" />
+                      Try Something New
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
               {image?.url && (
                 <Button
                   size="sm"
@@ -156,7 +193,10 @@ export function ImageLightbox({ image, onClose, onNavigate }: ImageLightboxProps
                 <StorageImage
                   src={image.url}
                   alt={`${image.roomLabel} variation ${image.variationIndex + 1}`}
-                  className="block max-w-[88vw] sm:max-w-[82vw] lg:max-w-4xl max-h-[calc(100vh-10rem)] w-auto h-auto object-contain"
+                  className={cn(
+                    "block max-w-[88vw] sm:max-w-[82vw] lg:max-w-4xl max-h-[calc(100vh-10rem)] w-auto h-auto object-contain",
+                    isRegenerating && "opacity-40"
+                  )}
                   fallbackClassName="w-[60vw] sm:w-[50vw] lg:w-[40vw] aspect-[4/3] rounded-xl bg-neutral-900/80"
                   fallbackText="Image could not be loaded"
                   overlay={
@@ -168,6 +208,14 @@ export function ImageLightbox({ image, onClose, onNavigate }: ImageLightboxProps
                     </div>
                   }
                 />
+                {isRegenerating && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="flex flex-col items-center gap-3">
+                      <Loader2 className="h-8 w-8 animate-spin text-white" />
+                      <span className="text-sm text-white/80 font-medium">Regenerating...</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Next arrow */}
