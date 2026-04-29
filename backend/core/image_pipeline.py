@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from fastapi import HTTPException, UploadFile
+from openai import RateLimitError
 from PIL import Image
 
 from backend.core import llm_client, image_sas_token
@@ -42,6 +43,38 @@ class ImagePipelineService:
 
     def __init__(self) -> None:
         self._image_analyzer: Optional[ImageAnalyzer] = None
+
+    async def _call_with_retry(self, coro_fn, *args, **kwargs):
+        """Wrap an async callable with 429 retry + exponential backoff.
+
+        Respects ``Retry-After`` header on the response when present;
+        otherwise uses exponential backoff (base * 2**attempt).
+        """
+        max_attempts = settings.IMAGE_GEN_RETRY_ATTEMPTS
+        base_delay = settings.IMAGE_GEN_RETRY_BASE_DELAY
+
+        for attempt in range(max_attempts):
+            try:
+                return await coro_fn(*args, **kwargs)
+            except RateLimitError as exc:
+                if attempt >= max_attempts - 1:
+                    raise
+                retry_after: Optional[float] = None
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    retry_after_str = response.headers.get("retry-after")
+                    if retry_after_str:
+                        try:
+                            retry_after = float(retry_after_str)
+                        except (ValueError, TypeError):
+                            retry_after = None
+                delay = retry_after if retry_after is not None else base_delay * (2 ** attempt)
+                logger.warning(
+                    "Rate limited (429), attempt %d/%d. Retrying in %.1fs",
+                    attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError("Unreachable")  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Generation / Edit helpers
@@ -82,7 +115,9 @@ class ImagePipelineService:
                 params["user"] = request.user
 
             # Run sync SDK call in thread pool to not block event loop
-            response = await asyncio.to_thread(client.generate_image, **params)
+            response = await self._call_with_retry(
+                asyncio.to_thread, client.generate_image, **params
+            )
             token_usage = self._extract_token_usage(response)
 
             return ImageGenerationResponse(
@@ -91,6 +126,9 @@ class ImagePipelineService:
                 imgen_model_response=response,
                 token_usage=token_usage,
             )
+        except RateLimitError as exc:
+            logger.error("Rate limit exceeded after %d retries: %s", settings.IMAGE_GEN_RETRY_ATTEMPTS, exc)
+            raise HTTPException(status_code=429, detail="Rate limit exceeded; try again later.")
         except Exception as exc:  # pragma: no cover - delegated to HTTP response
             logger.error("Error generating image: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -147,11 +185,20 @@ class ImagePipelineService:
                         "Using multiple reference images requires organization verification"
                     )
 
+            # Capture original image/mask paths to avoid closure mutation issues on retry
+            original_image = params.get("image")
+            original_mask = params.get("mask")
+
             # Run sync SDK call in thread pool, opening file paths as needed
             def _sync_edit():
+                local_params = dict(params)
+                local_params["image"] = original_image
+                if original_mask is not None:
+                    local_params["mask"] = original_mask
+
                 open_files = []
                 try:
-                    img = params.get("image")
+                    img = local_params.get("image")
                     if isinstance(img, list):
                         opened = []
                         for item in img:
@@ -161,24 +208,24 @@ class ImagePipelineService:
                                 opened.append(f)
                             else:
                                 opened.append(item)
-                        params["image"] = opened
+                        local_params["image"] = opened
                     elif isinstance(img, str) and os.path.isfile(img):
                         f = open(img, "rb")
                         open_files.append(f)
-                        params["image"] = f
+                        local_params["image"] = f
 
-                    mask_val = params.get("mask")
+                    mask_val = local_params.get("mask")
                     if isinstance(mask_val, str) and os.path.isfile(mask_val):
                         f = open(mask_val, "rb")
                         open_files.append(f)
-                        params["mask"] = f
+                        local_params["mask"] = f
 
-                    return client.edit_image(**params)
+                    return client.edit_image(**local_params)
                 finally:
                     for f in open_files:
                         f.close()
 
-            response = await asyncio.to_thread(_sync_edit)
+            response = await self._call_with_retry(asyncio.to_thread, _sync_edit)
             token_usage = self._extract_token_usage(response)
 
             return ImageGenerationResponse(
@@ -187,6 +234,9 @@ class ImagePipelineService:
                 imgen_model_response=response,
                 token_usage=token_usage,
             )
+        except RateLimitError as exc:
+            logger.error("Rate limit exceeded after %d retries: %s", settings.IMAGE_GEN_RETRY_ATTEMPTS, exc)
+            raise HTTPException(status_code=429, detail="Rate limit exceeded; try again later.")
         except Exception as exc:  # pragma: no cover - delegated to HTTP response
             logger.error("Error editing image: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc))
