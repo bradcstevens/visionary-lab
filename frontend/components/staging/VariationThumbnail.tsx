@@ -1,9 +1,15 @@
 "use client"
 
-import { AlertCircle, RefreshCw, Loader2 } from "lucide-react";
+import { AlertCircle, RefreshCw, Loader2, RotateCcw, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { StorageImage } from "./StorageImage";
 import { cn } from "@/utils/cn";
 
@@ -14,6 +20,8 @@ interface VariationThumbnailProps {
   index: number;
   onClick?: () => void;
   onRetry?: () => void;
+  onRegenerate?: (strategy: 'retry' | 'fresh') => void;
+  isRegenerating?: boolean;
 }
 
 export function VariationThumbnail({ 
@@ -22,11 +30,25 @@ export function VariationThumbnail({
   error, 
   index, 
   onClick, 
-  onRetry 
+  onRetry,
+  onRegenerate,
+  isRegenerating,
 }: VariationThumbnailProps) {
   const renderContent = () => {
     switch (status) {
       case 'completed':
+        if (isRegenerating) {
+          return (
+            <div className="w-full h-full bg-muted rounded-lg flex items-center justify-center">
+              <div className="flex flex-col items-center gap-2">
+                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                <Badge variant="secondary" className="text-xs">
+                  {index + 1}
+                </Badge>
+              </div>
+            </div>
+          );
+        }
         return (
           <div className="relative w-full h-full group cursor-pointer" onClick={onClick}>
             <StorageImage
@@ -36,12 +58,40 @@ export function VariationThumbnail({
               fallbackClassName="w-full h-full rounded-lg"
               fallbackText="Preview unavailable"
               overlay={
-                <Badge 
-                  variant="secondary" 
-                  className="absolute top-2 right-2 bg-black/70 text-white text-xs"
-                >
-                  {index + 1}
-                </Badge>
+                <>
+                  <Badge 
+                    variant="secondary" 
+                    className="absolute top-2 right-2 bg-black/70 text-white text-xs"
+                  >
+                    {index + 1}
+                  </Badge>
+                  {onRegenerate && (
+                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-200 rounded-lg flex items-center justify-center">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="opacity-0 group-hover:opacity-100 transition-opacity duration-200 h-8 w-8 p-0 rounded-full bg-white/90 hover:bg-white text-gray-700 shadow-md"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <RefreshCw className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="center" side="top" className="w-48">
+                          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('retry'); }}>
+                            <RotateCcw className="h-4 w-4 mr-2" />
+                            Retry Same Prompt
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('fresh'); }}>
+                            <Sparkles className="h-4 w-4 mr-2" />
+                            Try Something New
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  )}
+                </>
               }
             />
           </div>
