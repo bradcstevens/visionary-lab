@@ -1,5 +1,19 @@
 ## Visionary Lab Changelog
 
+<a name="0.2.0"></a>
+# 0.2.0 (2026-04-29)
+
+*Features*
+* Parallel processing for staging projects: rooms now generate concurrently via an `asyncio.Queue` worker pool gated by `STAGING_CONCURRENT_ROOMS` (default 3). A 5-room project completes in ~2 minutes vs ~5 minutes sequentially.
+* New `POST /api/v1/images/batch` endpoint accepts up to 20 image generation/edit requests at once and processes them in parallel, throttled by a module-level semaphore (`IMAGE_BATCH_MAX_CONCURRENT`, default 3).
+* Automatic retry with exponential backoff on Azure 429 rate-limit responses (`IMAGE_GEN_RETRY_ATTEMPTS=3`, `IMAGE_GEN_RETRY_BASE_DELAY=2.0`); honours the `Retry-After` header when present.
+
+*Reliability*
+* Worker tasks are cancelled cleanly on consumer disconnect (no orphaned room generation continuing after the SSE stream closes).
+* Image edit retries no longer leak file handles when the API call fails mid-stream.
+
+---
+
 <a name="0.1.0"></a>
 # 0.1.0 (2024-04-28)
 
