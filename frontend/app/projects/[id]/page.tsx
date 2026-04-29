@@ -17,7 +17,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
-import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -36,6 +36,8 @@ export default function ProjectDetailPage() {
   const [isResetting, setIsResetting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
+  const [regeneratingVariationId, setRegeneratingVariationId] = useState<string | null>(null);
+  const [lightboxContext, setLightboxContext] = useState<{ room: Room; variationIndex: number } | null>(null);
   const streamCleanupRef = useRef<(() => void) | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestLoadIdRef = useRef(0);
@@ -60,6 +62,23 @@ export default function ProjectDetailPage() {
       loadProject();
     }
   }, [projectId]);
+
+  // Sync lightbox image URL with project data after reload
+  useEffect(() => {
+    if (lightboxContext && project) {
+      const room = project.rooms.find(r => r.id === lightboxContext.room.id);
+      if (room) {
+        const variation = room.variations[lightboxContext.variationIndex];
+        if (variation?.status === 'completed' && variation.image_url) {
+          setLightboxImage(prev => prev ? {
+            ...prev,
+            url: variation.image_url!,
+          } : null);
+          setLightboxContext(prev => prev ? { ...prev, room } : null);
+        }
+      }
+    }
+  }, [project]);
 
   const resolveImageUrls = async (data: StagingProject) => {
     try {
@@ -249,6 +268,7 @@ export default function ProjectDetailPage() {
         variationIndex,
         variations: room.variations,
       });
+      setLightboxContext({ room, variationIndex });
     }
   };
 
@@ -261,6 +281,68 @@ export default function ProjectDetailPage() {
       );
     }
   };
+
+  const handleRegenerateVariation = useCallback((room: Room, variationIndex: number, strategy: 'retry' | 'fresh') => {
+    if (isGenerating || regeneratingVariationId) return;
+    const variation = room.variations[variationIndex];
+    setRegeneratingVariationId(variation.id);
+
+    const cleanup = streamVariationRegeneration(
+      projectId,
+      room.id,
+      variation.id,
+      strategy,
+      (event) => {
+        switch (event.type) {
+          case 'variation_completed':
+            activityLog.log({
+              level: 'success',
+              icon: '✓',
+              message: `Variation ${variationIndex + 1} regenerated`,
+              detail: [
+                (event as any).model,
+                (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
+                (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
+              ].filter(Boolean).join(' · ') || undefined,
+            });
+            break;
+          case 'variation_failed':
+            activityLog.log({
+              level: 'error',
+              icon: '✕',
+              message: `Variation ${variationIndex + 1} regeneration failed`,
+              detail: (event as any).error || 'Unknown error',
+            });
+            toast.error(`Regeneration failed: ${(event as any).error || 'Unknown error'}`);
+            break;
+          case 'project_completed':
+          case 'stream_ended':
+            setRegeneratingVariationId(null);
+            loadProject();
+            if (event.type === 'project_completed') {
+              toast.success('Variation regenerated!');
+            }
+            break;
+          case 'error':
+            setRegeneratingVariationId(null);
+            toast.error(event.error || 'Regeneration failed');
+            loadProject();
+            break;
+        }
+      },
+    );
+
+    const previousCleanup = streamCleanupRef.current;
+    streamCleanupRef.current = () => {
+      cleanup();
+      previousCleanup?.();
+    };
+  }, [isGenerating, regeneratingVariationId, projectId, activityLog, loadProject]);
+
+  const handleLightboxRegenerate = useCallback((strategy: 'retry' | 'fresh') => {
+    if (!lightboxContext) return;
+    handleRegenerateVariation(lightboxContext.room, lightboxContext.variationIndex, strategy);
+  }, [lightboxContext, handleRegenerateVariation]);
 
   const handleRetryVariation = (room: Room, _variationIndex: number) => {
     handleRegenerateRoom(room);
@@ -513,6 +595,8 @@ export default function ProjectDetailPage() {
               onVariationClick={handleVariationClick}
               onRetryVariation={handleRetryVariation}
               onRegenerateRoom={handleRegenerateRoom}
+              onRegenerateVariation={handleRegenerateVariation}
+              regeneratingVariationId={regeneratingVariationId}
               isGenerating={isGenerating}
             />
           ))
@@ -548,8 +632,14 @@ export default function ProjectDetailPage() {
       {/* Image lightbox */}
       <ImageLightbox
         image={lightboxImage}
-        onClose={() => setLightboxImage(null)}
+        onClose={() => { setLightboxImage(null); setLightboxContext(null); }}
         onNavigate={handleLightboxNavigate}
+        onRegenerate={lightboxContext ? handleLightboxRegenerate : undefined}
+        isRegenerating={
+          lightboxContext
+            ? regeneratingVariationId === lightboxContext.room.variations[lightboxContext.variationIndex]?.id
+            : false
+        }
       />
     </div>
   );
