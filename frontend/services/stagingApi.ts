@@ -544,6 +544,104 @@ export function streamRoomRegeneration(
     abortController.abort();
   };
 }
+
+/**
+ * Stream single variation regeneration
+ */
+export function streamVariationRegeneration(
+  projectId: string,
+  roomId: string,
+  variationId: string,
+  strategy: 'retry' | 'fresh',
+  onEvent: StagingStreamEventCallback,
+): () => void {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}/variations/${variationId}/regenerate?strategy=${strategy}`;
+  
+  if (API_DEBUG) {
+    console.log(`Starting SSE stream for variation regeneration (${strategy})`);
+    console.log(`POST ${url}`);
+  }
+
+  const abortController = new AbortController();
+  let receivedTerminalEvent = false;
+
+  fetch(url, {
+    method: 'POST',
+    signal: abortController.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const errorText = await response.text();
+        onEvent({ type: 'error', error: `HTTP ${response.status}: ${errorText}` });
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onEvent({ type: 'error', error: 'No response body' });
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEventType: string | null = null;
+      let currentData: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            currentData = line.slice(6);
+          } else if (line === '' && currentEventType && currentData) {
+            try {
+              const parsedData = JSON.parse(currentData);
+              const event: StagingStreamEvent = {
+                type: currentEventType as StagingStreamEventType,
+                ...parsedData,
+              };
+
+              if (currentEventType === 'project_completed' || currentEventType === 'error') {
+                receivedTerminalEvent = true;
+              }
+
+              if (API_DEBUG) {
+                console.log('SSE event:', event);
+              }
+
+              onEvent(event);
+            } catch (parseError) {
+              console.error('Failed to parse SSE data:', currentData, parseError);
+            }
+
+            currentEventType = null;
+            currentData = null;
+          }
+        }
+      }
+
+      if (!receivedTerminalEvent) {
+        onEvent({ type: 'stream_ended' });
+      }
+    })
+    .catch((error) => {
+      if (error.name === 'AbortError') return;
+      console.error('SSE stream error:', error);
+      onEvent({ type: 'error', error: error.message || 'Stream error' });
+    });
+
+  return () => {
+    abortController.abort();
+  };
+}
+
 export async function analyzeImages(projectId: string): Promise<ImageAnalysisResult[]> {
   const url = `${API_BASE_URL}/staging/projects/${projectId}/analyze`;
   const response = await fetch(url, { method: 'POST' });
