@@ -270,6 +270,107 @@ class StagingPipeline:
                 self._update_room_in_project(project, room)
                 yield {"type": "room_failed", "room_id": room.id, "error": str(e)}
 
+    async def process_single_variation(
+        self,
+        project: StagingProject,
+        room: Room,
+        variation: Variation,
+        adapted_prompt: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Regenerate a single variation using the provided prompt. Yields SSE events."""
+        variation_index = next(
+            (i for i, v in enumerate(room.variations) if v.id == variation.id), None
+        )
+        if variation_index is None:
+            logger.warning(f"Variation {variation.id} not found in room {room.id}, defaulting to index 0")
+            variation_index = 0
+
+        async with self.semaphore:
+            variation.status = ItemStatus.PROCESSING
+            self._update_room_in_project(project, room)
+
+            start_time = time.monotonic()
+            result = None
+            elapsed_ms = 0
+            try:
+                image_content, _ = self.blob_service.get_asset_content(
+                    blob_name=self._extract_blob_name(room.original_image_url),
+                    container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+                )
+                if image_content is None:
+                    raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
+                image_b64 = base64.b64encode(image_content).decode("utf-8")
+
+                pipeline_request = ImagePipelineRequest(
+                    action=PipelineAction.EDIT,
+                    prompt=adapted_prompt,
+                    model=project.settings.model,
+                    n=1,
+                    size=project.settings.size,
+                    quality=project.settings.quality,
+                    response_format="b64_json",
+                    output_format="png",
+                    source_image_base64=[image_b64],
+                    save_options=PipelineSaveOptions(
+                        enabled=True,
+                        folder_path=f"staging/{project.id}/variations/{room.id}",
+                    ),
+                    analysis_options=PipelineAnalysisOptions(enabled=False),
+                )
+
+                result = await self.image_pipeline.process_pipeline(
+                    pipeline_request=pipeline_request,
+                    azure_storage_service=self.blob_service,
+                )
+
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+                if result.generation and result.save:
+                    saved = result.save
+                    saved_url = (
+                        saved.saved_images[0].get("url")
+                        if saved.saved_images
+                        else None
+                    )
+                    if saved_url:
+                        variation.image_url = saved_url
+                        variation.status = ItemStatus.COMPLETED
+                        variation.generation_metadata = {
+                            "model": project.settings.model,
+                            "adapted_prompt": adapted_prompt,
+                            "generation_time_ms": elapsed_ms,
+                        }
+                    else:
+                        variation.status = ItemStatus.FAILED
+                        variation.error = "Save succeeded but no image URL returned"
+                else:
+                    variation.status = ItemStatus.FAILED
+                    variation.error = "Pipeline returned no generation result"
+
+            except Exception as e:
+                logger.error(f"Single variation regen failed for {variation.id}: {e}")
+                variation.status = ItemStatus.FAILED
+                variation.error = str(e)
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+            token_usage = None
+            if result and result.generation and result.generation.token_usage:
+                tu = result.generation.token_usage
+                token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
+
+            self._update_room_in_project(project, room)
+
+            yield {
+                "type": f"variation_{'completed' if variation.status == ItemStatus.COMPLETED else 'failed'}",
+                "room_id": room.id,
+                "variation_index": variation_index,
+                "image_url": variation.image_url,
+                "error": variation.error,
+                "elapsed_ms": elapsed_ms,
+                "tokens_used": token_usage,
+                "model": project.settings.model,
+            }
+
     async def generate_project(self, project: StagingProject) -> AsyncGenerator[Dict[str, Any], None]:
         """Process all pending rooms in the project. Yields SSE events."""
         project.status = ProjectStatus.PROCESSING

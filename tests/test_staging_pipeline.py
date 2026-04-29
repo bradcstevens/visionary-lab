@@ -1,7 +1,9 @@
 """Tests for staging pipeline variation URL extraction and SSE event flow."""
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from backend.core.staging_pipeline import StagingPipeline
 from backend.models.images import ImageGenerationResponse, ImageSaveResponse, ImagePipelineResponse, PipelineStepResult
 from backend.models.staging import (
     ItemStatus,
@@ -298,3 +300,35 @@ class TestVariationUrlExtraction:
         assert evt["tokens_used"] == 1500
         assert "model" in evt
         assert evt["model"] == "gpt-image-2"
+
+
+@pytest.mark.asyncio
+async def test_process_single_variation_completes():
+    """process_single_variation should yield variation_completed with image URL."""
+    project = _make_project(n_rooms=1, n_variations=3)
+    room = project.rooms[0]
+    variation = room.variations[1]  # Target the second variation
+    adapted_prompt = "Add a modern sofa with warm wood tones"
+
+    pipeline_response = _make_pipeline_response()
+
+    with patch("backend.core.staging_pipeline.StagingPipeline.__init__", return_value=None):
+        pipeline = StagingPipeline.__new__(StagingPipeline)
+        pipeline.image_pipeline = AsyncMock()
+        pipeline.image_pipeline.process_pipeline = AsyncMock(return_value=pipeline_response)
+        pipeline.blob_service = MagicMock()
+        pipeline.blob_service.get_asset_content.return_value = (b"fake-image-bytes", "image/png")
+        pipeline.storage_service = MagicMock()
+        pipeline.semaphore = asyncio.Semaphore(1)
+
+        events = []
+        async for event in pipeline.process_single_variation(project, room, variation, adapted_prompt):
+            events.append(event)
+
+    event_types = [e["type"] for e in events]
+    assert "variation_completed" in event_types
+    completed_event = next(e for e in events if e["type"] == "variation_completed")
+    assert completed_event["variation_index"] == 1
+    assert completed_event["room_id"] == room.id
+    assert variation.status == ItemStatus.COMPLETED
+    assert variation.image_url is not None
