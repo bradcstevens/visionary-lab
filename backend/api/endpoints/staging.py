@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from backend.core.azure_storage import AzureBlobStorageService
+from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
 from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
@@ -32,6 +33,22 @@ from backend.models.staging import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _migrate_design_brief_in_place(project: dict) -> bool:
+    """Apply ``migrate_legacy_plant_palette`` to ``project['design_brief']`` if
+    present. Returns True if the project was mutated (legacy → generic shape),
+    False otherwise. Idempotent: already-migrated briefs are left untouched
+    via the ``migrated is original`` short-circuit in the resolver.
+    """
+    brief = project.get("design_brief")
+    if not isinstance(brief, dict):
+        return False
+    migrated = migrate_legacy_plant_palette(brief)
+    if migrated is brief:
+        return False
+    project["design_brief"] = migrated
+    return True
 
 
 def get_staging_storage() -> StagingStorageService:
@@ -101,12 +118,17 @@ async def list_projects(
     total = storage.count_projects()
     projects = []
     for p in projects_raw:
-        # Auto-heal stale processing states on list too
-        if reconcile_project(p):
+        # Combine reconcile + legacy-brief-migration into a single optional
+        # writeback. Either pass alone may mutate; if both pass mutate we
+        # only persist once. ``or`` short-circuits, but we want both calls
+        # to run, so we OR the results explicitly.
+        reconciled = reconcile_project(p)
+        migrated = _migrate_design_brief_in_place(p)
+        if reconciled or migrated:
             try:
                 storage.update_project(p["id"], p)
             except Exception as e:
-                logger.warning("Failed to persist reconciled project %s: %s", p.get("id"), e)
+                logger.warning("Failed to persist reconciled/migrated project %s: %s", p.get("id"), e)
         clean = {k: v for k, v in p.items() if k != "doc_type" and not k.startswith("_")}
         projects.append(StagingProject(**clean))
     return ProjectListResponse(projects=projects, total=total)
@@ -121,12 +143,15 @@ async def get_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Auto-heal stale processing states (server crashed mid-generation)
-    if reconcile_project(project):
+    # Auto-heal stale processing states + opportunistically migrate legacy
+    # plant_palette → object_palette on read (single combined writeback).
+    reconciled = reconcile_project(project)
+    migrated = _migrate_design_brief_in_place(project)
+    if reconciled or migrated:
         try:
             storage.update_project(project_id, project)
         except Exception as e:
-            logger.warning("Failed to persist reconciled project %s: %s", project_id, e)
+            logger.warning("Failed to persist reconciled/migrated project %s: %s", project_id, e)
 
     clean = {k: v for k, v in project.items() if k != "doc_type" and not k.startswith("_")}
     return ProjectResponse(project=StagingProject(**clean))

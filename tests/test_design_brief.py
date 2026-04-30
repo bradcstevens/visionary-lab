@@ -6,27 +6,94 @@ from unittest.mock import AsyncMock, MagicMock
 from pydantic import ValidationError
 
 
-def test_plant_entry_defaults():
-    from backend.models.design_brief import PlantEntry
-    p = PlantEntry(species="Vanderwolf's Pyramid Limber Pine")
-    assert p.species == "Vanderwolf's Pyramid Limber Pine"
-    assert p.quantity == 1
-    assert p.botanical_name is None
-    assert p.visual_notes is None
+def test_object_entry_defaults():
+    from backend.models.design_brief import ObjectCategory, ObjectEntry
+    e = ObjectEntry(name="Vanderwolf's Pyramid Limber Pine")
+    assert e.name == "Vanderwolf's Pyramid Limber Pine"
+    assert e.default_quantity == 1
+    assert e.description is None
+    assert e.visual_notes is None
+    # default category is OTHER (no auto-detection on bare construction)
+    assert e.category == ObjectCategory.OTHER
+    # default_factory id should be a non-empty UUID-shaped string
+    assert isinstance(e.id, str) and len(e.id) > 0
 
 
-def test_plant_entry_full():
-    from backend.models.design_brief import PlantEntry
-    p = PlantEntry(
-        species="Baby Blue Eyes Spruce",
-        botanical_name="Picea pungens 'Baby Blue Eyes'",
-        quantity=3,
+def test_object_entry_full():
+    from backend.models.design_brief import ObjectCategory, ObjectEntry
+    e = ObjectEntry(
+        name="Baby Blue Eyes Spruce",
+        description="Picea pungens 'Baby Blue Eyes'",
+        category="tree",
+        default_quantity=3,
         size="15-30 ft",
         placement="back row along fence",
         visual_notes="Intense powder-blue to steel-blue needles",
     )
-    assert p.quantity == 3
-    assert "powder-blue" in p.visual_notes
+    assert e.default_quantity == 3
+    assert e.category == ObjectCategory.TREE
+    assert "powder-blue" in e.visual_notes
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("plant", "plant"),
+        ("Plant", "plant"),
+        (" PLANT ", "plant"),
+        ("plants", "plant"),       # naive plural
+        ("Trees", "tree"),
+        ("shrub", "plant"),         # synonym
+        ("bush", "plant"),          # synonym
+        ("light", "lighting"),      # synonym
+        ("LIGHTING", "lighting"),
+        ("hardscape", "hardscape"),
+        ("decor", "decor"),
+        ("rocks", "rock"),
+        ("furniture", "furniture"),
+        ("plant_tree_hybrid", "other"),  # unknown → OTHER, no raise
+        ("", "other"),
+        (None, "other"),
+        (42, "other"),                    # non-string → OTHER, no raise
+    ],
+)
+def test_object_entry_category_coercion(raw, expected):
+    from backend.models.design_brief import ObjectCategory, ObjectEntry
+    e = ObjectEntry(name="x", category=raw)
+    assert e.category == ObjectCategory(expected)
+
+
+def test_design_brief_auto_migrates_legacy_dict():
+    """DesignBrief(**raw) MUST migrate legacy plant_palette transparently —
+    this is what guarantees old persisted briefs deserialise on read."""
+    from backend.models.design_brief import DesignBrief
+    legacy_raw = {
+        "global_instructions": "Add evergreens",
+        "plant_palette": [
+            {
+                "species": "Sequoia",
+                "botanical_name": "Sequoiadendron giganteum",
+                "quantity": 2,
+                "size": "20 ft tall",
+                "placement": "north fence",
+                "visual_notes": "tall, conical",
+            }
+        ],
+        "placement_guide": {"back_row": "Tall conifers"},
+        "preserve_elements": ["patio"],
+    }
+    brief = DesignBrief(**legacy_raw)
+    assert len(brief.object_palette) == 1
+    obj = brief.object_palette[0]
+    assert obj.name == "Sequoia"
+    assert obj.description == "Sequoiadendron giganteum"
+    assert obj.default_quantity == 2
+    # Sequoia in species → TREE
+    from backend.models.design_brief import ObjectCategory
+    assert obj.category == ObjectCategory.TREE
+    assert isinstance(obj.id, str) and len(obj.id) > 0
+    # per_image_objects always initialised by migration
+    assert brief.per_image_objects == {}
 
 
 def test_placement_guide_defaults():
@@ -39,19 +106,20 @@ def test_placement_guide_defaults():
 
 
 def test_design_brief_valid():
-    from backend.models.design_brief import DesignBrief, PlantEntry, PlacementGuide
+    from backend.models.design_brief import DesignBrief, ObjectEntry, PlacementGuide
     brief = DesignBrief(
         global_instructions="Add layered evergreen privacy screen along fence",
-        plant_palette=[
-            PlantEntry(species="Columnar Norway Spruce", quantity=5, size="20 ft", placement="east fence"),
+        object_palette=[
+            ObjectEntry(name="Columnar Norway Spruce", category="tree", default_quantity=5, size="20 ft", placement="east fence"),
         ],
         placement_guide=PlacementGuide(back_row="Tall conifers along fence"),
         preserve_elements=["patio", "fire pit", "pergola"],
     )
-    assert len(brief.plant_palette) == 1
-    assert brief.plant_palette[0].species == "Columnar Norway Spruce"
+    assert len(brief.object_palette) == 1
+    assert brief.object_palette[0].name == "Columnar Norway Spruce"
     assert "patio" in brief.preserve_elements
     assert brief.per_image_notes == {}
+    assert brief.per_image_objects == {}
     assert brief.settings.model == "gpt-image-2"
 
 
@@ -118,11 +186,12 @@ async def test_brief_generation_from_conversation():
     mock_llm.chat.completions.create = AsyncMock(return_value=MagicMock(
         choices=[MagicMock(message=MagicMock(content=json.dumps({
             "global_instructions": "Add layered evergreen privacy screen along fence line",
-            "plant_palette": [
+            "object_palette": [
                 {
-                    "species": "Vanderwolf's Pyramid Limber Pine",
-                    "botanical_name": "Pinus flexilis 'Vanderwolf's Pyramid'",
-                    "quantity": 3,
+                    "name": "Vanderwolf's Pyramid Limber Pine",
+                    "description": "Pinus flexilis 'Vanderwolf's Pyramid'",
+                    "category": "tree",
+                    "default_quantity": 3,
                     "size": "8-10 ft",
                     "placement": "back row along east fence",
                     "visual_notes": "Silvery-blue twisted needles, narrow pyramid form",
@@ -145,16 +214,18 @@ async def test_brief_generation_from_conversation():
     brief = await service.generate_brief(conversation_history=history, image_analyses=analyses)
 
     assert brief.global_instructions == "Add layered evergreen privacy screen along fence line"
-    assert len(brief.plant_palette) == 1
-    assert brief.plant_palette[0].species == "Vanderwolf's Pyramid Limber Pine"
+    assert len(brief.object_palette) == 1
+    assert brief.object_palette[0].name == "Vanderwolf's Pyramid Limber Pine"
     assert "patio" in brief.preserve_elements
+    # generate_brief must assign a UUID id
+    assert isinstance(brief.object_palette[0].id, str) and len(brief.object_palette[0].id) > 0
 
 
 @pytest.mark.asyncio
 async def test_brief_to_prompts_produces_specific_prompts():
     from backend.core.brief_generator import BriefGeneratorService
     from backend.models.design_brief import (
-        DesignBrief, PlantEntry, PlacementGuide, ImageAnalysis,
+        DesignBrief, ObjectEntry, PlacementGuide, ImageAnalysis,
     )
 
     mock_llm = AsyncMock()
@@ -167,10 +238,11 @@ async def test_brief_to_prompts_produces_specific_prompts():
 
     brief = DesignBrief(
         global_instructions="Add trees along fence",
-        plant_palette=[
-            PlantEntry(
-                species="Vanderwolf's Pyramid Limber Pine",
-                quantity=3,
+        object_palette=[
+            ObjectEntry(
+                name="Vanderwolf's Pyramid Limber Pine",
+                category="tree",
+                default_quantity=3,
                 size="8-10 ft",
                 placement="back row along fence",
                 visual_notes="Silvery-blue twisted needles, narrow pyramid form",

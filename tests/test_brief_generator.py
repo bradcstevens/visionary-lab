@@ -5,15 +5,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.brief_generator import BriefGeneratorService
 from backend.models.design_brief import (
-    DesignBrief, ImageAnalysis, PlantEntry, PlacementGuide,
+    DesignBrief, ImageAnalysis, ObjectEntry, PlacementGuide,
 )
 
 
 def _make_brief():
     return DesignBrief(
         global_instructions="Add drought-tolerant plants along the fence line",
-        plant_palette=[
-            PlantEntry(species="Lavender", quantity=3, size="2ft", placement="front row"),
+        object_palette=[
+            ObjectEntry(name="Lavender", category="plant", default_quantity=3, size="2ft", placement="front row"),
         ],
         placement_guide=PlacementGuide(back_row="Tall grasses"),
         per_image_notes={},

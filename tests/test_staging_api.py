@@ -202,3 +202,175 @@ def test_regenerate_variation_preflight_preserves_image_url(client, mock_staging
     assert persisted_variation["status"] == "processing"
     # The error field is cleared (in case the variation was previously FAILED).
     assert persisted_variation.get("error") is None
+
+# ============================================================================
+# Legacy plant_palette → object_palette migration on read.
+#
+# Verifies: per-image-object-quantities issue 001 — old persisted briefs are
+# transparently migrated when surfaced via the GET project endpoints AND the
+# migrated dict is written back so the next read is a no-op.
+# ============================================================================
+
+
+def _legacy_brief_payload():
+    """A persisted-shape design brief from the pre-migration era."""
+    return {
+        "global_instructions": "Add evergreens",
+        "plant_palette": [
+            {
+                "species": "Sequoia",
+                "botanical_name": "Sequoiadendron giganteum",
+                "quantity": 2,
+                "size": "20 ft tall",
+                "placement": "north fence",
+                "visual_notes": "tall, conical",
+            }
+        ],
+        "placement_guide": {"back_row": "Tall conifers"},
+        "preserve_elements": ["patio"],
+    }
+
+
+def _migrated_brief_payload():
+    """A persisted-shape design brief that's already been migrated.
+
+    No legacy keys; ``object_palette`` and ``per_image_objects`` set.
+    """
+    return {
+        "global_instructions": "Add evergreens",
+        "object_palette": [
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Sequoia",
+                "description": "Sequoiadendron giganteum",
+                "category": "tree",
+                "default_quantity": 2,
+                "size": "20 ft tall",
+                "placement": "north fence",
+                "visual_notes": "tall, conical",
+            }
+        ],
+        "placement_guide": {"back_row": "Tall conifers"},
+        "preserve_elements": ["patio"],
+        "per_image_objects": {},
+    }
+
+
+def test_get_project_migrates_legacy_plant_palette_and_writes_back(client, mock_staging_deps):
+    """A project persisted with the old plant_palette shape is auto-migrated
+    on read AND the migrated dict is written back so the next read is a no-op."""
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-legacy",
+        "name": "Legacy",
+        "prompt": "Test",
+        "status": "completed",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": _legacy_brief_payload(),
+    }
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.get("/api/v1/staging/projects/proj-legacy")
+    assert response.status_code == 200
+    body = response.json()["project"]
+
+    # Response carries object_palette, NOT plant_palette.
+    brief = body["design_brief"]
+    assert "object_palette" in brief
+    assert "plant_palette" not in brief
+    assert len(brief["object_palette"]) == 1
+    obj = brief["object_palette"][0]
+    assert obj["name"] == "Sequoia"
+    assert obj["category"] == "tree"
+    assert obj["default_quantity"] == 2
+    assert obj["description"] == "Sequoiadendron giganteum"
+    # Migration assigns a UUID id, regardless of what was persisted before.
+    assert isinstance(obj["id"], str) and len(obj["id"]) > 0
+
+    # And the migrated doc was persisted (writeback) — this is what makes the
+    # next read a no-op rather than re-running the migration.
+    assert mock_container.replace_item.call_count >= 1
+    last_call = mock_container.replace_item.call_args_list[-1]
+    persisted_body = last_call.kwargs.get("body") or last_call.args[1]
+    assert "object_palette" in persisted_body["design_brief"]
+    assert "plant_palette" not in persisted_body["design_brief"]
+
+
+def test_get_project_no_writeback_when_brief_already_migrated(client, mock_staging_deps):
+    """Already-migrated briefs MUST NOT trigger an opportunistic writeback —
+    avoids needless Cosmos writes on every read."""
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-already-migrated",
+        "name": "Modern",
+        "prompt": "Test",
+        "status": "completed",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": _migrated_brief_payload(),
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-already-migrated")
+    assert response.status_code == 200
+    body = response.json()["project"]
+    assert "object_palette" in body["design_brief"]
+
+    # No-op writeback — no replace_item calls (reconcile_project also returned
+    # False because rooms=[] and the project is already terminal).
+    assert mock_container.replace_item.call_count == 0
+
+
+def test_get_project_no_design_brief_does_not_crash(client, mock_staging_deps):
+    """Projects without a design_brief (e.g. uploading state) MUST NOT crash
+    or trigger a writeback — the migration helper must short-circuit."""
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-no-brief",
+        "name": "Brand new",
+        "prompt": "Test",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-no-brief")
+    assert response.status_code == 200
+    assert mock_container.replace_item.call_count == 0
+
+
+def test_list_projects_migrates_legacy_plant_palette_and_writes_back(client, mock_staging_deps):
+    """list_projects also runs the migration so legacy keys can't leak via
+    list endpoints (defense-in-depth — issue 001 explicitly mentions
+    surfacing only the new shape)."""
+    mock_container = mock_staging_deps["container"]
+    legacy_doc = {
+        "id": "proj-legacy",
+        "name": "Legacy",
+        "prompt": "Test",
+        "status": "completed",
+        "rooms": [],
+        "settings": {"variations_per_room": 5, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": _legacy_brief_payload(),
+    }
+
+    def mock_query_items(query, parameters=None, enable_cross_partition_query=None):
+        if "COUNT" in (query or "").upper():
+            return iter([1])
+        return iter([legacy_doc])
+
+    mock_container.query_items = mock_query_items
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.get("/api/v1/staging/projects?limit=10")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    project = payload["projects"][0]
+
+    brief = project["design_brief"]
+    assert "object_palette" in brief
+    assert "plant_palette" not in brief
+
+    # Writeback fired so the next list read is a no-op for this project.
+    assert mock_container.replace_item.call_count >= 1

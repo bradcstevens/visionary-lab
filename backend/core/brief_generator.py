@@ -1,12 +1,20 @@
 """BriefGeneratorService — synthesizes conversation into a structured Design Brief."""
 import json
 import logging
+import uuid
 from typing import Dict, List
 
+from pydantic import ValidationError
+
+from backend.core.brief_resolver import resolve_objects_for_image
 from backend.core.config import settings
 from backend.core.retry import call_with_retry
 from backend.models.design_brief import (
-    ChatMessage, DesignBrief, ImageAnalysis, PlantEntry, PlacementGuide,
+    ChatMessage,
+    DesignBrief,
+    ImageAnalysis,
+    ObjectEntry,
+    PlacementGuide,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,33 +30,35 @@ CONVERSATION:
 Extract and organize all design decisions into this exact JSON structure:
 {{
   "global_instructions": "Overall description of what to add and the style direction",
-  "plant_palette": [
+  "object_palette": [
     {{
-      "species": "Common name",
-      "botanical_name": "Scientific name or null",
-      "quantity": 1,
-      "size": "height description",
+      "name": "Common name (e.g. 'Vanderwolf Pine', 'Adirondack chair', 'Pendant lamp')",
+      "description": "Optional detail (botanical name, model number, etc.) or null",
+      "category": "one of: plant, tree, rock, furniture, lighting, hardscape, decor, other",
+      "default_quantity": 1,
+      "size": "free-form size description",
       "placement": "where to put it",
-      "visual_notes": "key visual characteristics for image generation"
+      "visual_notes": "key visual characteristics for image generation or null"
     }}
   ],
   "placement_guide": {{
-    "back_row": "Tall plants description",
+    "back_row": "Tall objects description",
     "middle_row": "Mid-height description or null",
-    "front_row": "Low plants description or null",
+    "front_row": "Low objects description or null",
     "accent_areas": "Special areas or null"
   }},
   "per_image_notes": {{}},
   "preserve_elements": ["list of things to keep unchanged"]
 }}
 
-Be specific about visual characteristics — these will be used to generate images."""
+Be specific about visual characteristics — these will be used to generate images.
+Choose the best fitting category per object; if uncertain, use "other"."""
 
 BRIEF_TO_PROMPTS_TEMPLATE = """You are an image editing prompt writer. Given a Design Brief and an image description, generate {n} distinct prompts for an image editing model.
 
 DESIGN BRIEF:
 Global: {global_instructions}
-Plants: {plant_summary}
+Objects: {object_summary}
 Placement: {placement_summary}
 Preserve: {preserve_summary}
 
@@ -56,8 +66,8 @@ IMAGE DESCRIPTION: {image_description}
 {per_image_note}
 
 Generate {n} variation prompts. Each should:
-- ADD the specified plants/items to the scene described above
-- Reference specific species with their visual characteristics
+- ADD the specified objects to the scene described above
+- Reference specific objects with their visual characteristics
 - Respect the placement guide (back row, middle, front)
 - NOT remove or change elements listed in preserve
 - Vary the interpretation: different arrangements, densities, or seasonal looks
@@ -99,14 +109,25 @@ class BriefGeneratorService:
             )
             try:
                 parsed = json.loads(response.choices[0].message.content)
+                # Per the per-image-object-quantities PRD, generate_brief
+                # explicitly assigns a UUID to each new palette entry. The
+                # ObjectEntry default_factory would also do this implicitly,
+                # but explicit assignment makes it clear in the call site
+                # that ids originate here, not somewhere downstream.
+                palette_entries = []
+                for raw_obj in parsed.get("object_palette", []):
+                    if not isinstance(raw_obj, dict):
+                        continue
+                    raw_obj.setdefault("id", str(uuid.uuid4()))
+                    palette_entries.append(ObjectEntry(**raw_obj))
                 return DesignBrief(
                     global_instructions=parsed.get("global_instructions", ""),
-                    plant_palette=[PlantEntry(**p) for p in parsed.get("plant_palette", [])],
+                    object_palette=palette_entries,
                     placement_guide=PlacementGuide(**parsed.get("placement_guide", {})),
                     per_image_notes=parsed.get("per_image_notes", {}),
                     preserve_elements=parsed.get("preserve_elements", []),
                 )
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as e:
                 logger.warning(f"Brief generation attempt {attempt + 1} failed: {e}")
                 continue
 
@@ -118,10 +139,15 @@ class BriefGeneratorService:
         image_analyses: List[ImageAnalysis],
         n_variations: int = 5,
     ) -> Dict[str, List[str]]:
-        plant_summary = "; ".join(
-            f"{p.quantity}x {p.species} ({p.size}, {p.placement})"
-            + (f" — {p.visual_notes}" if p.visual_notes else "")
-            for p in brief.plant_palette
+        # Single project-wide object summary in this slice. Issue 003 will
+        # introduce per-image summaries by moving this call inside the loop
+        # and threading the room_id through resolve_objects_for_image.
+        sentinel_room_id = image_analyses[0].room_id if image_analyses else "__project__"
+        resolved_objects = resolve_objects_for_image(brief, room_id=sentinel_room_id)
+        object_summary = "; ".join(
+            f"{ro.quantity}x {ro.name} ({ro.size}, {ro.placement})"
+            + (f" — {ro.visual_notes}" if ro.visual_notes else "")
+            for ro in resolved_objects
         )
         placement_summary = f"Back: {brief.placement_guide.back_row}"
         if brief.placement_guide.middle_row:
@@ -140,7 +166,7 @@ class BriefGeneratorService:
             system_content = BRIEF_TO_PROMPTS_TEMPLATE.format(
                 n=n_variations,
                 global_instructions=brief.global_instructions,
-                plant_summary=plant_summary,
+                object_summary=object_summary,
                 placement_summary=placement_summary,
                 preserve_summary=preserve_summary,
                 image_description=analysis.description,

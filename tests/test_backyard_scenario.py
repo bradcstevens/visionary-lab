@@ -95,19 +95,21 @@ async def test_backyard_brief_includes_plant_details():
     mock_llm.chat.completions.create = AsyncMock(return_value=MagicMock(
         choices=[MagicMock(message=MagicMock(content=json.dumps({
             "global_instructions": "Add layered evergreen privacy screen along fence line",
-            "plant_palette": [
+            "object_palette": [
                 {
-                    "species": "Vanderwolf's Pyramid Limber Pine",
-                    "botanical_name": "Pinus flexilis 'Vanderwolf's Pyramid'",
-                    "quantity": 3,
+                    "name": "Vanderwolf's Pyramid Limber Pine",
+                    "description": "Pinus flexilis 'Vanderwolf's Pyramid'",
+                    "category": "tree",
+                    "default_quantity": 3,
                     "size": "20-25 ft tall",
                     "placement": "back row along fence",
                     "visual_notes": "Blue-green to silvery-blue twisted needles in bundles of 5, narrow pyramid silhouette",
                 },
                 {
-                    "species": "Baby Blue Eyes Spruce",
-                    "botanical_name": "Picea pungens 'Baby Blue Eyes'",
-                    "quantity": 2,
+                    "name": "Baby Blue Eyes Spruce",
+                    "description": "Picea pungens 'Baby Blue Eyes'",
+                    "category": "tree",
+                    "default_quantity": 2,
                     "size": "15-30 ft tall",
                     "placement": "corners of fence line",
                     "visual_notes": "Intense powder-blue needles, classic Christmas-tree shape",
@@ -131,13 +133,13 @@ async def test_backyard_brief_includes_plant_details():
     service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
     brief = await service.generate_brief(conversation_history=history, image_analyses=analyses)
 
-    assert len(brief.plant_palette) == 2
-    pine = next(p for p in brief.plant_palette if "Vanderwolf" in p.species)
-    assert pine.quantity == 3
+    assert len(brief.object_palette) == 2
+    pine = next(p for p in brief.object_palette if "Vanderwolf" in p.name)
+    assert pine.default_quantity == 3
     assert "silvery" in pine.visual_notes.lower() or "blue" in pine.visual_notes.lower()
 
-    spruce = next(p for p in brief.plant_palette if "Baby Blue" in p.species)
-    assert spruce.quantity == 2
+    spruce = next(p for p in brief.object_palette if "Baby Blue" in p.name)
+    assert spruce.default_quantity == 2
 
 
 @pytest.mark.asyncio
@@ -145,7 +147,7 @@ async def test_backyard_adapted_prompts_are_specific():
     """Verify adapted prompts reference specific plants and scene features."""
     from backend.core.brief_generator import BriefGeneratorService
     from backend.models.design_brief import (
-        DesignBrief, PlantEntry, PlacementGuide, ImageAnalysis,
+        DesignBrief, ObjectEntry, PlacementGuide, ImageAnalysis,
     )
 
     mock_llm = AsyncMock()
@@ -158,10 +160,10 @@ async def test_backyard_adapted_prompts_are_specific():
 
     brief = DesignBrief(
         global_instructions="Add evergreen privacy screen along fence",
-        plant_palette=[
-            PlantEntry(species="Vanderwolf's Pyramid Limber Pine", quantity=3, size="20-25 ft",
-                       placement="back row along fence",
-                       visual_notes="Silvery-blue twisted needles, narrow pyramid form"),
+        object_palette=[
+            ObjectEntry(name="Vanderwolf's Pyramid Limber Pine", category="tree", default_quantity=3, size="20-25 ft",
+                        placement="back row along fence",
+                        visual_notes="Silvery-blue twisted needles, narrow pyramid form"),
         ],
         placement_guide=PlacementGuide(back_row="Tall conifers along fence"),
         preserve_elements=["existing shrubs", "turf"],
@@ -185,7 +187,7 @@ async def test_backyard_per_image_notes_differ():
     """Verify per-image notes produce different prompts for pergola vs fence."""
     from backend.core.brief_generator import BriefGeneratorService
     from backend.models.design_brief import (
-        DesignBrief, PlantEntry, PlacementGuide, ImageAnalysis,
+        DesignBrief, ObjectEntry, PlacementGuide, ImageAnalysis,
     )
 
     async def mock_create(**kwargs):
@@ -202,7 +204,7 @@ async def test_backyard_per_image_notes_differ():
 
     brief = DesignBrief(
         global_instructions="Add plants throughout backyard",
-        plant_palette=[PlantEntry(species="Columnar Norway Spruce", quantity=5, placement="along fence")],
+        object_palette=[ObjectEntry(name="Columnar Norway Spruce", category="tree", default_quantity=5, placement="along fence")],
         placement_guide=PlacementGuide(back_row="Tall conifers"),
         per_image_notes={
             "pergola-1": "Add climbing jasmine on the pergola posts instead of ground plants",
