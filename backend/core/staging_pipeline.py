@@ -20,6 +20,31 @@ from backend.models.staging import ItemStatus, ProjectStatus, Room, StagingProje
 
 logger = logging.getLogger(__name__)
 
+# Module-level per-project lock registry. Keyed by project.id, this dict is
+# shared across ALL StagingPipeline instances in the process so concurrent
+# requests for the same project (each given its own pipeline by the FastAPI
+# Depends factory) still serialize at the storage boundary. In-process
+# serialization is correct because the backend container app is pinned to a
+# single replica — see parallel-processing PRD § Single-replica deployment
+# constraint and § Per-project lock for Cosmos updates. The dict has no
+# eviction in this slice; projects are short-lived enough that growth is
+# acceptable per the PRD's accepted-trade list.
+_PROJECT_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _get_project_lock(project_id: str) -> asyncio.Lock:
+    """Return the process-wide per-project asyncio.Lock, creating it lazily.
+
+    Safe under concurrent first-use because asyncio is single-threaded: the
+    get/assignment pair has no `await` between it, so two concurrently-
+    scheduled tasks cannot both observe `None` and both create a fresh Lock.
+    """
+    lock = _PROJECT_LOCKS.get(project_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROJECT_LOCKS[project_id] = lock
+    return lock
+
 INDOOR_PROMPT_TEMPLATE = """You are a virtual staging assistant. The user wants to visualize decorating ideas for their space.
 
 ROOM ANALYSIS: {room_analysis}
@@ -158,7 +183,7 @@ class StagingPipeline:
             yield {"type": "room_started", "room_id": room.id, "label": room.label}
 
             room.status = ItemStatus.PROCESSING
-            self._update_room_in_project(project, room)
+            await self._update_room_in_project(project, room)
 
             try:
                 image_content, _ = self.blob_service.get_asset_content(
@@ -200,7 +225,7 @@ class StagingPipeline:
                         "model": project.settings.model,
                         "adapted_prompt": adapted_prompt,
                     }
-                    self._update_room_in_project(project, room)
+                    await self._update_room_in_project(project, room)
 
                     start_time = time.monotonic()
                     result = None
@@ -265,7 +290,7 @@ class StagingPipeline:
                         tu = result.generation.token_usage
                         token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
 
-                    self._update_room_in_project(project, room)
+                    await self._update_room_in_project(project, room)
 
                     yield {
                         "type": f"variation_{'completed' if variation.status == ItemStatus.COMPLETED else 'failed'}",
@@ -286,14 +311,14 @@ class StagingPipeline:
 
                 any_completed = any(v.status == ItemStatus.COMPLETED for v in room.variations)
                 room.status = ItemStatus.COMPLETED if any_completed else ItemStatus.FAILED
-                self._update_room_in_project(project, room)
+                await self._update_room_in_project(project, room)
                 yield {"type": "room_completed", "room_id": room.id, "status": room.status}
 
             except Exception as e:
                 logger.error(f"Room {room.id} failed: {e}")
                 room.status = ItemStatus.FAILED
                 room.error = str(e)
-                self._update_room_in_project(project, room)
+                await self._update_room_in_project(project, room)
                 yield {"type": "room_failed", "room_id": room.id, "error": str(e)}
 
     async def process_single_variation(
@@ -344,7 +369,7 @@ class StagingPipeline:
                 "model": project.settings.model,
                 "adapted_prompt": adapted_prompt,
             }
-            self._update_room_in_project(project, room)
+            await self._update_room_in_project(project, room)
 
             start_time = time.monotonic()
             result = None
@@ -495,7 +520,7 @@ class StagingPipeline:
                 "adapted_prompt": adapted_prompt,
                 "generation_time_ms": elapsed_ms,
             }
-            self._update_room_in_project(project, room)
+            await self._update_room_in_project(project, room)
 
             # Fire-and-forget delete of the prior blob (best-effort).
             if prior_image_url and prior_image_url != saved_url:
@@ -514,7 +539,7 @@ class StagingPipeline:
         variation.error = prior_error
         # NOTE: variation.generation_metadata already carries the new
         # adapted_prompt (persisted before the image-gen call). Leave it.
-        self._update_room_in_project(project, room)
+        await self._update_room_in_project(project, room)
         return ("variation_failed", regen_error_message)
 
     def _schedule_blob_cleanup(self, blob_url: str) -> None:
@@ -559,7 +584,7 @@ class StagingPipeline:
     async def generate_project(self, project: StagingProject) -> AsyncGenerator[Dict[str, Any], None]:
         """Process all pending rooms in parallel. Yields SSE events as they arrive."""
         project.status = ProjectStatus.PROCESSING
-        self.storage_service.update_project(project.id, self._serialize_project(project))
+        await self._persist_project_locked(project)
 
         pending_rooms = [r for r in project.rooms if r.status in (ItemStatus.PENDING, ItemStatus.FAILED)]
 
@@ -583,7 +608,7 @@ class StagingPipeline:
 
         if not pending_rooms:
             project.status = ProjectStatus.COMPLETED
-            self.storage_service.update_project(project.id, self._serialize_project(project))
+            await self._persist_project_locked(project)
             yield {"type": "project_completed", "status": project.status}
             return
 
@@ -603,7 +628,7 @@ class StagingPipeline:
                     logger.error("Room %s failed: %s", room.id, exc)
                 room.status = ItemStatus.FAILED
                 room.error = str(exc) if not isinstance(exc, asyncio.CancelledError) else "cancelled"
-                self._update_room_in_project(project, room)
+                await self._update_room_in_project(project, room)
                 await event_queue.put({"type": "room_failed", "room_id": room.id, "error": str(exc)})
             finally:
                 await event_queue.put(_WORKER_DONE)
@@ -629,7 +654,7 @@ class StagingPipeline:
 
         any_room_completed = any(r.status == ItemStatus.COMPLETED for r in project.rooms)
         project.status = ProjectStatus.COMPLETED if any_room_completed else ProjectStatus.FAILED
-        self.storage_service.update_project(project.id, self._serialize_project(project))
+        await self._persist_project_locked(project)
         yield {"type": "project_completed", "status": project.status}
 
     @staticmethod
@@ -658,13 +683,62 @@ class StagingPipeline:
         """Serialize project to a JSON-safe dict (datetime → ISO string)."""
         return json.loads(project.json())
 
-    def _update_room_in_project(self, project: StagingProject, room: Room):
-        """Persist room updates to Cosmos DB."""
+    def _get_project_lock(self, project_id: str) -> asyncio.Lock:
+        """Return the per-project asyncio.Lock, delegating to the module-level
+        registry so locks are shared across all StagingPipeline instances in
+        this process. See `staging_pipeline._PROJECT_LOCKS` for rationale.
+        """
+        return _get_project_lock(project_id)
+
+    async def _persist_project_locked(self, project: StagingProject) -> Dict[str, Any]:
+        """Persist the full project document under the per-project lock.
+
+        Wraps `storage_service.update_project` (which performs a Cosmos
+        read-modify-write) inside the lock so concurrent persists for the
+        same project are serialized. The blocking Cosmos SDK call is
+        dispatched onto the default thread pool via `asyncio.to_thread`
+        so the lock has a real await window — ensuring concurrent persists
+        on the same project ID actually serialize at the storage boundary
+        rather than blocking the event loop.
+
+        The lock is per-project, so persists for *different* project IDs
+        run in parallel.
+
+        Cancellation safety: once the thread starts, Python threads cannot
+        be cancelled. If the caller's task is cancelled mid-`to_thread`,
+        we must keep the lock held until the thread truly completes —
+        otherwise the next writer could enter the lock and race the still-
+        in-flight write. We use `asyncio.shield` to detach the inner
+        Future from caller-cancellation and a re-entry loop to wait for
+        completion before re-raising the original cancellation.
+        """
+        async with self._get_project_lock(project.id):
+            fut = asyncio.ensure_future(
+                asyncio.to_thread(
+                    self.storage_service.update_project,
+                    project.id,
+                    self._serialize_project(project),
+                )
+            )
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                while not fut.done():
+                    try:
+                        await asyncio.shield(fut)
+                    except asyncio.CancelledError:
+                        # Cascading cancels are absorbed; we keep waiting
+                        # so the lock isn't released early.
+                        continue
+                raise
+
+    async def _update_room_in_project(self, project: StagingProject, room: Room):
+        """Persist room updates to Cosmos DB under the per-project lock."""
         for i, r in enumerate(project.rooms):
             if r.id == room.id:
                 project.rooms[i] = room
                 break
         try:
-            self.storage_service.update_project(project.id, self._serialize_project(project))
+            await self._persist_project_locked(project)
         except Exception as e:
             logger.error(f"Failed to persist room update: {e}")
