@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     # Staging feature
     STAGING_MAX_ROOMS_PER_PROJECT: int = 0  # 0 = unlimited
     STAGING_MAX_VARIATIONS: int = 10
-    STAGING_CONCURRENT_ROOMS: int = 3
+    STAGING_CONCURRENT_ROOMS: int = 10
     STAGING_COSMOS_CONTAINER_ID: str = "staging-projects"
     STAGING_STALE_PROCESSING_MINUTES: int = 5  # Consider processing stale after this many minutes
 

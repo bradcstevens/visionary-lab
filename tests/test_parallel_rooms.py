@@ -135,8 +135,11 @@ class TestParallelRoomProcessing:
 
     @pytest.mark.asyncio
     async def test_semaphore_limits_concurrency(self):
-        """No more than STAGING_CONCURRENT_ROOMS rooms should be inside process_room at once."""
+        """No more than the configured room semaphore size should be inside process_room at once."""
         staging = _build_staging_pipeline()
+        # Pin the semaphore to 3 so the assertion below stays meaningful
+        # regardless of production-default changes (issue 006 bumped it to 10).
+        staging.semaphore = asyncio.Semaphore(3)
         project = _make_project(n_rooms=5, n_variations=1)
 
         peak_concurrent = 0

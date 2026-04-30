@@ -178,7 +178,27 @@ class StagingPipeline:
     async def process_room(
         self, project: StagingProject, room: Room, brief_prompts: dict = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process a single room: analyze → adapt → generate variations. Yields SSE events."""
+        """Process a single room: analyze → adapt → generate variations. Yields SSE events.
+
+        Variations within a room run *concurrently*: a per-variation worker task
+        is launched for each adapted prompt and pushes its lifecycle events
+        onto a local ``asyncio.Queue``. The outer body drains the queue and
+        yields events as they arrive — interleaved variation_completed events
+        across variations are expected (and tolerated by the frontend's
+        debouncedReload). See parallel-processing PRD § Hybrid parallelism.
+
+        Cancellation contract for variation workers (issue 006):
+
+        * On ``asyncio.CancelledError``, the worker pushes only the ``_DONE``
+          sentinel and re-raises — it does NOT push a
+          ``variation_completed`` / ``variation_failed`` event and does NOT
+          issue a post-cancel ``update_project`` write. The pre-image-gen
+          ``PROCESSING + adapted_prompt`` write that already happened is
+          fine; that's not a "zombie write" — it's a normal pre-call
+          checkpoint that reconcile can recover from.
+        * On ordinary ``Exception``, the worker marks the variation FAILED,
+          persists, emits ``variation_failed``, and pushes ``_DONE``.
+        """
         async with self.semaphore:
             yield {"type": "room_started", "room_id": room.id, "label": room.label}
 
@@ -207,103 +227,86 @@ class StagingPipeline:
                         n_variations=project.settings.variations_per_room,
                     )
 
-                for idx, adapted_prompt in enumerate(adapted_prompts):
-                    if idx >= len(room.variations):
-                        logger.warning(
-                            "More adapted prompts (%d) than variations (%d) for room %s; "
-                            "ignoring excess prompts",
-                            len(adapted_prompts), len(room.variations), room.id,
-                        )
-                        break
+                # Cap prompts at #variations and warn on excess; truncate
+                # before fan-out so we don't spawn workers for missing slots.
+                if len(adapted_prompts) > len(room.variations):
+                    logger.warning(
+                        "More adapted prompts (%d) than variations (%d) for room %s; "
+                        "ignoring excess prompts",
+                        len(adapted_prompts), len(room.variations), room.id,
+                    )
+                    adapted_prompts = adapted_prompts[: len(room.variations)]
+
+                # Variation fan-out: each variation runs concurrently. Each
+                # worker pushes its outcome event onto event_queue; a _DONE
+                # sentinel is pushed in `finally` so the parent can count
+                # worker completion robustly under cancellation.
+                _DONE = object()
+                event_queue: asyncio.Queue = asyncio.Queue()
+
+                async def _variation_worker(idx: int, adapted_prompt: str) -> None:
                     variation = room.variations[idx]
-                    variation.status = ItemStatus.PROCESSING
-                    # Persist the attempted prompt BEFORE the image-gen call so a
-                    # subsequent retry can re-use it even if generation fails or
-                    # the worker process dies mid-call. See PRD Implementation
-                    # Decisions → Backend (`adapted_prompt` persistence bullet).
-                    variation.generation_metadata = {
-                        "model": project.settings.model,
-                        "adapted_prompt": adapted_prompt,
-                    }
-                    await self._update_room_in_project(project, room)
-
-                    start_time = time.monotonic()
-                    result = None
-                    elapsed_ms = 0
                     try:
-                        pipeline_request = ImagePipelineRequest(
-                            action=PipelineAction.EDIT,
-                            prompt=adapted_prompt,
-                            model=project.settings.model,
-                            n=1,
-                            size=project.settings.size,
-                            quality=project.settings.quality,
-                            response_format="b64_json",
-                            output_format="png",
-                            source_image_base64=[image_b64],
-                            save_options=PipelineSaveOptions(
-                                enabled=True,
-                                folder_path=f"staging/{project.id}/variations/{room.id}",
-                            ),
-                            analysis_options=PipelineAnalysisOptions(enabled=False),
+                        await self._process_one_variation(
+                            project=project,
+                            room=room,
+                            variation=variation,
+                            idx=idx,
+                            adapted_prompt=adapted_prompt,
+                            image_b64=image_b64,
+                            event_queue=event_queue,
                         )
-
-                        result = await self.image_pipeline.process_pipeline(
-                            pipeline_request=pipeline_request,
-                            azure_storage_service=self.blob_service,
+                    except asyncio.CancelledError:
+                        # Cancellation contract: no completion event, no
+                        # post-cancel write. Just signal done and re-raise.
+                        raise
+                    except Exception as exc:
+                        # Unexpected exception escaping `_process_one_variation`
+                        # (it should always handle its own errors and emit a
+                        # variation_failed event). Log and emit a defensive
+                        # variation_failed so the consumer doesn't hang.
+                        logger.error(
+                            "Variation worker for room %s idx %d crashed: %s",
+                            room.id, idx, exc,
                         )
+                        event_queue.put_nowait(
+                            {
+                                "type": "variation_failed",
+                                "room_id": room.id,
+                                "variation_index": idx,
+                                "image_url": variation.image_url,
+                                "error": str(exc),
+                                "elapsed_ms": 0,
+                                "tokens_used": None,
+                                "model": project.settings.model,
+                            }
+                        )
+                    finally:
+                        event_queue.put_nowait(_DONE)
 
-                        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                tasks = [
+                    asyncio.create_task(_variation_worker(idx, prompt))
+                    for idx, prompt in enumerate(adapted_prompts)
+                ]
+                try:
+                    workers_done = 0
+                    total_workers = len(tasks)
+                    while workers_done < total_workers:
+                        event = await event_queue.get()
+                        if event is _DONE:
+                            workers_done += 1
+                            continue
+                        yield event
+                finally:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-                        if result.generation and result.save:
-                            saved = result.save
-                            saved_url = (
-                                saved.saved_images[0].get("url")
-                                if saved.saved_images
-                                else None
-                            )
-                            if saved_url:
-                                variation.image_url = saved_url
-                                variation.status = ItemStatus.COMPLETED
-                                variation.generation_metadata = {
-                                    "model": project.settings.model,
-                                    "adapted_prompt": adapted_prompt,
-                                    "generation_time_ms": elapsed_ms,
-                                }
-                            else:
-
-                                variation.status = ItemStatus.FAILED
-                                variation.error = "Save succeeded but no image URL returned"
-                        else:
-                            variation.status = ItemStatus.FAILED
-                            variation.error = "Pipeline returned no generation result"
-
-                    except Exception as e:
-                        logger.error(f"Variation {idx} failed for room {room.id}: {e}")
-                        variation.status = ItemStatus.FAILED
-                        variation.error = str(e)
-                        elapsed_ms = int((time.monotonic() - start_time) * 1000)
-
-                    # Extract token usage from generation response
-                    token_usage = None
-                    if result and result.generation and result.generation.token_usage:
-                        tu = result.generation.token_usage
-                        token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
-
-                    await self._update_room_in_project(project, room)
-
-                    yield {
-                        "type": f"variation_{'completed' if variation.status == ItemStatus.COMPLETED else 'failed'}",
-                        "room_id": room.id,
-                        "variation_index": idx,
-                        "image_url": variation.image_url,
-                        "error": variation.error,
-                        "elapsed_ms": elapsed_ms,
-                        "tokens_used": token_usage,
-                        "model": project.settings.model,
-                    }
-
-                # Mark any unprocessed variations (fewer prompts than variations) as failed
+                # Mark any unprocessed variations (fewer prompts than variations) as failed.
+                # This runs only on the normal-flow path: if we got here via
+                # CancelledError raised during the queue drain, the surrounding
+                # `async with self.semaphore:` re-raises before this runs.
                 for v in room.variations[len(adapted_prompts):]:
                     if v.status == ItemStatus.PENDING:
                         v.status = ItemStatus.FAILED
@@ -320,6 +323,125 @@ class StagingPipeline:
                 room.error = str(e)
                 await self._update_room_in_project(project, room)
                 yield {"type": "room_failed", "room_id": room.id, "error": str(e)}
+
+    async def _process_one_variation(
+        self,
+        *,
+        project: StagingProject,
+        room: Room,
+        variation: Variation,
+        idx: int,
+        adapted_prompt: str,
+        image_b64: str,
+        event_queue: asyncio.Queue,
+    ) -> None:
+        """Run one variation end-to-end and push its outcome event onto
+        the queue. Cancellation propagates out unchanged so the worker
+        wrapper can honor the no-zombie-write contract.
+
+        On non-cancellation exceptions: marks the variation FAILED,
+        persists, and pushes a ``variation_failed`` event onto the queue.
+        Never raises Exception — only CancelledError can escape.
+        """
+        variation.status = ItemStatus.PROCESSING
+        # Persist the attempted prompt BEFORE the image-gen call so a
+        # subsequent retry can re-use it even if generation fails or
+        # the worker process dies mid-call. See PRD Implementation
+        # Decisions → Backend (`adapted_prompt` persistence bullet).
+        variation.generation_metadata = {
+            "model": project.settings.model,
+            "adapted_prompt": adapted_prompt,
+        }
+        await self._update_room_in_project(project, room)
+
+        start_time = time.monotonic()
+        result = None
+        elapsed_ms = 0
+        try:
+            pipeline_request = ImagePipelineRequest(
+                action=PipelineAction.EDIT,
+                prompt=adapted_prompt,
+                model=project.settings.model,
+                n=1,
+                size=project.settings.size,
+                quality=project.settings.quality,
+                response_format="b64_json",
+                output_format="png",
+                source_image_base64=[image_b64],
+                save_options=PipelineSaveOptions(
+                    enabled=True,
+                    folder_path=f"staging/{project.id}/variations/{room.id}",
+                ),
+                analysis_options=PipelineAnalysisOptions(enabled=False),
+            )
+
+            result = await self.image_pipeline.process_pipeline(
+                pipeline_request=pipeline_request,
+                azure_storage_service=self.blob_service,
+            )
+
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+            if result.generation and result.save:
+                saved = result.save
+                saved_url = (
+                    saved.saved_images[0].get("url")
+                    if saved.saved_images
+                    else None
+                )
+                if saved_url:
+                    variation.image_url = saved_url
+                    variation.status = ItemStatus.COMPLETED
+                    variation.generation_metadata = {
+                        "model": project.settings.model,
+                        "adapted_prompt": adapted_prompt,
+                        "generation_time_ms": elapsed_ms,
+                    }
+                else:
+                    variation.status = ItemStatus.FAILED
+                    variation.error = "Save succeeded but no image URL returned"
+            else:
+                variation.status = ItemStatus.FAILED
+                variation.error = "Pipeline returned no generation result"
+
+        except Exception as e:
+            # Catch Exception (not BaseException) so CancelledError (which is
+            # BaseException in 3.8+) propagates up to the worker wrapper for
+            # the no-zombie-write contract.
+            logger.error(f"Variation {idx} failed for room {room.id}: {e}")
+            variation.status = ItemStatus.FAILED
+            variation.error = str(e)
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+        # Extract token usage from generation response
+        token_usage = None
+        if result and result.generation and result.generation.token_usage:
+            tu = result.generation.token_usage
+            token_usage = (
+                tu.get("total_tokens") if isinstance(tu, dict)
+                else getattr(tu, "total_tokens", None)
+            )
+
+        await self._update_room_in_project(project, room)
+
+        event_queue.put_nowait(
+            {
+                "type": (
+                    "variation_completed"
+                    if variation.status == ItemStatus.COMPLETED
+                    else "variation_failed"
+                ),
+                "room_id": room.id,
+                "variation_index": idx,
+                "image_url": variation.image_url,
+                "error": variation.error,
+                "elapsed_ms": elapsed_ms,
+                "tokens_used": token_usage,
+                "model": project.settings.model,
+            }
+        )
+
+
 
     async def process_single_variation(
         self,
@@ -354,71 +476,99 @@ class StagingPipeline:
             logger.warning(f"Variation {variation.id} not found in room {room.id}, defaulting to index 0")
             variation_index = 0
 
-        async with self.semaphore:
-            # Capture pre-regen visible state so we can restore it on failure.
-            prior_image_url = variation.image_url
-            prior_status = variation.status
-            prior_error = variation.error
+        # Issue 006 of the parallel-processing PRD: single-variation regen is
+        # one image call. The global image-call cap (IMAGE_GEN_SEMAPHORE in
+        # backend.core.image_pipeline) provides rate-limit protection
+        # uniformly across all callers. The room-level `self.semaphore`
+        # bounds memory-heavy room workers; acquiring it here would let an
+        # in-flight room batch starve a regen the user is actively waiting
+        # on. Do NOT re-introduce `async with self.semaphore:` here.
+        # Capture pre-regen visible state so we can restore it on failure.
+        prior_image_url = variation.image_url
+        prior_status = variation.status
+        prior_error = variation.error
 
-            variation.status = ItemStatus.PROCESSING
-            # Persist the attempted prompt BEFORE the image-gen call so a
-            # subsequent retry can re-use it even if generation fails or the
-            # worker dies mid-call. See PRD Implementation Decisions → Backend
-            # (`adapted_prompt` persistence bullet).
-            variation.generation_metadata = {
-                "model": project.settings.model,
-                "adapted_prompt": adapted_prompt,
-            }
-            await self._update_room_in_project(project, room)
+        variation.status = ItemStatus.PROCESSING
+        # Persist the attempted prompt BEFORE the image-gen call so a
+        # subsequent retry can re-use it even if generation fails or the
+        # worker dies mid-call. See PRD Implementation Decisions → Backend
+        # (`adapted_prompt` persistence bullet).
+        variation.generation_metadata = {
+            "model": project.settings.model,
+            "adapted_prompt": adapted_prompt,
+        }
+        await self._update_room_in_project(project, room)
 
-            start_time = time.monotonic()
-            result = None
-            image_gen_error: Optional[Exception] = None
-            shield_started = False
+        start_time = time.monotonic()
+        result = None
+        image_gen_error: Optional[Exception] = None
+        shield_started = False
 
+        try:
             try:
-                try:
-                    image_content, _ = self.blob_service.get_asset_content(
-                        blob_name=self._extract_blob_name(room.original_image_url),
-                        container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
-                    )
-                    if image_content is None:
-                        raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
-                    image_b64 = base64.b64encode(image_content).decode("utf-8")
+                image_content, _ = self.blob_service.get_asset_content(
+                    blob_name=self._extract_blob_name(room.original_image_url),
+                    container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+                )
+                if image_content is None:
+                    raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
+                image_b64 = base64.b64encode(image_content).decode("utf-8")
 
-                    pipeline_request = ImagePipelineRequest(
-                        action=PipelineAction.EDIT,
-                        prompt=adapted_prompt,
-                        model=project.settings.model,
-                        n=1,
-                        size=project.settings.size,
-                        quality=project.settings.quality,
-                        response_format="b64_json",
-                        output_format="png",
-                        source_image_base64=[image_b64],
-                        save_options=PipelineSaveOptions(
-                            enabled=True,
-                            folder_path=f"staging/{project.id}/variations/{room.id}",
-                        ),
-                        analysis_options=PipelineAnalysisOptions(enabled=False),
-                    )
+                pipeline_request = ImagePipelineRequest(
+                    action=PipelineAction.EDIT,
+                    prompt=adapted_prompt,
+                    model=project.settings.model,
+                    n=1,
+                    size=project.settings.size,
+                    quality=project.settings.quality,
+                    response_format="b64_json",
+                    output_format="png",
+                    source_image_base64=[image_b64],
+                    save_options=PipelineSaveOptions(
+                        enabled=True,
+                        folder_path=f"staging/{project.id}/variations/{room.id}",
+                    ),
+                    analysis_options=PipelineAnalysisOptions(enabled=False),
+                )
 
-                    # Cancellable: a client disconnect mid-image-gen propagates
-                    # CancelledError out of this await, past the inner Exception
-                    # handler (CancelledError is BaseException, not Exception).
-                    result = await self.image_pipeline.process_pipeline(
-                        pipeline_request=pipeline_request,
-                        azure_storage_service=self.blob_service,
-                    )
-                except Exception as e:
-                    image_gen_error = e
+                # Cancellable: a client disconnect mid-image-gen propagates
+                # CancelledError out of this await, past the inner Exception
+                # handler (CancelledError is BaseException, not Exception).
+                result = await self.image_pipeline.process_pipeline(
+                    pipeline_request=pipeline_request,
+                    azure_storage_service=self.blob_service,
+                )
+            except Exception as e:
+                image_gen_error = e
 
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+            # Shield the persist write so a client disconnect after image
+            # generation but before persistence cannot strand the variation.
+            shield_started = True
+            event_type, regen_error_message = await asyncio.shield(
+                self._persist_single_variation_outcome(
+                    project=project,
+                    room=room,
+                    variation=variation,
+                    adapted_prompt=adapted_prompt,
+                    prior_image_url=prior_image_url,
+                    prior_status=prior_status,
+                    prior_error=prior_error,
+                    result=result,
+                    image_gen_error=image_gen_error,
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+        except asyncio.CancelledError:
+            if not shield_started:
+                # Pre-shield cancellation: image-gen was killed by the
+                # client disconnect before we built the persist payload.
+                # Persist a rollback (shielded) so the variation isn't
+                # stranded in PROCESSING (reconcile cannot recover us
+                # because we did not elevate `project.status`).
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-
-                # Shield the persist write so a client disconnect after image
-                # generation but before persistence cannot strand the variation.
-                shield_started = True
-                event_type, regen_error_message = await asyncio.shield(
+                await asyncio.shield(
                     self._persist_single_variation_outcome(
                         project=project,
                         room=room,
@@ -427,52 +577,30 @@ class StagingPipeline:
                         prior_image_url=prior_image_url,
                         prior_status=prior_status,
                         prior_error=prior_error,
-                        result=result,
-                        image_gen_error=image_gen_error,
+                        result=None,
+                        image_gen_error=RuntimeError("Cancelled by client disconnect"),
                         elapsed_ms=elapsed_ms,
                     )
                 )
-            except asyncio.CancelledError:
-                if not shield_started:
-                    # Pre-shield cancellation: image-gen was killed by the
-                    # client disconnect before we built the persist payload.
-                    # Persist a rollback (shielded) so the variation isn't
-                    # stranded in PROCESSING (reconcile cannot recover us
-                    # because we did not elevate `project.status`).
-                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                    await asyncio.shield(
-                        self._persist_single_variation_outcome(
-                            project=project,
-                            room=room,
-                            variation=variation,
-                            adapted_prompt=adapted_prompt,
-                            prior_image_url=prior_image_url,
-                            prior_status=prior_status,
-                            prior_error=prior_error,
-                            result=None,
-                            image_gen_error=RuntimeError("Cancelled by client disconnect"),
-                            elapsed_ms=elapsed_ms,
-                        )
-                    )
-                # If shield_started is True the inner _persist_outcome is still
-                # running to completion via asyncio.shield(); do not re-call it.
-                raise
+            # If shield_started is True the inner _persist_outcome is still
+            # running to completion via asyncio.shield(); do not re-call it.
+            raise
 
-            token_usage = None
-            if result and result.generation and result.generation.token_usage:
-                tu = result.generation.token_usage
-                token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
+        token_usage = None
+        if result and result.generation and result.generation.token_usage:
+            tu = result.generation.token_usage
+            token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
 
-            yield {
-                "type": event_type,
-                "room_id": room.id,
-                "variation_index": variation_index,
-                "image_url": variation.image_url,
-                "error": regen_error_message,
-                "elapsed_ms": elapsed_ms,
-                "tokens_used": token_usage,
-                "model": project.settings.model,
-            }
+        yield {
+            "type": event_type,
+            "room_id": room.id,
+            "variation_index": variation_index,
+            "image_url": variation.image_url,
+            "error": regen_error_message,
+            "elapsed_ms": elapsed_ms,
+            "tokens_used": token_usage,
+            "model": project.settings.model,
+        }
 
     async def _persist_single_variation_outcome(
         self,
