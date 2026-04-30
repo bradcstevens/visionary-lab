@@ -176,14 +176,22 @@ test.describe('Retry-to-fresh fallback toast (issue 004)', () => {
       fullPage: true,
     });
 
-    // The regen continues normally — assert the success toast also fires
-    // after project_completed (the page handler emits "Variation
-    // regenerated!" on project_completed).
-    const successToast = page.getByText(/Variation regenerated!/i);
-    await expect(successToast).toBeVisible({ timeout: 10_000 });
+    // The regen continues normally — issue 006 dropped the
+    // ``toast.success('Variation regenerated!')`` on
+    // ``project_completed``. Assert instead that the activity-log
+    // entry shows the "(fresh — no prior prompt)" strategy label,
+    // which is the post-issue-006 success signal.
+    const successEntry = page.getByText(
+      /Variation 1 regenerated \(fresh — no prior prompt\)/i,
+    );
+    await expect(successEntry).toBeVisible({ timeout: 10_000 });
+
+    // And confirm the dropped toast does NOT fire — this is the
+    // double-toast regression guard from issue 006.
+    await expect(page.getByText(/Variation regenerated!/i)).toHaveCount(0);
 
     await page.screenshot({
-      path: `${SCREENSHOT_DIR}/03-success-toast.png`,
+      path: `${SCREENSHOT_DIR}/03-success-activity-log-entry.png`,
       fullPage: true,
     });
   });

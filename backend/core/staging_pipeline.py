@@ -615,6 +615,7 @@ class StagingPipeline:
             "elapsed_ms": elapsed_ms,
             "tokens_used": token_usage,
             "model": project.settings.model,
+            "adapted_prompt": adapted_prompt,
         }
 
     async def _persist_single_variation_outcome(

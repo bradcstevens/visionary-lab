@@ -778,6 +778,87 @@ class TestSingleVariationFailureRollbackAndCleanup:
         mock_blob.delete_asset.assert_called_once()
 
 
+class TestSingleVariationEventIncludesAdaptedPrompt:
+    """Issue 006 of single-variation-regeneration PRD: ``process_single_variation``
+    yields ``adapted_prompt`` on its terminal ``variation_completed`` /
+    ``variation_failed`` event so the frontend activity log can render a
+    snippet of the prompt that was attempted (alongside model / tokens /
+    elapsed). The pipeline already takes ``adapted_prompt`` as a parameter
+    and persists it to ``generation_metadata``; this test pins that the
+    same value is surfaced on the SSE event.
+    """
+
+    PRIOR_URL = "https://acct.blob.core.windows.net/images/staging/proj/variations/room-0/prior.png"
+    NEW_URL = "https://acct.blob.core.windows.net/images/staging/proj/variations/room-0/new.png"
+
+    def _make_pipeline_with_prior_image(self, mock_pipeline_call):
+        project = _make_project(n_rooms=1, n_variations=2)
+        room = project.rooms[0]
+        variation = room.variations[1]
+        variation.status = ItemStatus.COMPLETED
+        variation.image_url = self.PRIOR_URL
+        variation.error = None
+
+        with patch("backend.core.staging_pipeline.StagingPipeline.__init__", return_value=None):
+            pipeline = StagingPipeline.__new__(StagingPipeline)
+            pipeline.image_pipeline = AsyncMock()
+            pipeline.image_pipeline.process_pipeline = mock_pipeline_call
+            mock_blob = MagicMock()
+            mock_blob.delete_asset = MagicMock(return_value=True)
+            mock_blob.get_asset_content.return_value = (b"\x89PNG\r\n", "image/png")
+            pipeline.blob_service = mock_blob
+            pipeline.storage_service = MagicMock()
+            pipeline.semaphore = asyncio.Semaphore(1)
+            pipeline._cleanup_tasks = set()
+        return pipeline, project, room, variation
+
+    @pytest.mark.asyncio
+    async def test_variation_completed_event_includes_adapted_prompt(self):
+        """The SSE ``variation_completed`` event must surface ``adapted_prompt``
+        so the frontend can render the activity-log prompt snippet without
+        an extra API round-trip."""
+        pipeline_response = _make_pipeline_response(image_url=self.NEW_URL)
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            AsyncMock(return_value=pipeline_response),
+        )
+        adapted_prompt = "Sculptural pendant lamp over a walnut dining table"
+
+        events = []
+        async for event in pipeline.process_single_variation(
+            project, room, variation, adapted_prompt,
+        ):
+            events.append(event)
+        await _drain_cleanup_tasks(pipeline)
+
+        completed = [e for e in events if e["type"] == "variation_completed"]
+        assert len(completed) == 1
+        assert completed[0].get("adapted_prompt") == adapted_prompt
+
+    @pytest.mark.asyncio
+    async def test_variation_failed_event_includes_adapted_prompt(self):
+        """Failure path must also surface ``adapted_prompt`` so the activity
+        log can show what was attempted on a failed regen."""
+
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("simulated image-gen failure")
+
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            AsyncMock(side_effect=_raise),
+        )
+        adapted_prompt = "Velvet teal sofa near the south-facing window"
+
+        events = []
+        async for event in pipeline.process_single_variation(
+            project, room, variation, adapted_prompt,
+        ):
+            events.append(event)
+        await _drain_cleanup_tasks(pipeline)
+
+        failed = [e for e in events if e["type"] == "variation_failed"]
+        assert len(failed) == 1
+        assert failed[0].get("adapted_prompt") == adapted_prompt
+
+
 class TestAdaptPromptWithRejectedPrompt:
     """Issue 003 of single-variation-regeneration PRD: ``StagingPipeline.adapt_prompt``
     accepts an optional ``rejected_prompt`` and threads it into the LLM

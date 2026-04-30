@@ -293,6 +293,12 @@ export default function ProjectDetailPage() {
     const variation = room.variations[variationIndex];
     setRegeneratingVariationId(variation.id);
 
+    // Issue 006 of single-variation-regeneration PRD: closure-scoped flag —
+    // each ``handleRegenerateVariation`` invocation gets its own. Set on
+    // ``variation_fallback``; read on ``variation_completed`` to compute
+    // the effective strategy label "(fresh — no prior prompt)".
+    let fellBackToFresh = false;
+
     const cleanup = streamVariationRegeneration(
       projectId,
       room.id,
@@ -300,18 +306,40 @@ export default function ProjectDetailPage() {
       strategy,
       (event) => {
         switch (event.type) {
-          case 'variation_completed':
+          case 'variation_completed': {
+            // Issue 006 success activity-log copy: include the strategy
+            // label and (when present) a 60-char snippet of the
+            // ``adapted_prompt`` that produced the result.
+            const completed = event as {
+              type: 'variation_completed';
+              model?: string;
+              tokens_used?: number;
+              elapsed_ms?: number;
+              adapted_prompt?: string;
+            };
+            const label = fellBackToFresh
+              ? '(fresh — no prior prompt)'
+              : strategy === 'retry'
+                ? '(retry)'
+                : '(fresh)';
+            const adaptedPrompt = completed.adapted_prompt;
+            const snippet =
+              typeof adaptedPrompt === 'string' && adaptedPrompt.length > 0
+                ? adaptedPrompt.slice(0, 60) + (adaptedPrompt.length > 60 ? '…' : '')
+                : null;
             activityLog.log({
               level: 'success',
               icon: '✓',
-              message: `Variation ${variationIndex + 1} regenerated`,
+              message: `Variation ${variationIndex + 1} regenerated ${label}`,
               detail: [
-                (event as any).model,
-                (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
-                (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
+                completed.model,
+                completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
+                completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
+                snippet,
               ].filter(Boolean).join(' · ') || undefined,
             });
             break;
+          }
           case 'variation_fallback':
             // Issue 004 of single-variation-regeneration PRD: backend
             // emits this when ``strategy=retry`` is requested but the
@@ -320,7 +348,10 @@ export default function ProjectDetailPage() {
             // notification that the retry silently became a fresh
             // generation. Single info toast + activity-log entry — do
             // NOT clear ``regeneratingVariationId`` (regen is still
-            // in flight).
+            // in flight). Also flip ``fellBackToFresh`` so the
+            // ``variation_completed`` activity entry shows the
+            // "(fresh — no prior prompt)" label per issue 006.
+            fellBackToFresh = true;
             activityLog.log({
               level: 'info',
               icon: 'ℹ',
@@ -340,11 +371,17 @@ export default function ProjectDetailPage() {
             break;
           case 'project_completed':
           case 'stream_ended':
+            // Issue 006: drop the spurious ``toast.success('Variation
+            // regenerated!')``. The success activity-log entry already
+            // landed on ``variation_completed``; an additional toast
+            // here would (a) duplicate that signal on the happy path
+            // and (b) flash a misleading success after a failure on
+            // the unhappy path (the double-toast bug). Both
+            // ``project_completed`` and ``stream_ended`` resolve to the
+            // same cleanup — clear the regen state and reload the
+            // project to surface the new variation.
             setRegeneratingVariationId(null);
             loadProject();
-            if (event.type === 'project_completed') {
-              toast.success('Variation regenerated!');
-            }
             break;
           case 'error':
             setRegeneratingVariationId(null);
