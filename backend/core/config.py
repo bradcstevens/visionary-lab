@@ -57,9 +57,11 @@ class Settings(BaseSettings):
     STAGING_COSMOS_CONTAINER_ID: str = "staging-projects"
     STAGING_STALE_PROCESSING_MINUTES: int = 5  # Consider processing stale after this many minutes
 
-    # Rate-limit retry for image generation API calls (429 handling)
-    IMAGE_GEN_RETRY_ATTEMPTS: int = 3
-    IMAGE_GEN_RETRY_BASE_DELAY: float = 2.0  # seconds; doubles each retry
+    # Retry for image-gen and LLM API calls (typed allowlist + full jitter
+    # exponential backoff + cumulative-wait cap). See backend/core/retry.py.
+    IMAGE_GEN_RETRY_ATTEMPTS: int = 5
+    IMAGE_GEN_RETRY_BASE_DELAY: float = 2.0  # seconds; full jitter doubles each attempt
+    IMAGE_GEN_RETRY_MAX_TOTAL_WAIT: float = 120.0  # seconds; cumulative wait cap
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"

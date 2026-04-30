@@ -20,6 +20,7 @@ from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.cosmos_client import CosmosDBService
 from backend.core.instructions import analyze_image_system_message
+from backend.core.retry import call_with_retry
 from backend.models.gallery import MediaType
 from backend.models.images import (
     ImageEditRequest,
@@ -43,38 +44,6 @@ class ImagePipelineService:
 
     def __init__(self) -> None:
         self._image_analyzer: Optional[ImageAnalyzer] = None
-
-    async def _call_with_retry(self, coro_fn, *args, **kwargs):
-        """Wrap an async callable with 429 retry + exponential backoff.
-
-        Respects ``Retry-After`` header on the response when present;
-        otherwise uses exponential backoff (base * 2**attempt).
-        """
-        max_attempts = settings.IMAGE_GEN_RETRY_ATTEMPTS
-        base_delay = settings.IMAGE_GEN_RETRY_BASE_DELAY
-
-        for attempt in range(max_attempts):
-            try:
-                return await coro_fn(*args, **kwargs)
-            except RateLimitError as exc:
-                if attempt >= max_attempts - 1:
-                    raise
-                retry_after: Optional[float] = None
-                response = getattr(exc, "response", None)
-                if response is not None:
-                    retry_after_str = response.headers.get("retry-after")
-                    if retry_after_str:
-                        try:
-                            retry_after = float(retry_after_str)
-                        except (ValueError, TypeError):
-                            retry_after = None
-                delay = retry_after if retry_after is not None else base_delay * (2 ** attempt)
-                logger.warning(
-                    "Rate limited (429), attempt %d/%d. Retrying in %.1fs",
-                    attempt + 1, max_attempts, delay,
-                )
-                await asyncio.sleep(delay)
-        raise RuntimeError("Unreachable")  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Generation / Edit helpers
@@ -115,8 +84,13 @@ class ImagePipelineService:
                 params["user"] = request.user
 
             # Run sync SDK call in thread pool to not block event loop
-            response = await self._call_with_retry(
-                asyncio.to_thread, client.generate_image, **params
+            response = await call_with_retry(
+                lambda: asyncio.to_thread(client.generate_image, **params),
+                semaphore=None,
+                model=request.model,
+                attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+                base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+                max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
             )
             token_usage = self._extract_token_usage(response)
 
@@ -225,7 +199,14 @@ class ImagePipelineService:
                     for f in open_files:
                         f.close()
 
-            response = await self._call_with_retry(asyncio.to_thread, _sync_edit)
+            response = await call_with_retry(
+                lambda: asyncio.to_thread(_sync_edit),
+                semaphore=None,
+                model=request.model,
+                attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+                base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+                max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
+            )
             token_usage = self._extract_token_usage(response)
 
             return ImageGenerationResponse(

@@ -13,6 +13,7 @@ from backend.core.analyze import ImageAnalyzer
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.image_pipeline import ImagePipelineService
+from backend.core.retry import call_with_retry
 from backend.core.staging_storage import StagingStorageService
 from backend.models.images import ImagePipelineRequest, PipelineAction, PipelineSaveOptions, PipelineAnalysisOptions
 from backend.models.staging import ItemStatus, ProjectStatus, Room, StagingProject, Variation
@@ -114,11 +115,21 @@ class StagingPipeline:
         for attempt in range(3):
             if attempt:
                 await asyncio.sleep(1)
-            response = await self.async_llm_client.chat.completions.create(
+            # Wrap the network call with retry util; the outer JSON-parse loop
+            # remains as an inner-style loop (per the parallel-processing PRD,
+            # JSON-parse retries inside prompt adaptation stay).
+            response = await call_with_retry(
+                lambda: self.async_llm_client.chat.completions.create(
+                    model=self.llm_deployment,
+                    messages=[{"role": "system", "content": system_content}],
+                    temperature=0.8,
+                    response_format={"type": "json_object"},
+                ),
+                semaphore=None,
                 model=self.llm_deployment,
-                messages=[{"role": "system", "content": system_content}],
-                temperature=0.8,
-                response_format={"type": "json_object"},
+                attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+                base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+                max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
             )
             try:
                 content = response.choices[0].message.content

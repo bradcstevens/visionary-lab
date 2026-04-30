@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Dict, List
 
+from backend.core.config import settings
+from backend.core.retry import call_with_retry
 from backend.models.design_brief import (
     ChatMessage, DesignBrief, ImageAnalysis, PlantEntry, PlacementGuide,
 )
@@ -146,11 +148,18 @@ class BriefGeneratorService:
             )
 
             for attempt in range(3):
-                response = await self.async_llm_client.chat.completions.create(
+                response = await call_with_retry(
+                    lambda: self.async_llm_client.chat.completions.create(
+                        model=self.llm_deployment,
+                        messages=[{"role": "system", "content": system_content}],
+                        temperature=0.8,
+                        response_format={"type": "json_object"},
+                    ),
+                    semaphore=None,
                     model=self.llm_deployment,
-                    messages=[{"role": "system", "content": system_content}],
-                    temperature=0.8,
-                    response_format={"type": "json_object"},
+                    attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+                    base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+                    max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
                 )
                 try:
                     content = response.choices[0].message.content

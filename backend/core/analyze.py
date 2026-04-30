@@ -8,6 +8,9 @@ from typing import List, Dict
 import cv2
 import numpy as np
 
+from backend.core.config import settings
+from backend.core.retry import call_with_retry
+
 logger = logging.getLogger(__name__)
 
 class VideoExtractor:
@@ -226,12 +229,22 @@ class ImageAnalyzer:
                 logger.info("Retrying ImageAnalyzer.async_image_chat() - attempt %s", attempt)
                 await asyncio.sleep(retry_delay)
 
-            response = await self.async_openai_client.chat.completions.create(
+            # Wrap the network call with retry util; the outer JSON-parse loop
+            # remains as an inner-style loop (per the parallel-processing PRD,
+            # JSON-parse retries inside prompt adaptation stay).
+            response = await call_with_retry(
+                lambda: self.async_openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0,
+                    seed=0,
+                    response_format={"type": "json_object"},
+                ),
+                semaphore=None,
                 model=self.model,
-                messages=messages,
-                temperature=0,
-                seed=0,
-                response_format={"type": "json_object"},
+                attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+                base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+                max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
             )
 
             try:
