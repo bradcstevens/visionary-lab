@@ -99,7 +99,7 @@ async function mockStagingApi(page: Page) {
         body: JSON.stringify({
           brief: {
             global_instructions: 'Add lush greenery along the fence line with layered heights',
-            plant_palette: [{ species: 'Japanese Maple', quantity: 1, size: 'medium', placement: 'Corner accent', botanical_name: 'Acer palmatum' }],
+            object_palette: [{ id: 'obj-1', name: 'Japanese Maple', description: 'Acer palmatum', category: 'tree', default_quantity: 1, size: 'medium', placement: 'Corner accent' }],
             placement_guide: { back_row: 'Tall ornamental grasses', front_row: 'Low ground cover', middle_row: 'Medium shrubs' },
             per_image_notes: {},
             preserve_elements: ['Existing fence', 'Patio pavers'],
@@ -441,7 +441,7 @@ test.describe('Design Chat — Brief Generation', () => {
 
     // Should advance to step 4 after brief is generated
     await expect(page.getByText('Global Instructions')).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText('Plant Palette')).toBeVisible();
+    await expect(page.getByText('Object Palette')).toBeVisible();
 
     await page.screenshot({ path: 'test-results/screenshots/wizard/step4-brief-editor.png', fullPage: true });
   });

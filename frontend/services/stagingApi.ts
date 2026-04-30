@@ -116,13 +116,25 @@ export interface StagingStreamEvent {
 export type StagingStreamEventCallback = (event: StagingStreamEvent) => void;
 
 // Design Brief types
-export interface PlantEntry {
-  species: string;
-  botanical_name?: string;
-  quantity: number;
+export type ObjectCategory =
+  | "plant"
+  | "tree"
+  | "rock"
+  | "furniture"
+  | "lighting"
+  | "hardscape"
+  | "decor"
+  | "other";
+
+export interface ObjectEntry {
+  id: string;
+  name: string;
+  description?: string | null;
+  category: ObjectCategory;
+  default_quantity: number;
   size: string;
   placement: string;
-  visual_notes?: string;
+  visual_notes?: string | null;
 }
 
 export interface PlacementGuide {
@@ -134,9 +146,13 @@ export interface PlacementGuide {
 
 export interface DesignBrief {
   global_instructions: string;
-  plant_palette: PlantEntry[];
+  object_palette: ObjectEntry[];
   placement_guide: PlacementGuide;
   per_image_notes: Record<string, string>;
+  // ``per_image_objects`` is reserved for issue 003 of the
+  // per-image-object-quantities PRD; the inner items round-trip as
+  // unknowns until 003 tightens the type.
+  per_image_objects?: Record<string, unknown[]>;
   preserve_elements: string[];
   settings: {
     variations_per_room: number;

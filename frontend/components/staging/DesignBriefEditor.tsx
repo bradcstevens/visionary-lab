@@ -7,8 +7,8 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { X } from "lucide-react";
-import { PlantPaletteTable } from "./PlantPaletteTable";
-import type { DesignBrief, PlantEntry } from "@/services/stagingApi";
+import { ObjectPaletteTable } from "./ObjectPaletteTable";
+import type { DesignBrief, ObjectEntry } from "@/services/stagingApi";
 
 interface DesignBriefEditorProps {
   brief: DesignBrief;
@@ -43,8 +43,11 @@ export function DesignBriefEditor({ brief, onChange, imageLabels }: DesignBriefE
       </div>
 
       <div className="space-y-2">
-        <Label className="text-sm font-semibold">Plant Palette</Label>
-        <PlantPaletteTable plants={brief.plant_palette} onChange={(plants: PlantEntry[]) => updateField("plant_palette", plants)} />
+        <Label className="text-sm font-semibold">Object Palette</Label>
+        <ObjectPaletteTable
+          objects={brief.object_palette}
+          onChange={(objects: ObjectEntry[]) => updateField("object_palette", objects)}
+        />
       </div>
 
       <div className="space-y-2">

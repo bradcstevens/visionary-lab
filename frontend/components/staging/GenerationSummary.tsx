@@ -41,13 +41,13 @@ export function GenerationSummary({ projectName, imageCount, brief }: Generation
         <p className="text-sm leading-relaxed">{brief.global_instructions}</p>
       </div>
 
-      {brief.plant_palette.length > 0 && (
+      {brief.object_palette.length > 0 && (
         <div className="space-y-2">
-          <span className="text-sm font-medium text-muted-foreground">Plants ({brief.plant_palette.length})</span>
+          <span className="text-sm font-medium text-muted-foreground">Objects ({brief.object_palette.length})</span>
           <div className="flex flex-wrap gap-1.5">
-            {brief.plant_palette.map((p, i) => (
-              <Badge key={i} variant="secondary" className="text-xs">
-                {p.quantity}× {p.species}
+            {brief.object_palette.map((obj) => (
+              <Badge key={obj.id} variant="secondary" className="text-xs">
+                {obj.default_quantity}× {obj.name}
               </Badge>
             ))}
           </div>
