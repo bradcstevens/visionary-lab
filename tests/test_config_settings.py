@@ -5,8 +5,3 @@ def test_retry_settings_have_defaults():
     s = Settings()
     assert s.IMAGE_GEN_RETRY_ATTEMPTS == 3
     assert s.IMAGE_GEN_RETRY_BASE_DELAY == 2.0
-
-
-def test_batch_concurrency_setting_has_default():
-    s = Settings()
-    assert s.IMAGE_BATCH_MAX_CONCURRENT == 3

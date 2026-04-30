@@ -463,24 +463,3 @@ class ImagePipelineResponse(BaseResponse):
     save: Optional[ImageSaveResponse] = Field(
         None, description="Save stage response when executed"
     )
-
-
-class ImageBatchRequest(BaseModel):
-    """Request containing multiple image pipeline operations to process in parallel."""
-    requests: List[ImagePipelineRequest] = Field(
-        ...,
-        description="List of pipeline requests to execute concurrently",
-        min_length=1,
-        max_length=20,
-    )
-
-
-class ImageBatchResponse(BaseModel):
-    """Response for batch image processing."""
-    results: List[ImagePipelineResponse] = Field(
-        default_factory=list,
-        description="Results for each request, in the same order as input",
-    )
-    total: int = Field(0, description="Total number of requests processed")
-    succeeded: int = Field(0, description="Number of successful results")
-    failed: int = Field(0, description="Number of failed results")

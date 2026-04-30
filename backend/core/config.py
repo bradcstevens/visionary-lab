@@ -61,9 +61,6 @@ class Settings(BaseSettings):
     IMAGE_GEN_RETRY_ATTEMPTS: int = 3
     IMAGE_GEN_RETRY_BASE_DELAY: float = 2.0  # seconds; doubles each retry
 
-    # Batch image API concurrency
-    IMAGE_BATCH_MAX_CONCURRENT: int = 3
-
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
 

@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from typing import List, Optional
-import asyncio
 import re
 import logging
 import base64
@@ -37,8 +36,6 @@ from backend.models.images import (
     PipelineAction,
     PipelineSaveOptions,
     PipelineAnalysisOptions,
-    ImageBatchRequest,
-    ImageBatchResponse,
 )
 from backend.core import llm_client, async_llm_client, image_sas_token
 from backend.core.azure_storage import AzureBlobStorageService
@@ -60,10 +57,6 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 pipeline_service = ImagePipelineService()
-
-# Module-level semaphore so concurrent batch requests share the limit
-# (otherwise N parallel batches × IMAGE_BATCH_MAX_CONCURRENT would exceed Azure quotas)
-_batch_semaphore = asyncio.Semaphore(settings.IMAGE_BATCH_MAX_CONCURRENT)
 
 
 def get_cosmos_service() -> Optional[CosmosDBService]:
@@ -247,54 +240,6 @@ async def process_image_pipeline(
         cosmos_service=cosmos_service,
         source_images=uploaded_images,
         mask=mask,
-    )
-
-
-@router.post("/batch", response_model=ImageBatchResponse)
-async def batch_process(
-    batch_request: ImageBatchRequest,
-    cosmos_service: Optional[CosmosDBService] = Depends(get_cosmos_service),
-):
-    """Process multiple image pipeline requests concurrently.
-
-    Limited by IMAGE_BATCH_MAX_CONCURRENT to respect Azure AI Foundry rate limits.
-    Partial failures (one request raising) do not block successful results.
-    """
-    azure_storage = AzureBlobStorageService() if settings.AZURE_BLOB_SERVICE_URL else None
-    results: List[Optional[ImagePipelineResponse]] = [None] * len(batch_request.requests)
-
-    async def _process_one(idx: int, req: ImagePipelineRequest):
-        async with _batch_semaphore:
-            try:
-                results[idx] = await pipeline_service.process_pipeline(
-                    pipeline_request=req,
-                    azure_storage_service=azure_storage,
-                    cosmos_service=cosmos_service,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("Batch item %d failed: %s", idx, exc)
-                results[idx] = ImagePipelineResponse(
-                    success=False,
-                    message=str(exc),
-                    steps=[],
-                )
-
-    tasks = [
-        asyncio.create_task(_process_one(i, req))
-        for i, req in enumerate(batch_request.requests)
-    ]
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    succeeded = sum(1 for r in results if r and r.success)
-    failed = len(results) - succeeded
-
-    return ImageBatchResponse(
-        results=results,
-        total=len(results),
-        succeeded=succeeded,
-        failed=failed,
     )
 
 
