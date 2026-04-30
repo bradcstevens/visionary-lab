@@ -17,6 +17,8 @@ import type { Variation } from "@/services/stagingApi";
 
 export interface LightboxImage {
   url: string;
+  /** Stable room id used to look up the up-to-date room in the latest project. */
+  roomId: string;
   roomLabel: string;
   variationIndex: number;
   /** All variations for this room — enables prev/next navigation. */

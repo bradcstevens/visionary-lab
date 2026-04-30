@@ -37,7 +37,6 @@ export default function ProjectDetailPage() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [regeneratingVariationId, setRegeneratingVariationId] = useState<string | null>(null);
-  const [lightboxContext, setLightboxContext] = useState<{ room: Room; variationIndex: number } | null>(null);
   const streamCleanupRef = useRef<(() => void) | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestLoadIdRef = useRef(0);
@@ -63,21 +62,28 @@ export default function ProjectDetailPage() {
     }
   }, [projectId]);
 
-  // Sync lightbox image URL with project data after reload
+  // Sync the open lightbox with the freshly-loaded project after each reload.
+  // Drives off `lightboxImage` (the variation actually on screen), not the
+  // variation we originally opened on, so arrow-key navigation during a regen
+  // doesn't desync the spinner / image. See issue 005 of the
+  // single-variation-regeneration PRD.
   useEffect(() => {
-    if (lightboxContext && project) {
-      const room = project.rooms.find(r => r.id === lightboxContext.room.id);
-      if (room) {
-        const variation = room.variations[lightboxContext.variationIndex];
-        if (variation?.status === 'completed' && variation.image_url) {
-          setLightboxImage(prev => prev ? {
-            ...prev,
-            url: variation.image_url!,
-          } : null);
-          setLightboxContext(prev => prev ? { ...prev, room } : null);
-        }
-      }
-    }
+    if (!project) return;
+    setLightboxImage((prev) => {
+      if (!prev) return prev;
+      const room = project.rooms.find((r) => r.id === prev.roomId);
+      if (!room) return prev;
+      const variation = room.variations[prev.variationIndex];
+      const refreshedUrl =
+        variation?.status === 'completed' && variation.image_url
+          ? variation.image_url
+          : prev.url;
+      return {
+        ...prev,
+        variations: room.variations,
+        url: refreshedUrl,
+      };
+    });
   }, [project]);
 
   const resolveImageUrls = async (data: StagingProject) => {
@@ -264,11 +270,11 @@ export default function ProjectDetailPage() {
     if (variation.status === 'completed' && variation.image_url) {
       setLightboxImage({
         url: variation.image_url,
+        roomId: room.id,
         roomLabel: room.label,
         variationIndex,
         variations: room.variations,
       });
-      setLightboxContext({ room, variationIndex });
     }
   };
 
@@ -340,9 +346,11 @@ export default function ProjectDetailPage() {
   }, [isGenerating, regeneratingVariationId, projectId, activityLog, loadProject]);
 
   const handleLightboxRegenerate = useCallback((strategy: 'retry' | 'fresh') => {
-    if (!lightboxContext) return;
-    handleRegenerateVariation(lightboxContext.room, lightboxContext.variationIndex, strategy);
-  }, [lightboxContext, handleRegenerateVariation]);
+    if (!lightboxImage || !project) return;
+    const room = project.rooms.find((r) => r.id === lightboxImage.roomId);
+    if (!room) return;
+    handleRegenerateVariation(room, lightboxImage.variationIndex, strategy);
+  }, [lightboxImage, project, handleRegenerateVariation]);
 
   const handleRetryVariation = (room: Room, variationIndex: number) => {
     // Failed-variation Retry regenerates ONLY that variation, leaving sibling
@@ -636,12 +644,13 @@ export default function ProjectDetailPage() {
       {/* Image lightbox */}
       <ImageLightbox
         image={lightboxImage}
-        onClose={() => { setLightboxImage(null); setLightboxContext(null); }}
+        onClose={() => setLightboxImage(null)}
         onNavigate={handleLightboxNavigate}
-        onRegenerate={lightboxContext ? handleLightboxRegenerate : undefined}
+        onRegenerate={lightboxImage ? handleLightboxRegenerate : undefined}
         isRegenerating={
-          lightboxContext
-            ? regeneratingVariationId === lightboxContext.room.variations[lightboxContext.variationIndex]?.id
+          lightboxImage
+            ? regeneratingVariationId ===
+              lightboxImage.variations[lightboxImage.variationIndex]?.id
             : false
         }
       />
