@@ -374,3 +374,145 @@ def test_list_projects_migrates_legacy_plant_palette_and_writes_back(client, moc
 
     # Writeback fired so the next list read is a no-op for this project.
     assert mock_container.replace_item.call_count >= 1
+
+
+def test_put_brief_round_trip_preserves_typed_per_image_objects(client, mock_staging_deps):
+    """Issue 003 of the per-image-object-quantities-design PRD: a brief with
+    typed `per_image_objects` overrides survives a PUT round trip with all
+    fields intact (object_id, quantity, placement, enabled).
+    """
+    mock_container = mock_staging_deps["container"]
+
+    project_id = "proj-pio"
+    obj_id = "obj-lavender"
+
+    initial = {
+        "id": project_id,
+        "name": "Per-Image Test",
+        "prompt": "",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": None,
+    }
+    mock_container.read_item.return_value = initial
+
+    # Capture the payload that would be persisted.
+    persisted = {}
+
+    def fake_replace_item(item, body):
+        persisted["body"] = body
+        return body
+
+    mock_container.replace_item.side_effect = fake_replace_item
+
+    brief_payload = {
+        "global_instructions": "Lush greenery",
+        "object_palette": [
+            {
+                "id": obj_id,
+                "name": "Lavender",
+                "description": "Lavandula",
+                "category": "plant",
+                "default_quantity": 3,
+                "size": "2 ft",
+                "placement": "front row",
+                "visual_notes": None,
+            }
+        ],
+        "placement_guide": {"back_row": "Tall grasses"},
+        "preserve_elements": [],
+        "per_image_notes": {"room-1": "Heavy reds"},
+        "per_image_objects": {
+            "room-1": [
+                {
+                    "object_id": obj_id,
+                    "quantity": 7,
+                    "placement": "back row",
+                    "enabled": True,
+                }
+            ],
+            "room-2": [
+                {
+                    "object_id": obj_id,
+                    "quantity": 0,
+                    "placement": None,
+                    "enabled": False,
+                }
+            ],
+        },
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    response = client.put(f"/api/v1/staging/projects/{project_id}/brief", json=brief_payload)
+    assert response.status_code == 200, response.text
+
+    returned = response.json()["brief"]
+    # Round-trip: full structure preserved.
+    assert returned["per_image_objects"]["room-1"] == [
+        {"object_id": obj_id, "quantity": 7, "placement": "back row", "enabled": True}
+    ]
+    assert returned["per_image_objects"]["room-2"] == [
+        {"object_id": obj_id, "quantity": 0, "placement": None, "enabled": False}
+    ]
+    assert returned["per_image_notes"] == {"room-1": "Heavy reds"}
+
+    # Persisted Cosmos doc carries the same typed structure (not a free-form
+    # `Dict[str, Any]` blob).
+    assert persisted["body"]["design_brief"]["per_image_objects"]["room-1"][0]["quantity"] == 7
+    assert persisted["body"]["design_brief"]["per_image_objects"]["room-2"][0]["enabled"] is False
+
+
+def test_put_brief_normalises_placement_whitespace(client, mock_staging_deps):
+    """ImageObjectOverride's placement validator (mode='before') strips
+    whitespace and turns empty/whitespace-only strings into None. This is
+    enforced at the model boundary; assert it actually fires through the
+    HTTP layer too.
+    """
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-ws",
+        "name": "WS",
+        "prompt": "",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": None,
+    }
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    obj_id = "obj-1"
+    brief_payload = {
+        "global_instructions": "X",
+        "object_palette": [
+            {
+                "id": obj_id,
+                "name": "Lavender",
+                "description": "",
+                "category": "plant",
+                "default_quantity": 3,
+                "size": "2 ft",
+                "placement": "front",
+                "visual_notes": None,
+            }
+        ],
+        "placement_guide": {"back_row": "ZZ"},
+        "preserve_elements": [],
+        "per_image_notes": {},
+        "per_image_objects": {
+            "room-1": [
+                {"object_id": obj_id, "quantity": 5, "placement": "   ", "enabled": True},
+                {"object_id": obj_id + "-dummy-ignored", "quantity": 1, "placement": "  back  row  ", "enabled": True},
+            ]
+        },
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    response = client.put("/api/v1/staging/projects/proj-ws/brief", json=brief_payload)
+    assert response.status_code == 200, response.text
+
+    overrides = response.json()["brief"]["per_image_objects"]["room-1"]
+    # whitespace-only → None
+    assert overrides[0]["placement"] is None
+    # interior whitespace preserved; edges stripped
+    assert overrides[1]["placement"] == "back  row"

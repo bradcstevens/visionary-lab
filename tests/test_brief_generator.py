@@ -138,3 +138,82 @@ class TestBriefToPromptsJsonParsing:
         result = await service.brief_to_prompts(brief, [_make_analysis()], n_variations=2)
         # Should fall back to global instructions, not use "ok" and "done" as prompts
         assert result["room-1"] == [brief.global_instructions] * 2
+
+
+class TestBriefToPromptsPerImageObjectSummary:
+    """Issue 003 of the per-image-object-quantities PRD: brief_to_prompts
+    must construct a separate object_summary per image using the resolver,
+    so two rooms with different overrides produce different prompts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_rooms_different_overrides_produce_different_object_summaries(self):
+        """Quantity override on room A vs skip on room B for the same object
+        produces materially different ``object_summary`` substrings in the
+        captured system prompts.
+        """
+        from backend.models.design_brief import ImageObjectOverride
+
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["p1", "p2"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+
+        lavender = ObjectEntry(name="Lavender", category="plant", default_quantity=3, size="2ft", placement="front row")
+        brief = DesignBrief(
+            global_instructions="x",
+            object_palette=[lavender],
+            placement_guide=PlacementGuide(back_row="grasses"),
+            per_image_notes={},
+            preserve_elements=[],
+            per_image_objects={
+                "room-A": [ImageObjectOverride(object_id=lavender.id, quantity=10)],
+                "room-B": [ImageObjectOverride(object_id=lavender.id, quantity=0)],
+            },
+        )
+        analyses = [
+            ImageAnalysis(room_id="room-A", description="backyard A"),
+            ImageAnalysis(room_id="room-B", description="backyard B"),
+        ]
+
+        result = await service.brief_to_prompts(brief, analyses, n_variations=2)
+
+        # Two LLM calls — one per room — and the system_content arg
+        # captures the per-image object_summary substring.
+        assert mock_llm.chat.completions.create.call_count == 2
+        call_args_list = mock_llm.chat.completions.create.call_args_list
+        # Each call: kwargs['messages'][0]['content'] holds system_content.
+        system_contents = [
+            call.kwargs["messages"][0]["content"] for call in call_args_list
+        ]
+        # Room A: quantity override 10 → "10x Lavender" appears.
+        # Room B: quantity 0 → Lavender skipped → "Lavender" absent.
+        room_a_content = next(c for c in system_contents if "backyard A" in c)
+        room_b_content = next(c for c in system_contents if "backyard B" in c)
+        assert "10x Lavender" in room_a_content
+        assert "Lavender" not in room_b_content
+        assert result["room-A"] == ["p1", "p2"]
+        assert result["room-B"] == ["p1", "p2"]
+
+    @pytest.mark.asyncio
+    async def test_palette_only_brief_yields_identical_object_summaries_per_room(self):
+        """No overrides → both rooms see palette defaults → identical object_summary."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["p1", "p2"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+        analyses = [
+            ImageAnalysis(room_id="room-A", description="A"),
+            ImageAnalysis(room_id="room-B", description="B"),
+        ]
+
+        await service.brief_to_prompts(_make_brief(), analyses, n_variations=2)
+
+        contents = [
+            call.kwargs["messages"][0]["content"]
+            for call in mock_llm.chat.completions.create.call_args_list
+        ]
+        # Both contain "3x Lavender" — palette default flows through both.
+        assert all("3x Lavender" in c for c in contents)

@@ -8,21 +8,88 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { X } from "lucide-react";
 import { ObjectPaletteTable } from "./ObjectPaletteTable";
-import type { DesignBrief, ObjectEntry } from "@/services/stagingApi";
+import { BriefEditorTabs, type BriefEditorTabsImage } from "./BriefEditorTabs";
+import { PerImageObjectTable } from "./PerImageObjectTable";
+import type {
+  DesignBrief,
+  ImageObjectOverride,
+  ObjectEntry,
+} from "@/services/stagingApi";
 
 interface DesignBriefEditorProps {
   brief: DesignBrief;
   onChange: (brief: DesignBrief) => void;
-  imageLabels: Record<string, string>;
+  // Image metadata for the per-image tabs. Replaces the previously-reserved
+  // `imageLabels: Record<string, string>` prop now that issue 003 of the
+  // per-image-object-quantities PRD actually consumes the data flow.
+  images: BriefEditorTabsImage[];
 }
 
-export function DesignBriefEditor({ brief, onChange, imageLabels }: DesignBriefEditorProps) {
-  // imageLabels reserved for per-image notes rendering
-  void imageLabels;
+// Remove any `per_image_objects[*]` entries whose `object_id` is no longer
+// present in the new palette, AND drop any room keys that become empty.
+// Critique catch: keeping `{ roomId: [] }` would accumulate noisy empty
+// keys; the resolver treats absent and empty-list identically, but the map
+// should stay sparse for clean serialization.
+function prunePerImageObjects(
+  perImage: Record<string, ImageObjectOverride[]>,
+  validIds: ReadonlySet<string>,
+): Record<string, ImageObjectOverride[]> {
+  const result: Record<string, ImageObjectOverride[]> = {};
+  for (const [roomId, list] of Object.entries(perImage)) {
+    const kept = list.filter((o) => validIds.has(o.object_id));
+    if (kept.length > 0) {
+      result[roomId] = kept;
+    }
+  }
+  return result;
+}
+
+export function DesignBriefEditor({ brief, onChange, images }: DesignBriefEditorProps) {
   const [newPreserve, setNewPreserve] = useState("");
 
   const updateField = <K extends keyof DesignBrief>(field: K, value: DesignBrief[K]) => {
     onChange({ ...brief, [field]: value });
+  };
+
+  // Palette mutation must also prune `per_image_objects` so deleted
+  // ObjectEntry ids don't leak orphaned overrides into prompts.
+  const handlePaletteChange = (objects: ObjectEntry[]) => {
+    const validIds = new Set(objects.map((o) => o.id));
+    const prevValidIds = new Set(brief.object_palette.map((o) => o.id));
+    const wasDeleted = [...prevValidIds].some((id) => !validIds.has(id));
+    const currentPerImage = brief.per_image_objects ?? {};
+    const nextPerImage = wasDeleted
+      ? prunePerImageObjects(currentPerImage, validIds)
+      : currentPerImage;
+    onChange({
+      ...brief,
+      object_palette: objects,
+      per_image_objects: nextPerImage,
+    });
+  };
+
+  const handlePerImageOverridesChange = (
+    roomId: string,
+    overrides: ImageObjectOverride[],
+  ) => {
+    const next: Record<string, ImageObjectOverride[]> = { ...(brief.per_image_objects ?? {}) };
+    if (overrides.length === 0) {
+      delete next[roomId];
+    } else {
+      next[roomId] = overrides;
+    }
+    updateField("per_image_objects", next);
+  };
+
+  const handlePerImageNoteChange = (roomId: string, raw: string) => {
+    const trimmed = raw.trim();
+    const next: Record<string, string> = { ...(brief.per_image_notes ?? {}) };
+    if (trimmed === "") {
+      delete next[roomId];
+    } else {
+      next[roomId] = raw;
+    }
+    updateField("per_image_notes", next);
   };
 
   const addPreserveElement = () => {
@@ -35,18 +102,24 @@ export function DesignBriefEditor({ brief, onChange, imageLabels }: DesignBriefE
     updateField("preserve_elements", brief.preserve_elements.filter((_, i) => i !== index));
   };
 
-  return (
+  const defaultTabContent = (
     <div className="space-y-6 max-w-4xl">
       <div className="space-y-2">
         <Label className="text-sm font-semibold">Global Instructions</Label>
-        <Textarea value={brief.global_instructions} onChange={(e) => updateField("global_instructions", e.target.value)} rows={3} className="text-sm resize-none" placeholder="Overall styling direction..." />
+        <Textarea
+          value={brief.global_instructions}
+          onChange={(e) => updateField("global_instructions", e.target.value)}
+          rows={3}
+          className="text-sm resize-none"
+          placeholder="Overall styling direction..."
+        />
       </div>
 
       <div className="space-y-2">
         <Label className="text-sm font-semibold">Object Palette</Label>
         <ObjectPaletteTable
           objects={brief.object_palette}
-          onChange={(objects: ObjectEntry[]) => updateField("object_palette", objects)}
+          onChange={handlePaletteChange}
         />
       </div>
 
@@ -78,12 +151,20 @@ export function DesignBriefEditor({ brief, onChange, imageLabels }: DesignBriefE
           {brief.preserve_elements.map((el, idx) => (
             <Badge key={idx} variant="secondary" className="text-xs gap-1">
               {el}
-              <button onClick={() => removePreserveElement(idx)}><X className="h-2.5 w-2.5" /></button>
+              <button onClick={() => removePreserveElement(idx)}>
+                <X className="h-2.5 w-2.5" />
+              </button>
             </Badge>
           ))}
         </div>
         <div className="flex gap-2">
-          <Input value={newPreserve} onChange={(e) => setNewPreserve(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addPreserveElement()} placeholder="e.g. existing patio" className="text-sm h-8" />
+          <Input
+            value={newPreserve}
+            onChange={(e) => setNewPreserve(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addPreserveElement()}
+            placeholder="e.g. existing patio"
+            className="text-sm h-8"
+          />
           <Button size="sm" variant="outline" onClick={addPreserveElement} className="h-8">Add</Button>
         </div>
       </div>
@@ -110,5 +191,41 @@ export function DesignBriefEditor({ brief, onChange, imageLabels }: DesignBriefE
         </div>
       </div>
     </div>
+  );
+
+  const renderImageTabContent = (image: BriefEditorTabsImage) => {
+    const overrides = brief.per_image_objects?.[image.id] ?? [];
+    const note = brief.per_image_notes?.[image.id] ?? "";
+    return (
+      <div className="space-y-6 max-w-4xl">
+        <div className="space-y-2">
+          <Label className="text-sm font-semibold">Per-Image Object Overrides — {image.label}</Label>
+          <PerImageObjectTable
+            palette={brief.object_palette}
+            overrides={overrides}
+            onChange={(next) => handlePerImageOverridesChange(image.id, next)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-sm font-semibold">Per-Image Note</Label>
+          <Textarea
+            value={note}
+            onChange={(e) => handlePerImageNoteChange(image.id, e.target.value)}
+            rows={2}
+            className="text-sm resize-none"
+            placeholder="Anything specific to this image..."
+            data-testid={`per-image-note-${image.id}`}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <BriefEditorTabs
+      images={images}
+      defaultTabContent={defaultTabContent}
+      renderImageTabContent={renderImageTabContent}
+    />
   );
 }

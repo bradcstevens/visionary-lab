@@ -268,7 +268,10 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
     ? uploadedRooms.find(r => r.id === focusedImageId)?.label ?? null
     : null;
 
-  const imageLabels = Object.fromEntries(uploadedRooms.map(r => [r.id, r.label]));
+  // Issue 003 of the per-image-object-quantities PRD: the brief editor now
+  // wraps a tab strip with one tab per uploaded image, each rendering a
+  // small thumbnail. Passing the full {id, label, url} triple here.
+  const briefEditorImages = uploadedRooms.map(r => ({ id: r.id, label: r.label, url: r.url }));
 
   /** Step 2 only shows a checkmark once background prep is fully ready. */
   const isStepComplete = (stepNumber: number) => {
@@ -470,7 +473,7 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
 
       case 4:
         return designBrief ? (
-          <DesignBriefEditor brief={designBrief} onChange={setDesignBrief} imageLabels={imageLabels} />
+          <DesignBriefEditor brief={designBrief} onChange={setDesignBrief} images={briefEditorImages} />
         ) : (
           <div className="flex items-center justify-center h-32">
             <Loader2 className="h-5 w-5 animate-spin" />

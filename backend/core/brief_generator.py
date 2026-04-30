@@ -139,16 +139,7 @@ class BriefGeneratorService:
         image_analyses: List[ImageAnalysis],
         n_variations: int = 5,
     ) -> Dict[str, List[str]]:
-        # Single project-wide object summary in this slice. Issue 003 will
-        # introduce per-image summaries by moving this call inside the loop
-        # and threading the room_id through resolve_objects_for_image.
-        sentinel_room_id = image_analyses[0].room_id if image_analyses else "__project__"
-        resolved_objects = resolve_objects_for_image(brief, room_id=sentinel_room_id)
-        object_summary = "; ".join(
-            f"{ro.quantity}x {ro.name} ({ro.size}, {ro.placement})"
-            + (f" — {ro.visual_notes}" if ro.visual_notes else "")
-            for ro in resolved_objects
-        )
+        # Project-wide context that doesn't depend on per-image overrides.
         placement_summary = f"Back: {brief.placement_guide.back_row}"
         if brief.placement_guide.middle_row:
             placement_summary += f" | Middle: {brief.placement_guide.middle_row}"
@@ -159,6 +150,17 @@ class BriefGeneratorService:
         result: Dict[str, List[str]] = {}
 
         for analysis in image_analyses:
+            # Per-image object_summary: resolver merges palette + per-image
+            # overrides for THIS room_id, so two rooms with different
+            # override maps produce different prompts. Issue 003 of the
+            # per-image-object-quantities PRD.
+            resolved_objects = resolve_objects_for_image(brief, room_id=analysis.room_id)
+            object_summary = "; ".join(
+                f"{ro.quantity}x {ro.name} ({ro.size}, {ro.placement})"
+                + (f" — {ro.visual_notes}" if ro.visual_notes else "")
+                for ro in resolved_objects
+            )
+
             per_image_note = ""
             if analysis.room_id in brief.per_image_notes:
                 per_image_note = f"SPECIAL NOTE FOR THIS IMAGE: {brief.per_image_notes[analysis.room_id]}"

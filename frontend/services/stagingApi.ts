@@ -137,6 +137,22 @@ export interface ObjectEntry {
   visual_notes?: string | null;
 }
 
+export interface ImageObjectOverride {
+  object_id: string;
+  // Required, must be >= 0. Frontend prefills with palette default_quantity
+  // before any user edit; quantity=0 OR enabled=false means "skip this
+  // object in this image" (the resolver treats both as equivalent skip
+  // signals). Note `null` is NOT a valid value — use `enabled=false` for
+  // skip and pull palette default for "no override yet".
+  quantity: number;
+  // `null` means inherit palette placement. Empty string is normalised to
+  // null at the model boundary (the backend's pydantic validator coerces
+  // empty / whitespace strings to None), but the frontend MUST send `null`
+  // explicitly — never `undefined`.
+  placement: string | null;
+  enabled: boolean;
+}
+
 export interface PlacementGuide {
   back_row: string;
   middle_row?: string;
@@ -149,10 +165,10 @@ export interface DesignBrief {
   object_palette: ObjectEntry[];
   placement_guide: PlacementGuide;
   per_image_notes: Record<string, string>;
-  // ``per_image_objects`` is reserved for issue 003 of the
-  // per-image-object-quantities PRD; the inner items round-trip as
-  // unknowns until 003 tightens the type.
-  per_image_objects?: Record<string, unknown[]>;
+  // Sparse map: room_id -> override entries. The map only contains keys
+  // for rooms that have at least one override; empty room keys are pruned
+  // by DesignBriefEditor when the user clears the last override.
+  per_image_objects: Record<string, ImageObjectOverride[]>;
   preserve_elements: string[];
   settings: {
     variations_per_room: number;

@@ -88,6 +88,46 @@ class ObjectEntry(BaseModel):
         return _coerce_category(v)
 
 
+class ImageObjectOverride(BaseModel):
+    """One per-image override targeting a single ObjectEntry by id.
+
+    Stored sparsely under ``DesignBrief.per_image_objects[room_id]``. Only
+    rows that actually differ from the palette defaults need to be present;
+    the resolver applies overrides on top of the palette at render time.
+
+    Skip semantics: ``enabled=False`` AND ``quantity=0`` are equivalent
+    skip signals. The resolver omits the object from the rendered scene if
+    either is true. The frontend canonical form for "skip" is
+    ``{enabled=False, quantity=0, placement=None}`` — but the resolver does
+    not enforce that contract; either flag suffices.
+    """
+
+    object_id: str = Field(..., description="The ObjectEntry.id this override targets")
+    # ``quantity`` is REQUIRED — there is no "inherit palette default" sentinel.
+    # The frontend pre-fills the input with palette ``default_quantity`` before
+    # any user edit, so any persisted override carries an explicit count. A
+    # missing quantity in deserialized data is a programming error, not a
+    # legitimate "skip" signal. Issue 003 critique: defaulting to 0 would
+    # silently turn ``{object_id: "x"}`` into a skip; we reject that here.
+    quantity: int = Field(..., ge=0, description="Effective count for this image (0 = skip)")
+    # ``placement is None`` means "inherit palette placement"; any other
+    # string replaces it. The mode='before' validator coerces empty /
+    # whitespace strings to None so a frontend bug can't persist '' as a
+    # blanking override.
+    placement: Optional[str] = Field(None, description="None inherits, any other string replaces")
+    enabled: bool = Field(True, description="False = skip this object in this image")
+
+    @field_validator("placement", mode="before")
+    @classmethod
+    def _normalise_placement(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return v  # let the type checker raise its own error
+        stripped = v.strip()
+        return stripped if stripped else None
+
+
 class PlacementGuide(BaseModel):
     back_row: str = Field("", description="Tall plants / trees description")
     middle_row: Optional[str] = Field(None, description="Mid-height shrubs description")
@@ -100,11 +140,11 @@ class DesignBrief(BaseModel):
     object_palette: List[ObjectEntry] = Field(default_factory=list)
     placement_guide: PlacementGuide = Field(default_factory=PlacementGuide)
     per_image_notes: Dict[str, str] = Field(default_factory=dict, description="room_id → specific note")
-    # ``per_image_objects`` is reserved for issue 003 of the
-    # per-image-object-quantities PRD. The migration helper initialises it
-    # whenever a legacy brief is migrated, so the round-trip shape is stable.
-    # Until 003 lands the inner items round-trip as raw dicts.
-    per_image_objects: Dict[str, List[Dict[str, Any]]] = Field(
+    # ``per_image_objects`` carries sparse per-image overrides keyed by
+    # ``room_id``. Each list entry is an ``ImageObjectOverride`` that targets
+    # one ``ObjectEntry`` by id. The resolver in ``brief_resolver`` applies
+    # these on top of the palette per the per-image-object-quantities PRD.
+    per_image_objects: Dict[str, List[ImageObjectOverride]] = Field(
         default_factory=dict, description="room_id → list of per-image overrides"
     )
     preserve_elements: List[str] = Field(default_factory=list, description="Elements to keep unchanged")

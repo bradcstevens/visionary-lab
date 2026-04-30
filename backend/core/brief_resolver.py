@@ -108,27 +108,58 @@ class ResolvedObject:
 def resolve_objects_for_image(brief: "DesignBrief", room_id: str) -> List[ResolvedObject]:
     """Return the effective object list for a single image.
 
-    Issue 001 ships only the palette-projection branch; issue 003 will layer
-    per-image override handling (quantity overrides, placement overrides,
-    skip semantics, palette-pruning) on top of this same signature.
+    Applies per-image overrides on top of the palette, per the
+    per-image-object-quantities PRD's "Resolution logic" section:
 
-    The ``room_id`` parameter is intentionally required even in this slice so
-    issue 003 doesn't need to churn the public API: callers already pass
-    a room_id, and the resolver simply ignores it for now.
+    * Start from ``brief.object_palette`` in declaration order.
+    * Build an override-by-object_id dict from ``brief.per_image_objects[room_id]``.
+      If multiple overrides target the same ``object_id`` (which shouldn't
+      happen via the normal frontend flow), the LAST wins — a defensive
+      last-write-wins contract that keeps resolution deterministic when
+      duplicates somehow leak through.
+    * For each ``ObjectEntry``: if the matching override has ``enabled=False``
+      OR ``quantity=0``, omit the object from the result entirely (the two
+      flags are equivalent skip signals).
+    * Effective quantity: override quantity (when non-zero / enabled), else
+      ``default_quantity`` from the palette.
+    * Effective placement: override.placement when non-None, else palette
+      placement. (The model's field validator coerces empty / whitespace
+      strings to None upstream, so this branch reliably means "inherit".)
+    * Overrides whose ``object_id`` is not in the palette are silently
+      ignored — palette is the source of truth.
     """
-    return [
-        ResolvedObject(
-            id=obj.id,
-            name=obj.name,
-            description=obj.description,
-            category=obj.category,
-            quantity=obj.default_quantity,
-            size=obj.size,
-            placement=obj.placement,
-            visual_notes=obj.visual_notes,
+    overrides_by_id: Dict[str, Any] = {}
+    for ovr in brief.per_image_objects.get(room_id, []):
+        # Last-write-wins on duplicate object_ids. The frontend never emits
+        # duplicates, but legacy / hand-edited data could.
+        overrides_by_id[ovr.object_id] = ovr
+
+    resolved: List[ResolvedObject] = []
+    for obj in brief.object_palette:
+        ovr = overrides_by_id.get(obj.id)
+        if ovr is not None:
+            if not ovr.enabled or ovr.quantity == 0:
+                continue
+            quantity = ovr.quantity
+            placement = obj.placement if ovr.placement is None else ovr.placement
+        else:
+            quantity = obj.default_quantity
+            placement = obj.placement
+
+        resolved.append(
+            ResolvedObject(
+                id=obj.id,
+                name=obj.name,
+                description=obj.description,
+                category=obj.category,
+                quantity=quantity,
+                size=obj.size,
+                placement=placement,
+                visual_notes=obj.visual_notes,
+            )
         )
-        for obj in brief.object_palette
-    ]
+
+    return resolved
 
 
 # ---------------------------------------------------------------------------

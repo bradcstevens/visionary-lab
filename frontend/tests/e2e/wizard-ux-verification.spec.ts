@@ -102,6 +102,7 @@ async function mockStagingApi(page: Page) {
             object_palette: [{ id: 'obj-1', name: 'Japanese Maple', description: 'Acer palmatum', category: 'tree', default_quantity: 1, size: 'medium', placement: 'Corner accent' }],
             placement_guide: { back_row: 'Tall ornamental grasses', front_row: 'Low ground cover', middle_row: 'Medium shrubs' },
             per_image_notes: {},
+            per_image_objects: {},
             preserve_elements: ['Existing fence', 'Patio pavers'],
             settings: { variations_per_room: 1, model: 'gpt-image-2', quality: 'high', size: 'auto' },
           },

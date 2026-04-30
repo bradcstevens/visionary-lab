@@ -148,6 +148,7 @@ export function ObjectPaletteTable({ objects, onChange }: ObjectPaletteTableProp
             variant="ghost"
             onClick={() => removeEntry(idx)}
             className="h-8 w-8 p-0"
+            data-testid={`palette-delete-${entry.id}`}
           >
             <Trash2 className="h-3.5 w-3.5 text-destructive" />
           </Button>

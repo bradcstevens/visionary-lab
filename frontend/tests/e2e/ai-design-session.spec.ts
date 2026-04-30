@@ -27,9 +27,11 @@ test('DesignChat supports focused image context', async () => {
   expect(source).toContain('onReadyForBrief');
 });
 
-test('DesignBriefEditor has object palette and placement guide', async () => {
+test('DesignBriefEditor wraps BriefEditorTabs and renders palette/placement controls', async () => {
   const source = readFileSync(join(STAGING_DIR, 'DesignBriefEditor.tsx'), 'utf-8');
+  expect(source).toContain('BriefEditorTabs');
   expect(source).toContain('ObjectPaletteTable');
+  expect(source).toContain('PerImageObjectTable');
   expect(source).toContain('placement_guide');
   expect(source).toContain('preserve_elements');
   expect(source).toContain('global_instructions');
