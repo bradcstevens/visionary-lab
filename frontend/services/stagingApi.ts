@@ -197,6 +197,20 @@ export interface ChatResponse {
   suggested_actions: string[];
 }
 
+// Issue 004 of the per-image-object-quantities PRD. The backend returns a
+// non-zero ``dropped`` count when a regenerate-brief request carried prior
+// per-image overrides whose object names no longer match (or were
+// ambiguous). The wizard surfaces this in a non-blocking toast.
+export interface ReconcileSummary {
+  carried_forward: number;
+  dropped: number;
+}
+
+export interface GenerateBriefResponse {
+  brief: DesignBrief;
+  reconciliation_summary: ReconcileSummary;
+}
+
 // API Functions
 
 /**
@@ -708,19 +722,40 @@ export async function chatWithProject(
   return response.json();
 }
 
-export async function generateBrief(projectId: string, conversationHistory: ChatMessage[]): Promise<DesignBrief> {
+export async function generateBrief(
+  projectId: string,
+  conversationHistory: ChatMessage[],
+  previousBrief?: DesignBrief,
+): Promise<GenerateBriefResponse> {
   const url = `${API_BASE_URL}/staging/projects/${projectId}/brief`;
+  const body: {
+    conversation_history: ChatMessage[];
+    previous_brief?: DesignBrief;
+  } = { conversation_history: conversationHistory };
+  if (previousBrief) {
+    // Issue 004 of the per-image-object-quantities PRD: pass the current
+    // brief so per-image quantity / placement / skip overrides can be
+    // carried forward by case-insensitive whitespace-trimmed name match
+    // against the regenerated palette.
+    body.previous_brief = previousBrief;
+  }
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ conversation_history: conversationHistory }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to generate brief: ${response.status} ${errorText}`);
   }
   const data = await response.json();
-  return data.brief;
+  return {
+    brief: data.brief,
+    reconciliation_summary: data.reconciliation_summary ?? {
+      carried_forward: 0,
+      dropped: 0,
+    },
+  };
 }
 
 export async function updateBrief(projectId: string, brief: DesignBrief): Promise<DesignBrief> {

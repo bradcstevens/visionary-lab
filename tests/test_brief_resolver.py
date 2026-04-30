@@ -580,3 +580,386 @@ class TestResolveObjectsForImageWithOverrides:
         brief = self._make_brief([entry], per_image_objects={"r1": []})
         [r] = resolve_objects_for_image(brief, room_id="r1")
         assert r.quantity == 3
+
+
+# ---------------------------------------------------------------------------
+# reconcile_overrides_by_name — issue 004 of the per-image-object-quantities
+# PRD. Carries per-image overrides from a prior brief into a freshly-
+# regenerated brief by matching palette entries on case-insensitive,
+# whitespace-trimmed name. ``ReconcileSummary`` reports how many were
+# carried forward vs. dropped.
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileOverridesByName:
+    """End-to-end behaviour of ``reconcile_overrides_by_name``.
+
+    Tests construct prev/new ``DesignBrief`` instances directly (no LLM
+    mock involved). ``ImageObjectOverride.object_id`` strings are taken
+    from the palette entries so the prev → new mapping is realistic.
+    """
+
+    def _make_brief(self, palette, per_image_objects=None):
+        from backend.models.design_brief import DesignBrief
+
+        return DesignBrief(
+            global_instructions="x",
+            object_palette=palette,
+            per_image_objects=per_image_objects or {},
+        )
+
+    def test_identical_name_carry_forward(self):
+        """Same name in prev + new palette → override carried forward
+        with object_id rewritten to the new palette's UUID.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import (
+            ImageObjectOverride,
+            ObjectEntry,
+            ReconcileSummary,
+        )
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+        # Sanity: prev id != new id (different UUIDs).
+        assert prev_pine.id != new_pine.id
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_pine.id, quantity=8)]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert isinstance(summary, ReconcileSummary)
+        assert summary.carried_forward == 1
+        assert summary.dropped == 0
+        # Override now points at the NEW palette's UUID.
+        assert reconciled.per_image_objects["r1"][0].object_id == new_pine.id
+        assert reconciled.per_image_objects["r1"][0].quantity == 8
+
+    def test_renamed_object_dropped(self):
+        """Prior override referencing a name that no longer exists in the
+        new palette is dropped and counted in ``summary.dropped``.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_oak = ObjectEntry(name="Oak", default_quantity=1)
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_pine.id, quantity=8)]
+            },
+        )
+        new = self._make_brief([new_oak])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 0
+        assert summary.dropped == 1
+        # No room key for r1 because nothing was carried forward, OR
+        # the room key has an empty list. Either is acceptable contract.
+        assert reconciled.per_image_objects.get("r1", []) == []
+
+    def test_case_insensitive_matching(self):
+        """``"Lavender"`` in prev should match ``"lavender"`` in new."""
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_lav = ObjectEntry(name="Lavender", default_quantity=3)
+        new_lav = ObjectEntry(name="lavender", default_quantity=3)
+
+        prev = self._make_brief(
+            [prev_lav],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_lav.id, quantity=10)]
+            },
+        )
+        new = self._make_brief([new_lav])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 1
+        assert summary.dropped == 0
+        assert reconciled.per_image_objects["r1"][0].quantity == 10
+        assert reconciled.per_image_objects["r1"][0].object_id == new_lav.id
+
+    def test_whitespace_trimmed_matching(self):
+        """``"  Lavender  "`` in prev matches ``"Lavender"`` in new."""
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_lav = ObjectEntry(name="  Lavender  ", default_quantity=3)
+        new_lav = ObjectEntry(name="Lavender", default_quantity=3)
+
+        prev = self._make_brief(
+            [prev_lav],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_lav.id, quantity=10)]
+            },
+        )
+        new = self._make_brief([new_lav])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 1
+        assert reconciled.per_image_objects["r1"][0].object_id == new_lav.id
+
+    def test_orphan_in_prev_palette_dropped(self):
+        """Prior override referencing an object_id that doesn't exist in
+        the prev palette either (legacy / hand-edited data) is dropped.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [
+                    # Valid override.
+                    ImageObjectOverride(object_id=prev_pine.id, quantity=8),
+                    # Orphan: object_id not in prev_pine palette.
+                    ImageObjectOverride(object_id="ghost-uuid", quantity=99),
+                ]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        # Only Pine carried forward; orphan dropped.
+        assert summary.carried_forward == 1
+        assert summary.dropped == 1
+        [r] = reconciled.per_image_objects["r1"]
+        assert r.object_id == new_pine.id
+        assert r.quantity == 8
+
+    def test_duplicate_normalized_name_in_new_palette_drops_override(self):
+        """If the new palette contains two entries that normalize to the
+        same name, the match is ambiguous and we drop the override rather
+        than guess. Caught by rubber-duck review of the issue-004 plan.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine_1 = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine_2 = ObjectEntry(name="pine", default_quantity=4)  # normalizes to same.
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_pine.id, quantity=8)]
+            },
+        )
+        new = self._make_brief([new_pine_1, new_pine_2])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 0
+        assert summary.dropped == 1
+        assert reconciled.per_image_objects.get("r1", []) == []
+
+    def test_duplicate_normalized_name_in_prev_palette_drops_override(self):
+        """Same rule applies symmetrically: if the prev palette has
+        ambiguous names, we can't reliably identify which one the
+        override referred to even if the new palette is unambiguous.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine_1 = ObjectEntry(name="Pine", default_quantity=2)
+        prev_pine_2 = ObjectEntry(name=" pine ", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief(
+            [prev_pine_1, prev_pine_2],
+            per_image_objects={
+                "r1": [
+                    # Targets prev_pine_1 specifically — but reconcile
+                    # only looks up by NAME, and "pine" is duplicated.
+                    ImageObjectOverride(object_id=prev_pine_1.id, quantity=8)
+                ]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 0
+        assert summary.dropped == 1
+
+    def test_skip_override_enabled_false_carried_forward(self):
+        """``enabled=False`` is a meaningful user edit ("skip this object
+        in this image"). It must carry forward when the name matches.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [
+                    ImageObjectOverride(
+                        object_id=prev_pine.id, quantity=0, enabled=False
+                    )
+                ]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 1
+        assert summary.dropped == 0
+        [r] = reconciled.per_image_objects["r1"]
+        assert r.object_id == new_pine.id
+        assert r.enabled is False
+        assert r.quantity == 0
+
+    def test_skip_override_quantity_zero_carried_forward(self):
+        """``quantity=0`` (the other equivalent skip signal) must also
+        survive reconciliation when the name matches.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [
+                    ImageObjectOverride(object_id=prev_pine.id, quantity=0)
+                ]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 1
+        [r] = reconciled.per_image_objects["r1"]
+        assert r.quantity == 0
+
+    def test_prev_wins_over_new_pre_populated_override_on_conflict(self):
+        """If both prev and new have an override for the same (room_id,
+        normalized name), the prev override (user edit) wins over the
+        LLM-emitted suggestion in new. Conflict resolution decision
+        documented in the issue-004 plan; rationale: never silently
+        overwrite a user edit with a regenerated auto-suggestion.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_lav = ObjectEntry(name="Lavender", default_quantity=3)
+        new_lav = ObjectEntry(name="Lavender", default_quantity=3)
+
+        prev = self._make_brief(
+            [prev_lav],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_lav.id, quantity=8)]
+            },
+        )
+        new = self._make_brief(
+            [new_lav],
+            per_image_objects={
+                # LLM-suggested override pre-populated in new brief.
+                "r1": [ImageObjectOverride(object_id=new_lav.id, quantity=4)]
+            },
+        )
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        # Prev wins. quantity=8, NOT 4.
+        [r] = reconciled.per_image_objects["r1"]
+        assert r.quantity == 8
+        assert r.object_id == new_lav.id
+        assert summary.carried_forward == 1
+        assert summary.dropped == 0
+
+    def test_prev_override_appended_when_room_not_in_new(self):
+        """Prev override on a (room_id, name) pair that the new brief
+        didn't pre-populate is appended to new — preserving overrides
+        even when the LLM doesn't re-emit them.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_lav = ObjectEntry(name="Lavender", default_quantity=3)
+        new_lav = ObjectEntry(name="Lavender", default_quantity=3)
+
+        prev = self._make_brief(
+            [prev_lav],
+            per_image_objects={
+                "r2": [ImageObjectOverride(object_id=prev_lav.id, quantity=8)]
+            },
+        )
+        new = self._make_brief([new_lav])  # no pre-populated overrides at all.
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 1
+        assert summary.dropped == 0
+        [r] = reconciled.per_image_objects["r2"]
+        assert r.quantity == 8
+        assert r.object_id == new_lav.id
+
+    def test_prev_brief_with_empty_per_image_objects_yields_zero_counts(self):
+        """No-op base case: prev had a palette but no overrides → both
+        counts 0, new brief returned unchanged.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief([prev_pine])
+        new = self._make_brief([new_pine])
+
+        reconciled, summary = reconcile_overrides_by_name(prev, new)
+
+        assert summary.carried_forward == 0
+        assert summary.dropped == 0
+        assert reconciled.per_image_objects == {}
+
+    def test_input_briefs_are_not_mutated(self):
+        """Reconciliation must produce a NEW DesignBrief; the prev and
+        new inputs stay untouched so callers can keep using them.
+        """
+        from backend.core.brief_resolver import reconcile_overrides_by_name
+        from backend.models.design_brief import ImageObjectOverride, ObjectEntry
+
+        prev_pine = ObjectEntry(name="Pine", default_quantity=2)
+        new_pine = ObjectEntry(name="Pine", default_quantity=2)
+
+        prev = self._make_brief(
+            [prev_pine],
+            per_image_objects={
+                "r1": [ImageObjectOverride(object_id=prev_pine.id, quantity=8)]
+            },
+        )
+        new = self._make_brief([new_pine])
+
+        # Snapshot relevant state.
+        prev_overrides_before = list(prev.per_image_objects["r1"])
+        new_overrides_before = dict(new.per_image_objects)
+
+        reconcile_overrides_by_name(prev, new)
+
+        assert prev.per_image_objects["r1"] == prev_overrides_before
+        assert new.per_image_objects == new_overrides_before

@@ -516,3 +516,166 @@ def test_put_brief_normalises_placement_whitespace(client, mock_staging_deps):
     assert overrides[0]["placement"] is None
     # interior whitespace preserved; edges stripped
     assert overrides[1]["placement"] == "back  row"
+
+
+# ---------------------------------------------------------------------------
+# POST /projects/{id}/brief — issue 004 of the per-image-object-quantities PRD.
+# The endpoint accepts an optional ``previous_brief`` and returns a
+# ``reconciliation_summary`` body field. The wizard's regenerate flow uses
+# both fields together to carry forward per-image quantity overrides across
+# regeneration.
+# ---------------------------------------------------------------------------
+
+
+def test_post_brief_returns_reconciliation_summary_zero_zero_when_no_previous_brief(
+    client, mock_staging_deps
+):
+    """Smoke-check: the new ``reconciliation_summary`` field is always
+    present in the response, even on first generation when no
+    ``previous_brief`` is supplied. carried_forward / dropped both 0.
+    """
+    import json as _json
+    from unittest.mock import AsyncMock, MagicMock as _MagicMock
+
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-pb-1",
+        "name": "X",
+        "prompt": "",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": None,
+        "analyses": [
+            {"room_id": "room-1", "description": "back yard", "features": [], "zones": []}
+        ],
+    }
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    fake_llm_response = _MagicMock(
+        choices=[_MagicMock(message=_MagicMock(content=_json.dumps({
+            "global_instructions": "x",
+            "object_palette": [
+                {
+                    "name": "Lavender",
+                    "category": "plant",
+                    "default_quantity": 3,
+                    "size": "2 ft",
+                    "placement": "front",
+                    "visual_notes": None,
+                    "description": None,
+                }
+            ],
+            "placement_guide": {"back_row": "z"},
+            "per_image_notes": {},
+            "preserve_elements": [],
+        })))]
+    )
+    fake_llm = AsyncMock()
+    fake_llm.chat.completions.create.return_value = fake_llm_response
+
+    with patch("backend.core.async_llm_client", fake_llm):
+        response = client.post(
+            "/api/v1/staging/projects/proj-pb-1/brief",
+            json={"conversation_history": [{"role": "user", "content": "Add lavender"}]},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "brief" in body
+    assert body["reconciliation_summary"] == {"carried_forward": 0, "dropped": 0}
+
+
+def test_post_brief_reconciles_previous_brief_overrides_by_name(
+    client, mock_staging_deps
+):
+    """When the request body carries a ``previous_brief``, surviving
+    per-image overrides are carried forward by case-insensitive,
+    whitespace-trimmed name match against the new palette and the
+    ``reconciliation_summary`` reports counts.
+    """
+    import json as _json
+    from unittest.mock import AsyncMock, MagicMock as _MagicMock
+
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = {
+        "id": "proj-pb-2",
+        "name": "X",
+        "prompt": "",
+        "status": "uploading",
+        "rooms": [],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "design_brief": None,
+        "analyses": [
+            {"room_id": "room-1", "description": "back yard", "features": [], "zones": []}
+        ],
+    }
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    # Previous brief: user manually set Lavender qty=8 in room-1 and
+    # also has an orphan "Pine" override that won't survive (Pine isn't
+    # in the regenerated palette).
+    prev_lav_id = "prev-lav-uuid"
+    prev_pine_id = "prev-pine-uuid"
+    previous_brief = {
+        "global_instructions": "x",
+        "object_palette": [
+            {"id": prev_lav_id, "name": "Lavender", "category": "plant", "default_quantity": 3, "size": "2 ft", "placement": "front", "visual_notes": None, "description": None},
+            {"id": prev_pine_id, "name": "Pine", "category": "tree", "default_quantity": 2, "size": "8 ft", "placement": "back", "visual_notes": None, "description": None},
+        ],
+        "placement_guide": {"back_row": "z"},
+        "per_image_notes": {},
+        "preserve_elements": [],
+        "per_image_objects": {
+            "room-1": [
+                {"object_id": prev_lav_id, "quantity": 8, "placement": None, "enabled": True},
+                {"object_id": prev_pine_id, "quantity": 5, "placement": None, "enabled": True},
+            ]
+        },
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+    # New LLM response: Lavender survives (different UUID, same name),
+    # Pine is gone.
+    fake_llm_response = _MagicMock(
+        choices=[_MagicMock(message=_MagicMock(content=_json.dumps({
+            "global_instructions": "x",
+            "object_palette": [
+                {
+                    "name": "lavender",  # different case, same normalized name.
+                    "category": "plant",
+                    "default_quantity": 3,
+                    "size": "2 ft",
+                    "placement": "front",
+                    "visual_notes": None,
+                    "description": None,
+                }
+            ],
+            "placement_guide": {"back_row": "z"},
+            "per_image_notes": {},
+            "preserve_elements": [],
+        })))]
+    )
+    fake_llm = AsyncMock()
+    fake_llm.chat.completions.create.return_value = fake_llm_response
+
+    with patch("backend.core.async_llm_client", fake_llm):
+        response = client.post(
+            "/api/v1/staging/projects/proj-pb-2/brief",
+            json={
+                "conversation_history": [{"role": "user", "content": "regenerate"}],
+                "previous_brief": previous_brief,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Reconciliation surfaces: 1 carried (Lavender), 1 dropped (Pine).
+    assert body["reconciliation_summary"] == {"carried_forward": 1, "dropped": 1}
+    # The carried-forward override now points at the NEW palette UUID.
+    new_lavender_id = body["brief"]["object_palette"][0]["id"]
+    assert new_lavender_id != prev_lav_id
+    overrides = body["brief"]["per_image_objects"]["room-1"]
+    assert len(overrides) == 1
+    assert overrides[0]["object_id"] == new_lavender_id
+    assert overrides[0]["quantity"] == 8

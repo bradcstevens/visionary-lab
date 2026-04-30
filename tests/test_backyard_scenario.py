@@ -131,7 +131,7 @@ async def test_backyard_brief_includes_plant_details():
     ]
 
     service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
-    brief = await service.generate_brief(conversation_history=history, image_analyses=analyses)
+    brief, _ = await service.generate_brief(conversation_history=history, image_analyses=analyses)
 
     assert len(brief.object_palette) == 2
     pine = next(p for p in brief.object_palette if "Vanderwolf" in p.name)

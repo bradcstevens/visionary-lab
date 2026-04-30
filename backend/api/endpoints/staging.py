@@ -613,23 +613,30 @@ async def generate_brief(
     analyses = [ImageAnalysis(**a) for a in raw_analyses]
 
     conversation_history = []
+    previous_brief = None
     if request and request.conversation_history:
         conversation_history = request.conversation_history
+    if request and request.previous_brief is not None:
+        previous_brief = request.previous_brief
 
     service = BriefGeneratorService(
         async_llm_client=async_llm_client,
         llm_deployment=settings.LLM_DEPLOYMENT,
     )
 
-    brief = await service.generate_brief(
+    brief, reconcile_summary = await service.generate_brief(
         conversation_history=conversation_history,
         image_analyses=analyses,
+        previous_brief=previous_brief,
     )
 
     brief_dict = brief.dict()
     storage.update_project(project_id, {"design_brief": brief_dict})
 
-    return {"brief": brief_dict}
+    return {
+        "brief": brief_dict,
+        "reconciliation_summary": reconcile_summary.dict(),
+    }
 
 
 @router.put("/projects/{project_id}/brief")

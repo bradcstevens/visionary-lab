@@ -211,7 +211,7 @@ async def test_brief_generation_from_conversation():
     ]
 
     service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
-    brief = await service.generate_brief(conversation_history=history, image_analyses=analyses)
+    brief, _ = await service.generate_brief(conversation_history=history, image_analyses=analyses)
 
     assert brief.global_instructions == "Add layered evergreen privacy screen along fence line"
     assert len(brief.object_palette) == 1

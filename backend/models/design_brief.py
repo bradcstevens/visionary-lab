@@ -195,3 +195,27 @@ class ChatResponse(BaseModel):
 
 class GenerateBriefRequest(BaseModel):
     conversation_history: List[ChatMessage] = Field(default_factory=list, description="Full chat history for brief synthesis")
+    # Issue 004 of the per-image-object-quantities PRD: when this is the
+    # SECOND-or-later invocation of generate-brief for a project (i.e. the
+    # user already had a brief and is regenerating after more chat), the
+    # frontend passes the previous brief here so the generator can carry
+    # forward per-image overrides whose object names still match in the
+    # newly-synthesized palette.
+    previous_brief: Optional[DesignBrief] = Field(
+        None,
+        description="Prior brief — if supplied, surviving per-image overrides are carried forward by name.",
+    )
+
+
+class ReconcileSummary(BaseModel):
+    """Counts emitted by ``brief_resolver.reconcile_overrides_by_name``.
+
+    Carried in the generate-brief endpoint response so the wizard can show
+    a non-blocking toast when at least one prior override was dropped
+    because its object no longer exists (or could not be unambiguously
+    matched) in the regenerated palette. Issue 004 of the
+    per-image-object-quantities PRD.
+    """
+
+    carried_forward: int = Field(0, ge=0, description="Per-image overrides preserved across regenerate")
+    dropped: int = Field(0, ge=0, description="Per-image overrides discarded because no name match")

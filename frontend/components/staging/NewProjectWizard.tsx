@@ -207,8 +207,22 @@ export function NewProjectWizard({ onComplete, onCancel }: NewProjectWizardProps
     if (!projectId) return;
     setIsGeneratingBrief(true);
     try {
-      const brief = await generateBrief(projectId, conversationHistory);
+      // Issue 004 of the per-image-object-quantities PRD: when this
+      // transition is reached as a regenerate (designBrief is non-null
+      // because the user already saw step 4 once), pass the current brief
+      // back so per-image quantity / placement / skip overrides can be
+      // carried forward by case-insensitive name match.
+      const { brief, reconciliation_summary } = await generateBrief(
+        projectId,
+        conversationHistory,
+        designBrief ?? undefined,
+      );
       setDesignBrief(brief);
+      if (reconciliation_summary.dropped > 0) {
+        toast.info(
+          `Carried forward ${reconciliation_summary.carried_forward} per-image quantity overrides; ${reconciliation_summary.dropped} were dropped because their objects could not be matched in the regenerated palette.`,
+        );
+      }
       setCurrentStep(4);
     } catch (error) {
       console.error("Failed to generate brief:", error);
