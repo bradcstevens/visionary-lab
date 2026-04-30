@@ -81,6 +81,12 @@ class StagingPipeline:
         self.storage_service = storage_service
         self.blob_service = blob_service
         self.semaphore = asyncio.Semaphore(settings.STAGING_CONCURRENT_ROOMS)
+        # Fire-and-forget cleanup tasks (e.g. prior-blob deletes after a
+        # successful single-variation regen). We hold strong references here so
+        # the tasks are not garbage-collected before they run, and so tests can
+        # await them deterministically. See `_schedule_blob_cleanup` and
+        # `process_single_variation`.
+        self._cleanup_tasks: set = set()
 
     async def analyze_room(self, image_base64: str) -> Dict[str, Any]:
         """Use ImageAnalyzer to describe what's in the uploaded photo."""
@@ -286,7 +292,25 @@ class StagingPipeline:
         variation: Variation,
         adapted_prompt: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Regenerate a single variation using the provided prompt. Yields SSE events."""
+        """Regenerate a single variation using the provided prompt. Yields SSE events.
+
+        Failure / cancellation semantics (issue 002 of the single-variation-regen PRD):
+        - On image-gen failure or pre-shield client disconnect, the variation is
+          restored to its pre-regen visible state (status / image_url / error).
+          The new `adapted_prompt` is preserved in `generation_metadata` so a
+          subsequent retry can re-use it.
+        - On success, the prior blob is deleted fire-and-forget.
+        - The post-image-gen state write is wrapped in `asyncio.shield()` so a
+          client disconnect during persistence cannot strand the variation in
+          PROCESSING.
+
+        Reconcile invariant: this method does NOT elevate `project.status` to
+        PROCESSING. Reconcile only fires when `project.status == 'processing'`
+        AND the doc is older than `STAGING_STALE_PROCESSING_MINUTES` (default
+        5 min). Therefore reconcile cannot interfere with this regen mid-flight.
+        That is what makes the explicit cancellation rollback above necessary —
+        without it, a stranded variation would never recover.
+        """
         variation_index = next(
             (i for i, v in enumerate(room.variations) if v.id == variation.id), None
         )
@@ -295,6 +319,11 @@ class StagingPipeline:
             variation_index = 0
 
         async with self.semaphore:
+            # Capture pre-regen visible state so we can restore it on failure.
+            prior_image_url = variation.image_url
+            prior_status = variation.status
+            prior_error = variation.error
+
             variation.status = ItemStatus.PROCESSING
             # Persist the attempted prompt BEFORE the image-gen call so a
             # subsequent retry can re-use it even if generation fails or the
@@ -308,85 +337,213 @@ class StagingPipeline:
 
             start_time = time.monotonic()
             result = None
-            elapsed_ms = 0
+            image_gen_error: Optional[Exception] = None
+            shield_started = False
+
             try:
-                image_content, _ = self.blob_service.get_asset_content(
-                    blob_name=self._extract_blob_name(room.original_image_url),
-                    container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
-                )
-                if image_content is None:
-                    raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
-                image_b64 = base64.b64encode(image_content).decode("utf-8")
-
-                pipeline_request = ImagePipelineRequest(
-                    action=PipelineAction.EDIT,
-                    prompt=adapted_prompt,
-                    model=project.settings.model,
-                    n=1,
-                    size=project.settings.size,
-                    quality=project.settings.quality,
-                    response_format="b64_json",
-                    output_format="png",
-                    source_image_base64=[image_b64],
-                    save_options=PipelineSaveOptions(
-                        enabled=True,
-                        folder_path=f"staging/{project.id}/variations/{room.id}",
-                    ),
-                    analysis_options=PipelineAnalysisOptions(enabled=False),
-                )
-
-                result = await self.image_pipeline.process_pipeline(
-                    pipeline_request=pipeline_request,
-                    azure_storage_service=self.blob_service,
-                )
-
-                elapsed_ms = int((time.monotonic() - start_time) * 1000)
-
-                if result.generation and result.save:
-                    saved = result.save
-                    saved_url = (
-                        saved.saved_images[0].get("url")
-                        if saved.saved_images
-                        else None
+                try:
+                    image_content, _ = self.blob_service.get_asset_content(
+                        blob_name=self._extract_blob_name(room.original_image_url),
+                        container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
                     )
-                    if saved_url:
-                        variation.image_url = saved_url
-                        variation.status = ItemStatus.COMPLETED
-                        variation.generation_metadata = {
-                            "model": project.settings.model,
-                            "adapted_prompt": adapted_prompt,
-                            "generation_time_ms": elapsed_ms,
-                        }
-                    else:
-                        variation.status = ItemStatus.FAILED
-                        variation.error = "Save succeeded but no image URL returned"
-                else:
-                    variation.status = ItemStatus.FAILED
-                    variation.error = "Pipeline returned no generation result"
+                    if image_content is None:
+                        raise RuntimeError(f"Image not found in blob storage: {room.original_image_url}")
+                    image_b64 = base64.b64encode(image_content).decode("utf-8")
 
-            except Exception as e:
-                logger.error(f"Single variation regen failed for {variation.id}: {e}")
-                variation.status = ItemStatus.FAILED
-                variation.error = str(e)
+                    pipeline_request = ImagePipelineRequest(
+                        action=PipelineAction.EDIT,
+                        prompt=adapted_prompt,
+                        model=project.settings.model,
+                        n=1,
+                        size=project.settings.size,
+                        quality=project.settings.quality,
+                        response_format="b64_json",
+                        output_format="png",
+                        source_image_base64=[image_b64],
+                        save_options=PipelineSaveOptions(
+                            enabled=True,
+                            folder_path=f"staging/{project.id}/variations/{room.id}",
+                        ),
+                        analysis_options=PipelineAnalysisOptions(enabled=False),
+                    )
+
+                    # Cancellable: a client disconnect mid-image-gen propagates
+                    # CancelledError out of this await, past the inner Exception
+                    # handler (CancelledError is BaseException, not Exception).
+                    result = await self.image_pipeline.process_pipeline(
+                        pipeline_request=pipeline_request,
+                        azure_storage_service=self.blob_service,
+                    )
+                except Exception as e:
+                    image_gen_error = e
+
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+                # Shield the persist write so a client disconnect after image
+                # generation but before persistence cannot strand the variation.
+                shield_started = True
+                event_type, regen_error_message = await asyncio.shield(
+                    self._persist_single_variation_outcome(
+                        project=project,
+                        room=room,
+                        variation=variation,
+                        adapted_prompt=adapted_prompt,
+                        prior_image_url=prior_image_url,
+                        prior_status=prior_status,
+                        prior_error=prior_error,
+                        result=result,
+                        image_gen_error=image_gen_error,
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except asyncio.CancelledError:
+                if not shield_started:
+                    # Pre-shield cancellation: image-gen was killed by the
+                    # client disconnect before we built the persist payload.
+                    # Persist a rollback (shielded) so the variation isn't
+                    # stranded in PROCESSING (reconcile cannot recover us
+                    # because we did not elevate `project.status`).
+                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                    await asyncio.shield(
+                        self._persist_single_variation_outcome(
+                            project=project,
+                            room=room,
+                            variation=variation,
+                            adapted_prompt=adapted_prompt,
+                            prior_image_url=prior_image_url,
+                            prior_status=prior_status,
+                            prior_error=prior_error,
+                            result=None,
+                            image_gen_error=RuntimeError("Cancelled by client disconnect"),
+                            elapsed_ms=elapsed_ms,
+                        )
+                    )
+                # If shield_started is True the inner _persist_outcome is still
+                # running to completion via asyncio.shield(); do not re-call it.
+                raise
 
             token_usage = None
             if result and result.generation and result.generation.token_usage:
                 tu = result.generation.token_usage
                 token_usage = tu.get("total_tokens") if isinstance(tu, dict) else getattr(tu, "total_tokens", None)
 
-            self._update_room_in_project(project, room)
-
             yield {
-                "type": f"variation_{'completed' if variation.status == ItemStatus.COMPLETED else 'failed'}",
+                "type": event_type,
                 "room_id": room.id,
                 "variation_index": variation_index,
                 "image_url": variation.image_url,
-                "error": variation.error,
+                "error": regen_error_message,
                 "elapsed_ms": elapsed_ms,
                 "tokens_used": token_usage,
                 "model": project.settings.model,
             }
+
+    async def _persist_single_variation_outcome(
+        self,
+        *,
+        project: StagingProject,
+        room: Room,
+        variation: Variation,
+        adapted_prompt: str,
+        prior_image_url: Optional[str],
+        prior_status: str,
+        prior_error: Optional[str],
+        result,
+        image_gen_error: Optional[Exception],
+        elapsed_ms: int,
+    ) -> tuple:
+        """Persist the regen outcome atomically.
+
+        Returns (event_type, regen_error_message):
+        - ("variation_completed", None) on success — variation now points at the
+          new image, COMPLETED, prior blob delete scheduled fire-and-forget.
+        - ("variation_failed", "<reason>") on any failure (image-gen exception,
+          empty saved_images, missing generation, cancellation). Variation is
+          restored to its prior visible state (status / image_url / error) so
+          the UI keeps showing the prior image. The new `adapted_prompt` stays
+          in `generation_metadata` so a retry can re-use it.
+        """
+        saved_url = None
+        if image_gen_error is None and result and result.generation and result.save:
+            saved = result.save
+            saved_url = (
+                saved.saved_images[0].get("url") if saved.saved_images else None
+            )
+            if not saved_url:
+                image_gen_error = RuntimeError("Save succeeded but no image URL returned")
+        elif image_gen_error is None:
+            image_gen_error = RuntimeError("Pipeline returned no generation result")
+
+        if image_gen_error is None and saved_url:
+            # Success path
+            variation.image_url = saved_url
+            variation.status = ItemStatus.COMPLETED
+            variation.error = None
+            variation.generation_metadata = {
+                "model": project.settings.model,
+                "adapted_prompt": adapted_prompt,
+                "generation_time_ms": elapsed_ms,
+            }
+            self._update_room_in_project(project, room)
+
+            # Fire-and-forget delete of the prior blob (best-effort).
+            if prior_image_url and prior_image_url != saved_url:
+                self._schedule_blob_cleanup(prior_image_url)
+
+            return ("variation_completed", None)
+
+        # Failure path: restore prior visible state. Keep the new
+        # adapted_prompt in generation_metadata for retry.
+        regen_error_message = str(image_gen_error) if image_gen_error else "Unknown error"
+        logger.error(
+            f"Single variation regen failed for {variation.id}: {regen_error_message}"
+        )
+        variation.status = prior_status
+        variation.image_url = prior_image_url
+        variation.error = prior_error
+        # NOTE: variation.generation_metadata already carries the new
+        # adapted_prompt (persisted before the image-gen call). Leave it.
+        self._update_room_in_project(project, room)
+        return ("variation_failed", regen_error_message)
+
+    def _schedule_blob_cleanup(self, blob_url: str) -> None:
+        """Schedule a fire-and-forget delete of the given blob URL.
+
+        Best-effort: warnings are logged on failure; never raises. The task is
+        held in `self._cleanup_tasks` to prevent garbage collection and to
+        allow tests to await pending cleanups deterministically.
+        """
+        try:
+            blob_name = self._extract_blob_name(blob_url)
+        except Exception as e:
+            logger.warning(f"Could not extract blob name from {blob_url}: {e}")
+            return
+
+        async def _delete():
+            try:
+                await asyncio.to_thread(
+                    self.blob_service.delete_asset,
+                    blob_name,
+                    settings.AZURE_BLOB_IMAGE_CONTAINER,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to delete prior blob {blob_name}: {e}")
+
+        try:
+            task = asyncio.create_task(_delete())
+        except RuntimeError:
+            # No running loop — fall back to a synchronous best-effort delete.
+            # This path is unreachable during request handling but keeps
+            # cleanup robust if invoked from non-async contexts.
+            try:
+                self.blob_service.delete_asset(
+                    blob_name, settings.AZURE_BLOB_IMAGE_CONTAINER,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to delete prior blob {blob_name}: {e}")
+            return
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
 
     async def generate_project(self, project: StagingProject) -> AsyncGenerator[Dict[str, Any], None]:
         """Process all pending rooms in parallel. Yields SSE events as they arrive."""

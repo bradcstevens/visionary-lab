@@ -382,9 +382,13 @@ async def regenerate_variation(
         if not adapted_prompt:
             fallback_to_fresh = True
 
-    # Reset the variation
-    variation.status = ItemStatus.PENDING
-    variation.image_url = None
+    # Preflight: mark variation/room as PROCESSING so concurrent regen requests
+    # see the 409 mutex on `variation.status == PROCESSING`. Deliberately do
+    # NOT clear `variation.image_url` — the pipeline captures it as
+    # `prior_image_url` for failure rollback and old-blob cleanup. See
+    # PRD: Implementation Decisions → Backend (`process_single_variation`
+    # rollback semantics) and issue 002 of the single-variation regen PRD.
+    variation.status = ItemStatus.PROCESSING
     variation.error = None
 
     # Update room status to processing

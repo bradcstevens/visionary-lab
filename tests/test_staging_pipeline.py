@@ -469,8 +469,14 @@ class TestFailedVariationPersistsAdaptedPrompt:
         assert persisted_prompt_at_call_time.get("value") == adapted_prompt, \
             "adapted_prompt must be persisted to Cosmos BEFORE the image-gen call"
 
-        # Final state: variation is failed and still has the prompt on record:
-        assert variation.status == ItemStatus.FAILED
+        # Final state: under the rollback-on-failure contract (issue 002), the
+        # variation is restored to its pre-regen visible state — but the new
+        # adapted_prompt remains in generation_metadata so a retry can re-use it.
+        # The variation here started in PENDING (default), so rollback returns it
+        # to PENDING, NOT FAILED. The dedicated rollback test class
+        # (TestSingleVariationFailureRollbackAndCleanup) covers the prior-FAILED
+        # case explicitly.
+        assert variation.status == ItemStatus.PENDING
         assert variation.generation_metadata is not None
         meta = variation.generation_metadata
         meta_prompt = meta.get("adapted_prompt") if isinstance(meta, dict) else meta.adapted_prompt
@@ -480,3 +486,293 @@ class TestFailedVariationPersistsAdaptedPrompt:
         final = _persisted_variation_for(mock_storage, room.id, variation.id)
         assert final is not None
         assert (final.get("generation_metadata") or {}).get("adapted_prompt") == adapted_prompt
+
+
+async def _drain_cleanup_tasks(pipeline) -> None:
+    """Wait for any fire-and-forget cleanup tasks (e.g., blob deletes) to settle."""
+    pending = getattr(pipeline, "_cleanup_tasks", None)
+    if not pending:
+        return
+    await asyncio.gather(*list(pending), return_exceptions=True)
+
+
+class TestSingleVariationFailureRollbackAndCleanup:
+    """Issue 002 (single-variation-regeneration): failure preserves the prior
+    user-visible state (status / image_url / error), success deletes the prior
+    blob, and disconnect mid-flight does not strand the variation in PROCESSING.
+    """
+
+    PRIOR_URL = "https://acct.blob.core.windows.net/images/staging/proj/variations/room-0/prior.png"
+    PRIOR_BLOB_NAME = "staging/proj/variations/room-0/prior.png"
+    NEW_URL = "https://acct.blob.core.windows.net/images/staging/proj/variations/room-0/new.png"
+
+    def _make_pipeline_with_prior_image(self, mock_blob, mock_storage, mock_pipeline_call):
+        """Construct a StagingPipeline with mocked deps. Returns (pipeline, project, room, variation)."""
+        project = _make_project(n_rooms=1, n_variations=2)
+        room = project.rooms[0]
+        variation = room.variations[1]
+        # Prior state: COMPLETED with an image
+        variation.status = ItemStatus.COMPLETED
+        variation.image_url = self.PRIOR_URL
+        variation.error = None
+
+        with patch("backend.core.staging_pipeline.StagingPipeline.__init__", return_value=None):
+            pipeline = StagingPipeline.__new__(StagingPipeline)
+            pipeline.image_pipeline = AsyncMock()
+            pipeline.image_pipeline.process_pipeline = mock_pipeline_call
+            pipeline.blob_service = mock_blob
+            pipeline.blob_service.get_asset_content.return_value = (b"\x89PNG\r\n", "image/png")
+            pipeline.storage_service = mock_storage
+            pipeline.semaphore = asyncio.Semaphore(1)
+            pipeline._cleanup_tasks = set()
+        return pipeline, project, room, variation
+
+    @pytest.mark.asyncio
+    async def test_failure_preserves_prior_image_url_and_status(self):
+        """When image-gen raises, the variation must end with prior status/url/error
+        so the UI continues to show the prior image (not a failure tile)."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("simulated image-gen failure")
+
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(side_effect=_raise),
+        )
+        adapted_prompt = "Add a velvet teal sofa near the window"
+
+        events = []
+        async for event in pipeline.process_single_variation(project, room, variation, adapted_prompt):
+            events.append(event)
+        await _drain_cleanup_tasks(pipeline)
+
+        # Variation is restored to its pre-regen visible state:
+        assert variation.status == ItemStatus.COMPLETED, \
+            "Failure must restore prior status so the UI keeps the prior image visible"
+        assert variation.image_url == self.PRIOR_URL, \
+            "Failure must preserve the prior image_url"
+        assert variation.error is None, "Failure must restore the prior error (None for COMPLETED)"
+
+        # SSE event reports the regen failure, but the persisted state shows the prior image:
+        failed_events = [e for e in events if e["type"] == "variation_failed"]
+        assert len(failed_events) == 1
+        assert "simulated image-gen failure" in (failed_events[0].get("error") or "")
+
+        # The prior blob is NOT deleted on failure:
+        mock_blob.delete_asset.assert_not_called()
+
+        # The new adapted_prompt is preserved in metadata so retry can re-use it:
+        meta = variation.generation_metadata
+        meta_prompt = meta.get("adapted_prompt") if isinstance(meta, dict) else meta.adapted_prompt
+        assert meta_prompt == adapted_prompt
+
+    @pytest.mark.asyncio
+    async def test_success_deletes_prior_blob(self):
+        """On successful regen, the prior blob is deleted fire-and-forget."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        pipeline_response = _make_pipeline_response(image_url=self.NEW_URL)
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(return_value=pipeline_response),
+        )
+
+        events = []
+        async for event in pipeline.process_single_variation(
+            project, room, variation, "new prompt",
+        ):
+            events.append(event)
+        await _drain_cleanup_tasks(pipeline)
+
+        # Variation transitioned to COMPLETED with the new URL:
+        assert variation.status == ItemStatus.COMPLETED
+        assert variation.image_url == self.NEW_URL
+
+        # Prior blob deleted exactly once with the right name + container:
+        from backend.core.config import settings as _settings
+        mock_blob.delete_asset.assert_called_once_with(
+            self.PRIOR_BLOB_NAME, _settings.AZURE_BLOB_IMAGE_CONTAINER,
+        )
+
+        completed_events = [e for e in events if e["type"] == "variation_completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0]["image_url"] == self.NEW_URL
+
+    @pytest.mark.asyncio
+    async def test_no_prior_image_no_delete(self):
+        """When the variation had no prior image (e.g., regenning a previously
+        FAILED variation), success path must NOT call delete_asset."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        pipeline_response = _make_pipeline_response(image_url=self.NEW_URL)
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(return_value=pipeline_response),
+        )
+        # No prior image (override the COMPLETED-with-prior-image setup)
+        variation.image_url = None
+        variation.status = ItemStatus.FAILED
+        variation.error = "previous attempt failed"
+
+        async for _ in pipeline.process_single_variation(project, room, variation, "new prompt"):
+            pass
+        await _drain_cleanup_tasks(pipeline)
+
+        assert variation.status == ItemStatus.COMPLETED
+        assert variation.image_url == self.NEW_URL
+        assert variation.error is None
+        mock_blob.delete_asset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_save_without_url_preserves_prior_state(self):
+        """If the pipeline returns a 'save succeeded but no URL' response, the
+        regen counts as a failure and prior state is preserved."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        # Build a response with empty saved_images
+        gen = ImageGenerationResponse(success=True, message="ok",
+                                       imgen_model_response={"data": [{"b64_json": "AAAA"}]})
+        save = ImageSaveResponse(success=True, message="Saved 0", saved_images=[], total_saved=0)
+        empty_response = ImagePipelineResponse(
+            success=True, message="ok",
+            steps=[PipelineStepResult(step="edit", success=True), PipelineStepResult(step="save", success=True)],
+            generation=gen, save=save,
+        )
+
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(return_value=empty_response),
+        )
+
+        events = []
+        async for event in pipeline.process_single_variation(project, room, variation, "new prompt"):
+            events.append(event)
+        await _drain_cleanup_tasks(pipeline)
+
+        # Prior state is preserved:
+        assert variation.status == ItemStatus.COMPLETED
+        assert variation.image_url == self.PRIOR_URL
+        # The SSE event reports the failure:
+        failed_events = [e for e in events if e["type"] == "variation_failed"]
+        assert len(failed_events) == 1
+        # No blob delete on failure:
+        mock_blob.delete_asset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failure_from_prior_failed_state_keeps_failed(self):
+        """If the variation was FAILED before regen and the regen also fails,
+        the persisted state must remain FAILED with the prior error message."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("regen also failed")
+
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(side_effect=_raise),
+        )
+        # Prior state: FAILED with a specific error
+        variation.status = ItemStatus.FAILED
+        variation.image_url = None
+        variation.error = "earlier rate limit"
+
+        async for _ in pipeline.process_single_variation(project, room, variation, "new prompt"):
+            pass
+        await _drain_cleanup_tasks(pipeline)
+
+        assert variation.status == ItemStatus.FAILED
+        assert variation.image_url is None
+        assert variation.error == "earlier rate limit"
+        mock_blob.delete_asset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pre_shield_cancellation_restores_prior_state(self):
+        """If the SSE client disconnects DURING image-gen (before the shielded
+        persist runs), the variation must end up in its prior visible state, not
+        stranded in PROCESSING. Reconcile cannot recover this case because
+        single-variation regen does not elevate project.status."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        async def _raise_cancelled(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(side_effect=_raise_cancelled),
+        )
+
+        # Drive the generator until it raises CancelledError out
+        gen = pipeline.process_single_variation(project, room, variation, "new prompt")
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in gen:
+                pass
+        await _drain_cleanup_tasks(pipeline)
+
+        # Variation is no longer stranded in PROCESSING:
+        assert variation.status != ItemStatus.PROCESSING
+        # And the prior visible state is preserved:
+        assert variation.status == ItemStatus.COMPLETED
+        assert variation.image_url == self.PRIOR_URL
+        # No blob delete on cancellation:
+        mock_blob.delete_asset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invariant_does_not_elevate_project_status(self):
+        """process_single_variation must never set project.status = processing.
+        That invariant is what keeps reconcile from interfering mid-regen."""
+        mock_blob = MagicMock()
+        mock_blob.delete_asset = MagicMock(return_value=True)
+        mock_storage = MagicMock()
+
+        pipeline_response = _make_pipeline_response(image_url=self.NEW_URL)
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(return_value=pipeline_response),
+        )
+        # Set project.status to a non-processing baseline
+        from backend.models.staging import ProjectStatus
+        project.status = ProjectStatus.COMPLETED
+
+        async for _ in pipeline.process_single_variation(project, room, variation, "new prompt"):
+            # During processing project.status must NOT be processing:
+            assert project.status != ProjectStatus.PROCESSING
+        await _drain_cleanup_tasks(pipeline)
+        # And it remains non-processing afterwards:
+        assert project.status != ProjectStatus.PROCESSING
+
+    @pytest.mark.asyncio
+    async def test_delete_asset_failure_is_swallowed(self):
+        """If best-effort cleanup of the prior blob raises, the regen must
+        still complete successfully — cleanup failures must never propagate or
+        flip the variation back to FAILED."""
+        mock_blob = MagicMock()
+        # delete_asset raises, simulating a transient storage error
+        mock_blob.delete_asset = MagicMock(side_effect=RuntimeError("storage offline"))
+        mock_storage = MagicMock()
+
+        pipeline_response = _make_pipeline_response(image_url=self.NEW_URL)
+        pipeline, project, room, variation = self._make_pipeline_with_prior_image(
+            mock_blob, mock_storage, AsyncMock(return_value=pipeline_response),
+        )
+
+        events = []
+        async for event in pipeline.process_single_variation(
+            project, room, variation, "new prompt"
+        ):
+            events.append(event)
+        # Drain so the cleanup task's exception is observed (and swallowed).
+        await _drain_cleanup_tasks(pipeline)
+
+        # Regen still reports success and the variation is COMPLETED with the
+        # new image — the delete failure does not surface to the caller.
+        assert any(e["type"] == "variation_completed" for e in events)
+        assert variation.status == ItemStatus.COMPLETED
+        assert variation.image_url == self.NEW_URL
+        # The cleanup task did attempt the delete (and the mock raised).
+        mock_blob.delete_asset.assert_called_once()

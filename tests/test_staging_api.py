@@ -151,3 +151,54 @@ def test_regenerate_variation_already_processing(client, mock_staging_deps):
     mock_container.read_item.return_value = project_data
     response = client.post("/api/v1/staging/projects/proj-123/rooms/room-1/variations/var-1/regenerate?strategy=fresh")
     assert response.status_code == 409
+
+
+def test_regenerate_variation_preflight_preserves_image_url(client, mock_staging_deps):
+    """Issue 002: the endpoint preflight must NOT clear `variation.image_url`.
+
+    The pipeline captures the prior URL for failure rollback and old-blob
+    cleanup, so wiping it in the preflight write would defeat that contract.
+    Verifies the preflight write keeps the prior image_url intact and sets
+    status=processing (not pending).
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_completed_variation()
+    prior_image_url = project_data["rooms"][0]["variations"][0]["image_url"]
+    mock_container.read_item.return_value = project_data
+    # Echo replace_item back so update_project returns valid data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    # The pipeline's process_single_variation is awaited inside the SSE
+    # generator. We don't need it to do anything — the preflight write happens
+    # before the generator yields, so we let the response stream to completion
+    # but the pipeline is mocked to return an empty async generator.
+    mock_pipeline = mock_staging_deps["pipeline"]
+
+    async def _empty_async_gen(*_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    mock_pipeline.process_single_variation = _empty_async_gen
+
+    with client.stream(
+        "POST",
+        "/api/v1/staging/projects/proj-123/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+    ) as response:
+        assert response.status_code == 200
+        # Drain the stream so the preflight + final writes complete.
+        for _ in response.iter_bytes():
+            pass
+
+    # The first replace_item call is the preflight write.
+    assert mock_container.replace_item.call_count >= 1
+    first_call = mock_container.replace_item.call_args_list[0]
+    persisted_body = first_call.kwargs.get("body") or first_call.args[1]
+    persisted_variation = persisted_body["rooms"][0]["variations"][0]
+    # Critical: the prior image_url is preserved through the preflight write.
+    assert persisted_variation["image_url"] == prior_image_url, \
+        "Preflight write must NOT clear variation.image_url; the pipeline " \
+        "needs it for failure rollback and old-blob cleanup (issue 002)."
+    # And the variation is now PROCESSING (not PENDING) so the 409 mutex works.
+    assert persisted_variation["status"] == "processing"
+    # The error field is cleared (in case the variation was previously FAILED).
+    assert persisted_variation.get("error") is None
