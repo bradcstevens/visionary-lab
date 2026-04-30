@@ -341,6 +341,12 @@ module containerAppBackend './modules/containerApp.bicep' = {
     COSMOS_DATABASE_NAME: cosmosDbMod.outputs.databaseName
     COSMOS_CONTAINER_NAME: cosmosDbMod.outputs.containerName
     azdServiceName: 'backend'
+    // Pin the backend to a single replica. The in-process semaphore in
+    // `ImagePipelineService` and the per-project asyncio lock in
+    // `StagingPipeline` rely on a single replica for correctness. See
+    // `prds/2026-04-29-parallel-processing-prd.md` (Single-replica
+    // deployment constraint) before raising this.
+    maxReplicas: 1
   }
 }
 

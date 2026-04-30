@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.38.3.11034",
-      "templateHash": "10910682752480484047"
+      "templateHash": "5554718835774863193"
     }
   },
   "parameters": {
@@ -90,7 +90,7 @@
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "Name of the optional legacy gpt-image-1.5 deployment"
+        "description": "Name of the optional legacy image generation deployment (gpt-image-1.5 era)"
       }
     },
     "IMAGEGEN_1_MINI_DEPLOYMENT": {
@@ -222,7 +222,7 @@
     },
     "cosmosAccountName": {
       "type": "string",
-      "defaultValue": "visionary-lab-cosmos"
+      "defaultValue": "[format('cosmos-{0}', parameters('environmentName'))]"
     },
     "cosmosDatabaseName": {
       "type": "string",
@@ -2390,6 +2390,9 @@
           },
           "azdServiceName": {
             "value": "backend"
+          },
+          "maxReplicas": {
+            "value": 1
           }
         },
         "template": {
@@ -2399,7 +2402,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.38.3.11034",
-              "templateHash": "5428454923103479925"
+              "templateHash": "14794117218314730494"
             }
           },
           "parameters": {
@@ -2504,6 +2507,10 @@
             "API_PORT": {
               "type": "string",
               "defaultValue": "80"
+            },
+            "maxReplicas": {
+              "type": "int",
+              "defaultValue": 0
             },
             "COSMOS_ENDPOINT": {
               "type": "string",
@@ -2668,9 +2675,7 @@
                       ]
                     }
                   ],
-                  "scale": {
-                    "minReplicas": 1
-                  }
+                  "scale": "[if(greater(parameters('maxReplicas'), 0), createObject('minReplicas', 1, 'maxReplicas', parameters('maxReplicas')), createObject('minReplicas', 1))]"
                 }
               }
             },
@@ -2844,7 +2849,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.38.3.11034",
-              "templateHash": "5428454923103479925"
+              "templateHash": "14794117218314730494"
             }
           },
           "parameters": {
@@ -2949,6 +2954,10 @@
             "API_PORT": {
               "type": "string",
               "defaultValue": "80"
+            },
+            "maxReplicas": {
+              "type": "int",
+              "defaultValue": 0
             },
             "COSMOS_ENDPOINT": {
               "type": "string",
@@ -3113,9 +3122,7 @@
                       ]
                     }
                   ],
-                  "scale": {
-                    "minReplicas": 1
-                  }
+                  "scale": "[if(greater(parameters('maxReplicas'), 0), createObject('minReplicas', 1, 'maxReplicas', parameters('maxReplicas')), createObject('minReplicas', 1))]"
                 }
               }
             },

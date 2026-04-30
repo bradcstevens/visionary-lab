@@ -36,6 +36,24 @@ param API_PROTOCOL string = 'http'
 param API_HOSTNAME string = 'localhost'
 param API_PORT string = '80'
 
+// Replica scaling.
+//
+// `maxReplicas` is an explicit cap. Set it to 1 for the backend container
+// app: the in-process semaphore in `ImagePipelineService` and the
+// per-project asyncio lock in `StagingPipeline` rely on a single replica
+// for correctness. Raising this value without first replacing those
+// in-process primitives with a distributed token bucket (Redis or similar)
+// for the global image-call cap, and Cosmos optimistic concurrency for the
+// per-project read-modify-write, will silently break the global rate-limit
+// cap and reintroduce the last-writer-wins races those primitives prevent.
+// See `prds/2026-04-29-parallel-processing-prd.md` (Single-replica
+// deployment constraint, and Further Notes) for the full rationale and the
+// migration plan when horizontal scale becomes necessary.
+//
+// A value of `0` means "leave unset" so the Container Apps platform default
+// applies (used by the frontend, which has no in-process state to protect).
+param maxReplicas int = 0
+
 // Cosmos DB (managed identity — no keys)
 param COSMOS_ENDPOINT string = ''
 param COSMOS_DATABASE_NAME string = ''
@@ -209,7 +227,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = if(deployNew) {
           ]
         }
       ]
-      scale: {
+      scale: maxReplicas > 0 ? {
+        minReplicas: 1
+        maxReplicas: maxReplicas
+      } : {
         minReplicas: 1
       }
     }
