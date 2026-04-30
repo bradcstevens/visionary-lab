@@ -39,6 +39,25 @@ from backend.models.images import (
 logger = logging.getLogger(__name__)
 
 
+# Single concurrency boundary for Azure image generate / edit calls.
+#
+# Every image-gen / image-edit code path in the codebase — staging pipeline
+# rooms and variations, single-variation regeneration, ad-hoc generate,
+# ad-hoc edit, and ad-hoc edit upload — acquires this semaphore via
+# ``call_with_retry``. No other module may enforce its own image-call cap.
+# This is the global rate-limit bound, configurable via
+# ``settings.IMAGE_GEN_MAX_CONCURRENT`` (default 3).
+#
+# The room-level ``STAGING_CONCURRENT_ROOMS`` semaphore in ``StagingPipeline``
+# is a SEPARATE cap that bounds in-memory base64 / SSE generators per room
+# worker. It is unrelated to Azure rate-limit exposure.
+#
+# See parallel-processing PRD § Global image-call cap (rate-limit bound).
+IMAGE_GEN_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(
+    settings.IMAGE_GEN_MAX_CONCURRENT
+)
+
+
 class ImagePipelineService:
     """Service that centralises the image generation/edit/save pipeline logic."""
 
@@ -83,10 +102,11 @@ class ImagePipelineService:
             if request.user:
                 params["user"] = request.user
 
-            # Run sync SDK call in thread pool to not block event loop
+            # Run sync SDK call in thread pool to not block event loop.
+            # Acquires the global IMAGE_GEN_SEMAPHORE via call_with_retry.
             response = await call_with_retry(
                 lambda: asyncio.to_thread(client.generate_image, **params),
-                semaphore=None,
+                semaphore=IMAGE_GEN_SEMAPHORE,
                 model=request.model,
                 attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
                 base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
@@ -201,7 +221,7 @@ class ImagePipelineService:
 
             response = await call_with_retry(
                 lambda: asyncio.to_thread(_sync_edit),
-                semaphore=None,
+                semaphore=IMAGE_GEN_SEMAPHORE,
                 model=request.model,
                 attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
                 base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
@@ -315,6 +335,12 @@ class ImagePipelineService:
             )
         except HTTPException:
             raise
+        except RateLimitError as exc:
+            logger.error(
+                "Rate limit exceeded after %d retries: %s",
+                settings.IMAGE_GEN_RETRY_ATTEMPTS, exc,
+            )
+            raise HTTPException(status_code=429, detail="Rate limit exceeded; try again later.")
         except Exception as exc:  # pragma: no cover - delegated to HTTP response
             logger.error("Error editing image upload: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -647,18 +673,21 @@ class ImagePipelineService:
             provider=settings.MODEL_PROVIDER,
             model=model
         )
-        
-        # Run sync SDK call in thread pool to not block event loop
-        # We use a helper function that handles file opening/closing in the thread
+
+        # Run sync SDK call in thread pool to not block event loop.
+        # We use a helper function that handles file opening/closing in the
+        # thread. The closure copies `params` per attempt so retries don't
+        # leak closed file handles into the outer dict.
         def _sync_edit_with_files():
+            local_params = dict(params)
             if len(image_paths) == 1:
                 with open(image_paths[0], "rb") as image_file:
-                    params["image"] = image_file
+                    local_params["image"] = image_file
                     if mask_path:
                         with open(mask_path, "rb") as mask_file:
-                            params["mask"] = mask_file
-                            return client.edit_image(**params)
-                    return client.edit_image(**params)
+                            local_params["mask"] = mask_file
+                            return client.edit_image(**local_params)
+                    return client.edit_image(**local_params)
 
             open_files: List[io.BufferedReader] = []
             try:
@@ -667,19 +696,30 @@ class ImagePipelineService:
                     file_obj = open(path, "rb")
                     open_files.append(file_obj)
                     image_files.append(file_obj)
-                params["image"] = image_files
+                local_params["image"] = image_files
 
                 if mask_path:
                     mask_file = open(mask_path, "rb")
                     open_files.append(mask_file)
-                    params["mask"] = mask_file
+                    local_params["mask"] = mask_file
 
-                return client.edit_image(**params)
+                return client.edit_image(**local_params)
             finally:
                 for file_obj in open_files:
                     file_obj.close()
 
-        return await asyncio.to_thread(_sync_edit_with_files)
+        # Wrap in call_with_retry to (a) acquire the global IMAGE_GEN_SEMAPHORE
+        # and (b) honor the typed retry allowlist (rate-limit, connection,
+        # timeout, retryable 5xx). Files are reopened on each attempt by the
+        # closure above, so retries always operate on fresh handles.
+        return await call_with_retry(
+            lambda: asyncio.to_thread(_sync_edit_with_files),
+            semaphore=IMAGE_GEN_SEMAPHORE,
+            model=model,
+            attempts=settings.IMAGE_GEN_RETRY_ATTEMPTS,
+            base_delay=settings.IMAGE_GEN_RETRY_BASE_DELAY,
+            max_total_wait=settings.IMAGE_GEN_RETRY_MAX_TOTAL_WAIT,
+        )
 
     @staticmethod
     def _cleanup_temp_files(temp_files: List[Tuple[int, str]]) -> None:

@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     IMAGE_GEN_RETRY_BASE_DELAY: float = 2.0  # seconds; full jitter doubles each attempt
     IMAGE_GEN_RETRY_MAX_TOTAL_WAIT: float = 120.0  # seconds; cumulative wait cap
 
+    # Global concurrency cap for Azure image generate / edit calls. Every
+    # image-call code path (staging pipeline, single-variation regen, ad-hoc
+    # generate, ad-hoc edit, ad-hoc edit upload) shares this cap via the
+    # module-level semaphore in backend/core/image_pipeline.py. This is the
+    # rate-limit bound. See parallel-processing PRD § Global image-call cap.
+    IMAGE_GEN_MAX_CONCURRENT: int = 3
+
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
 
