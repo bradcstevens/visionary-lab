@@ -395,15 +395,22 @@ async def regenerate_variation(
     if variation.status == ItemStatus.PROCESSING:
         raise HTTPException(status_code=409, detail="Variation is already being processed")
 
-    # Determine the prompt to use
+    # Determine the prompt to use, and capture the previously-rejected
+    # prompt regardless of strategy. Issue 003 of single-variation-regen
+    # PRD: on the fresh path, the rejected prior prompt is threaded down
+    # to ``brief_to_prompts`` / ``adapt_prompt`` as ``rejected_prompt`` so
+    # the new generation diverges from the rejected aesthetic.
     adapted_prompt = None
+    prior_adapted_prompt: Optional[str] = None
     fallback_to_fresh = False
 
+    if variation.generation_metadata and isinstance(variation.generation_metadata, dict):
+        prior_adapted_prompt = variation.generation_metadata.get("adapted_prompt")
+    elif hasattr(variation.generation_metadata, "adapted_prompt"):
+        prior_adapted_prompt = variation.generation_metadata.adapted_prompt
+
     if strategy == "retry":
-        if variation.generation_metadata and isinstance(variation.generation_metadata, dict):
-            adapted_prompt = variation.generation_metadata.get("adapted_prompt")
-        elif hasattr(variation.generation_metadata, "adapted_prompt"):
-            adapted_prompt = variation.generation_metadata.adapted_prompt
+        adapted_prompt = prior_adapted_prompt
         if not adapted_prompt:
             fallback_to_fresh = True
 
@@ -443,6 +450,7 @@ async def regenerate_variation(
                             brief=brief,
                             image_analyses=analyses,
                             n_variations=1,
+                            rejected_prompt=prior_adapted_prompt,
                         )
                         if room.id in brief_prompts and brief_prompts[room.id]:
                             adapted_prompt = brief_prompts[room.id][0]
@@ -462,6 +470,7 @@ async def regenerate_variation(
                         user_prompt=project.prompt,
                         room_analysis=room_description,
                         n_variations=1,
+                        rejected_prompt=prior_adapted_prompt,
                     )
                     adapted_prompt = prompts[0]
 

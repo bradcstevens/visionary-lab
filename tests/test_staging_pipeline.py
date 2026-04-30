@@ -776,3 +776,92 @@ class TestSingleVariationFailureRollbackAndCleanup:
         assert variation.image_url == self.NEW_URL
         # The cleanup task did attempt the delete (and the mock raised).
         mock_blob.delete_asset.assert_called_once()
+
+
+class TestAdaptPromptWithRejectedPrompt:
+    """Issue 003 of single-variation-regeneration PRD: ``StagingPipeline.adapt_prompt``
+    accepts an optional ``rejected_prompt`` and threads it into the LLM
+    system message so "Try Something New" diverges from the rejected
+    aesthetic on the no-brief regen path.
+    """
+
+    def _make_pipeline(self, mock_llm: AsyncMock) -> StagingPipeline:
+        return StagingPipeline(
+            async_llm_client=mock_llm,
+            llm_deployment="gpt-4o",
+            image_analyzer=MagicMock(),
+            image_pipeline=MagicMock(),
+            storage_service=MagicMock(),
+            blob_service=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_rejected_prompt_is_none_no_steering(self):
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"prompts":["A","B"]}'))]
+        )
+        pipeline = self._make_pipeline(mock_llm)
+        await pipeline.adapt_prompt(
+            user_prompt="Modern minimalist",
+            room_analysis="A sunlit living room",
+            n_variations=2,
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "REJECTED_PRIOR_DIRECTION" not in sent
+        assert "REGENERATION STEERING" not in sent
+
+    @pytest.mark.asyncio
+    async def test_rejected_prompt_appears_in_llm_call_site(self):
+        """Integration acceptance criterion: assert at the actual LLM
+        client (not at the boundary of ``adapt_prompt``) that the rejected
+        prompt is embedded in the system message."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"prompts":["new A","new B"]}'))]
+        )
+        pipeline = self._make_pipeline(mock_llm)
+        await pipeline.adapt_prompt(
+            user_prompt="Modern minimalist",
+            room_analysis="A sunlit living room",
+            n_variations=2,
+            rejected_prompt="MAGENTA-AND-CHROME MAXIMALIST AESTHETIC",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "MAGENTA-AND-CHROME MAXIMALIST AESTHETIC" in sent
+        assert "REJECTED_PRIOR_DIRECTION" in sent
+
+    @pytest.mark.asyncio
+    async def test_rejected_prompt_does_not_drop_user_intent(self):
+        """The user's ``user_prompt`` (e.g. "Modern minimalist") must
+        survive in the system message alongside the steering block."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"prompts":["A","B"]}'))]
+        )
+        pipeline = self._make_pipeline(mock_llm)
+        await pipeline.adapt_prompt(
+            user_prompt="USER_INTENT_SENTINEL_TOKEN",
+            room_analysis="A modern living room",
+            n_variations=2,
+            rejected_prompt="industrial concrete jungle",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "USER_INTENT_SENTINEL_TOKEN" in sent
+        assert "industrial concrete jungle" in sent
+
+    @pytest.mark.asyncio
+    async def test_empty_rejected_prompt_treated_as_none(self):
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"prompts":["A","B"]}'))]
+        )
+        pipeline = self._make_pipeline(mock_llm)
+        await pipeline.adapt_prompt(
+            user_prompt="Modern minimalist",
+            room_analysis="A sunlit living room",
+            n_variations=2,
+            rejected_prompt="",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "REJECTED_PRIOR_DIRECTION" not in sent

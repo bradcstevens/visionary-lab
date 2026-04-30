@@ -683,3 +683,92 @@ class TestGenerateBriefWithPreviousBrief:
         # room-1 carried; room-removed filtered out at the final step.
         assert "room-removed" not in new_brief.per_image_objects
         assert len(new_brief.per_image_objects["room-1"]) == 1
+
+
+class TestBriefToPromptsWithRejectedPrompt:
+    """Issue 003 of single-variation-regeneration PRD: ``brief_to_prompts``
+    accepts an optional ``rejected_prompt`` and threads it through to the
+    LLM call site so "Try Something New" diverges from the rejected
+    aesthetic."""
+
+    @pytest.mark.asyncio
+    async def test_default_rejected_prompt_is_none_no_steering(self):
+        """Existing first-time generation paths must keep working with no
+        new argument: the default value is ``None`` and no steering is
+        injected into the LLM call."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["A", "B"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+        await service.brief_to_prompts(_make_brief(), [_make_analysis()], n_variations=2)
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        # No "REJECTED" / "REGENERATION STEERING" markers when no prior prompt.
+        assert "REJECTED_PRIOR_DIRECTION" not in sent
+        assert "REGENERATION STEERING" not in sent
+
+    @pytest.mark.asyncio
+    async def test_rejected_prompt_appears_in_llm_call_site(self):
+        """When a prior prompt is supplied, the actual ``messages[0].content``
+        sent to the LLM must contain the rejected prompt as negative context.
+        This is the integration acceptance criterion (rubber-duck blocking
+        finding #2): mocking ``brief_to_prompts``' boundary alone wouldn't
+        prove the LLM call site receives the steering. We assert at the
+        LLM mock directly."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["new direction A", "new direction B"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+        await service.brief_to_prompts(
+            _make_brief(),
+            [_make_analysis()],
+            n_variations=2,
+            rejected_prompt="MAGENTA-AND-CHROME MAXIMALIST AESTHETIC",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "MAGENTA-AND-CHROME MAXIMALIST AESTHETIC" in sent
+        assert "REJECTED_PRIOR_DIRECTION" in sent
+
+    @pytest.mark.asyncio
+    async def test_rejected_prompt_does_not_drop_brief_intent(self):
+        """The user's existing brief intent (e.g. ``global_instructions``)
+        must SURVIVE the steering wrapper — diversification biases the
+        LLM away from the rejected aesthetic but keeps the user's intent
+        intact."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["x", "y"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+        brief = _make_brief()  # global_instructions = "Add drought-tolerant plants along the fence line"
+        await service.brief_to_prompts(
+            brief,
+            [_make_analysis()],
+            n_variations=2,
+            rejected_prompt="industrial concrete jungle",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert brief.global_instructions in sent
+        # The original brief content survives alongside the steering.
+        assert "Lavender" in sent  # palette object name
+        assert "existing fence" in sent  # preserve element
+
+    @pytest.mark.asyncio
+    async def test_empty_rejected_prompt_treated_as_none(self):
+        """Empty strings are normalized to "no rejected prompt" — caller
+        can pass through ``variation.generation_metadata.adapted_prompt``
+        even when it's an empty string without a guard."""
+        mock_llm = AsyncMock()
+        mock_llm.chat.completions.create.return_value = _mock_llm_response(
+            json.dumps({"prompts": ["A", "B"]})
+        )
+        service = BriefGeneratorService(async_llm_client=mock_llm, llm_deployment="gpt-5-4")
+        await service.brief_to_prompts(
+            _make_brief(),
+            [_make_analysis()],
+            n_variations=2,
+            rejected_prompt="",
+        )
+        sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert "REJECTED_PRIOR_DIRECTION" not in sent

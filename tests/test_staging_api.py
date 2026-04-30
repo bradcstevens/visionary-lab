@@ -679,3 +679,226 @@ def test_post_brief_reconciles_previous_brief_overrides_by_name(
     assert len(overrides) == 1
     assert overrides[0]["object_id"] == new_lavender_id
     assert overrides[0]["quantity"] == 8
+
+
+# ============================================================================
+# Issue 003 of single-variation-regeneration PRD: prompt_diversity threading.
+#
+# When the user clicks "Try Something New" (strategy=fresh) on a variation
+# that has a previously rejected ``adapted_prompt`` in ``generation_metadata``,
+# the prior prompt MUST flow through to the LLM call site as negative
+# context. These tests drive the regen endpoint and assert the LLM mock
+# receives ``messages[0].content`` containing the prior prompt — the
+# integration acceptance criterion.
+#
+# Test pattern: the existing ``mock_staging_deps`` fixture replaces the
+# pipeline with a MagicMock. We configure that mock's blob/analyzer to
+# return real data, and replace ``adapt_prompt`` with a thin wrapper that
+# delegates to a REAL ``StagingPipeline`` instance whose ``async_llm_client``
+# is a captured ``AsyncMock``. The brief path uses ``BriefGeneratorService``
+# constructed inside the endpoint with ``backend.core.async_llm_client`` —
+# patching that module attribute routes the brief LLM call to the captured
+# mock. ``process_single_variation`` is stubbed to an empty async generator
+# so the test focuses on the prompt-generation seam.
+# ============================================================================
+
+import json as _json_for_regen_tests
+from unittest.mock import AsyncMock, MagicMock as _MM, patch as _patch
+
+
+_PRIOR_PROMPT = "MAGENTA-AND-CHROME MAXIMALIST AESTHETIC FROM REJECTED VARIATION"
+
+
+def _project_fresh_regen_payload(*, with_brief: bool):
+    """Project containing one room with one previously-rejected variation.
+
+    The variation's ``generation_metadata.adapted_prompt`` is the prompt
+    the user just rejected. ``with_brief=True`` exercises the
+    BriefGeneratorService path; False exercises the no-brief
+    (``adapt_prompt``) path.
+    """
+    project = {
+        "id": "proj-regen-fresh",
+        "name": "Fresh Regen Test",
+        "prompt": "USER_INTENT_SENTINEL — Modern minimalist",
+        "status": "completed",
+        "rooms": [{
+            "id": "room-1",
+            "label": "Living Room",
+            "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/photo.png",
+            "status": "completed",
+            "analysis": {"description": "A sunlit living room with hardwood floors", "features": ["floor", "window"]},
+            "variations": [{
+                "id": "var-1",
+                "status": "completed",
+                "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/img.png",
+                "generation_metadata": {
+                    "model": "gpt-image-2",
+                    "adapted_prompt": _PRIOR_PROMPT,
+                    "generation_time_ms": 5000,
+                },
+            }],
+        }],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "analyses": [{"room_id": "room-1", "description": "A sunlit living room with hardwood floors", "features": ["floor", "window"]}],
+    }
+    if with_brief:
+        project["design_brief"] = {
+            "global_instructions": "BRIEF_INTENT_SENTINEL — warm scandinavian palette",
+            "object_palette": [
+                {"name": "Sofa", "category": "furniture", "default_quantity": 1, "size": "3-seater", "placement": "facing window"},
+            ],
+            "placement_guide": {"back_row": "abstract art"},
+            "per_image_notes": {},
+            "preserve_elements": ["hardwood floor"],
+            "per_image_objects": {},
+        }
+    return project
+
+
+def _make_captured_llm():
+    """Build an AsyncMock LLM client that records every chat completion."""
+    llm = AsyncMock()
+    llm.chat.completions.create.return_value = _MM(
+        choices=[_MM(message=_MM(content=_json_for_regen_tests.dumps({"prompts": ["new direction"]})))]
+    )
+    return llm
+
+
+def test_fresh_regen_threads_prior_prompt_to_brief_llm_call(client, mock_staging_deps):
+    """Brief path: the rejected ``adapted_prompt`` from
+    ``generation_metadata`` must appear in ``messages[0].content`` sent
+    to the LLM by ``BriefGeneratorService.brief_to_prompts``.
+
+    Patches ``backend.core.async_llm_client`` so the BriefGeneratorService
+    constructed inside the endpoint routes through our captured mock.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_fresh_regen_payload(with_brief=True)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    # ``process_single_variation`` is patched at the class level so the
+    # request returns immediately after prompt-generation — we don't want
+    # it to run real image-gen.
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _empty_psv):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-regen-fresh/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    assert captured_llm.chat.completions.create.called, (
+        "Brief path must reach the LLM for prompt generation"
+    )
+    sent = captured_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert _PRIOR_PROMPT in sent, (
+        f"Rejected prior prompt missing from LLM call site. Got: {sent[:400]!r}"
+    )
+    assert "REJECTED_PRIOR_DIRECTION" in sent
+    assert "BRIEF_INTENT_SENTINEL" in sent  # brief intent survives steering
+
+
+def test_fresh_regen_threads_prior_prompt_to_no_brief_llm_call(client, mock_staging_deps):
+    """No-brief path: the rejected ``adapted_prompt`` must appear in the
+    LLM's system message via ``StagingPipeline.adapt_prompt``.
+
+    Patches ``backend.core.async_llm_client`` so the pipeline's LLM
+    client is the captured mock; patches
+    ``AzureBlobStorageService.get_asset_content`` to serve a real bytes
+    tuple so ``base64.b64encode`` doesn't crash on the auto-MagicMock
+    chain; replaces ``StagingPipeline.analyze_room`` with a stub so we
+    don't need to wire the analyzer.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_fresh_regen_payload(with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "ROOM_ANALYSIS_SENTINEL — sunlit living room", "features": ["floor", "window"]}
+
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _empty_psv), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-regen-fresh/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    assert captured_llm.chat.completions.create.called, (
+        "No-brief path must reach the LLM for prompt adaptation"
+    )
+    sent = captured_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert _PRIOR_PROMPT in sent, (
+        f"Rejected prior prompt missing from no-brief LLM call site. Got: {sent[:400]!r}"
+    )
+    assert "REJECTED_PRIOR_DIRECTION" in sent
+    # User intent survives the steering wrapper.
+    assert "USER_INTENT_SENTINEL" in sent
+
+
+def test_fresh_regen_no_prior_metadata_does_not_inject_steering(client, mock_staging_deps):
+    """First-ever generation defense: when ``generation_metadata`` lacks an
+    ``adapted_prompt`` (e.g. an old variation persisted before issue 002),
+    the LLM call must NOT contain the steering block — defaulting to
+    ``rejected_prompt=None`` is the no-op contract."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_fresh_regen_payload(with_brief=False)
+    project_data["rooms"][0]["variations"][0]["generation_metadata"] = {"model": "gpt-image-2"}
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit living room", "features": []}
+
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _empty_psv), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-regen-fresh/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    sent = captured_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert "REJECTED_PRIOR_DIRECTION" not in sent
+    assert "REGENERATION STEERING" not in sent

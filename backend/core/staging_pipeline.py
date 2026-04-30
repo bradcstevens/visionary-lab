@@ -13,6 +13,7 @@ from backend.core.analyze import ImageAnalyzer
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.image_pipeline import ImagePipelineService
+from backend.core.prompt_diversity import build_diversifying_prompt
 from backend.core.retry import call_with_retry
 from backend.core.staging_storage import StagingStorageService
 from backend.models.images import ImagePipelineRequest, PipelineAction, PipelineSaveOptions, PipelineAnalysisOptions
@@ -129,13 +130,27 @@ class StagingPipeline:
 
     async def adapt_prompt(
         self, user_prompt: str, room_analysis: str, n_variations: int,
+        rejected_prompt: Optional[str] = None,
     ) -> List[str]:
-        """Use LLM to create n distinct variation prompts for this room."""
+        """Use LLM to create n distinct variation prompts for this room.
+
+        Issue 003 of single-variation-regen PRD: when this call is the
+        fresh-regen path for a previously rejected variation, pass the
+        rejected ``adapted_prompt`` as ``rejected_prompt`` to bias the LLM
+        away from the rejected aesthetic. ``rejected_prompt=None`` (the
+        default) preserves the existing first-time-generation behavior.
+        """
         template = build_adaptation_template(room_analysis)
         system_content = template.format(
             room_analysis=room_analysis,
             user_prompt=user_prompt,
             n=n_variations,
+        )
+        # No-op when ``rejected_prompt`` is None / empty / whitespace.
+        system_content = build_diversifying_prompt(
+            rejected_prompt=rejected_prompt,
+            base=system_content,
+            room_analysis=room_analysis,
         )
         for attempt in range(3):
             if attempt:

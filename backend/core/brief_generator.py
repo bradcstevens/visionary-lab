@@ -12,6 +12,7 @@ from backend.core.brief_resolver import (
     resolve_objects_for_image,
 )
 from backend.core.config import settings
+from backend.core.prompt_diversity import build_diversifying_prompt
 from backend.core.retry import call_with_retry
 from backend.models.design_brief import (
     ChatMessage,
@@ -314,6 +315,7 @@ class BriefGeneratorService:
         brief: DesignBrief,
         image_analyses: List[ImageAnalysis],
         n_variations: int = 5,
+        rejected_prompt: Optional[str] = None,
     ) -> Dict[str, List[str]]:
         # Project-wide context that doesn't depend on per-image overrides.
         placement_summary = f"Back: {brief.placement_guide.back_row}"
@@ -349,6 +351,18 @@ class BriefGeneratorService:
                 preserve_summary=preserve_summary,
                 image_description=analysis.description,
                 per_image_note=per_image_note,
+            )
+
+            # Issue 003 of single-variation-regen PRD: when this call is
+            # the fresh-regen path for a previously rejected variation,
+            # bias the LLM away from the rejected aesthetic by prepending
+            # a fenced steering block. ``build_diversifying_prompt`` is a
+            # no-op when ``rejected_prompt`` is None / empty / whitespace,
+            # so first-time generation paths are unaffected.
+            system_content = build_diversifying_prompt(
+                rejected_prompt=rejected_prompt,
+                base=system_content,
+                room_analysis=analysis.description,
             )
 
             for attempt in range(3):
