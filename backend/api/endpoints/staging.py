@@ -1,6 +1,7 @@
 """FastAPI endpoints for virtual staging projects."""
 import json
 import logging
+import time
 import uuid
 from typing import List, Optional
 
@@ -268,6 +269,82 @@ def _sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _log_regen_event(
+    *,
+    event: str,
+    project_id: str,
+    room_id: str,
+    variation_id: str,
+    strategy: str,
+    effective_strategy: str,
+    elapsed_ms: Optional[int] = None,
+    tokens_used: Optional[int] = None,
+) -> None:
+    """Emit an operator-facing structured log line for a regen lifecycle event.
+
+    Issue 008 of the single-variation-regeneration PRD: log analytics must be
+    able to answer questions about regen usage rates, success rates, fallback
+    frequency, and elapsed time without spelunking through unstructured logs.
+
+    Field contract (PRD § Implementation Decisions → Backend, structured-
+    logging bullet):
+
+    - ``project_id``, ``room_id``, ``variation_id`` — entity identifiers.
+      All UUIDs; no PII.
+    - ``strategy`` — the *requested* strategy ("retry" or "fresh").
+    - ``effective_strategy`` — the strategy *actually used* after any fallback
+      (e.g., retry that fell back to fresh has ``effective_strategy="fresh"``).
+    - ``elapsed_ms`` — wall-clock milliseconds from regen acceptance to the
+      terminal event. Sourced from ``time.monotonic()`` deltas in the
+      endpoint, NOT from the pipeline's image-gen-only ``elapsed_ms``: log
+      analytics for "how long does a regen take" needs the operator-facing
+      total (prompt-gen + image-gen + persistence), not just the image-gen
+      slice. Included on ``completed`` / ``failed`` lines; omitted on
+      ``started`` / ``fallback_to_fresh``.
+    - ``tokens_used`` — image-gen token usage from the pipeline's terminal
+      event (``None`` for failed image-gen and any path that never reaches
+      the pipeline). LLM prompt-generation tokens are NOT included; the
+      field is image-gen-only. ALWAYS carried on ``completed`` / ``failed``
+      (even when ``None``, so consumers distinguish "no image-gen happened"
+      from "field missing"). Omitted on ``started`` / ``fallback_to_fresh``.
+
+    Fields are projected onto the ``LogRecord`` via ``extra=`` (for
+    structured-log aggregators like App Insights) AND mirrored as
+    ``key=value`` pairs in the human-readable message (mirroring the
+    ``backend.core.retry`` pattern). Promotion to a dedicated metrics sink
+    is explicitly out of scope; see PRD § Out of Scope.
+    """
+    extra = {
+        "event": event,
+        "project_id": project_id,
+        "room_id": room_id,
+        "variation_id": variation_id,
+        "strategy": strategy,
+        "effective_strategy": effective_strategy,
+    }
+    parts = [
+        f"event={event}",
+        f"project_id={project_id}",
+        f"room_id={room_id}",
+        f"variation_id={variation_id}",
+        f"strategy={strategy}",
+        f"effective_strategy={effective_strategy}",
+    ]
+    # ``completed`` and ``failed`` are the terminal lifecycle events that
+    # carry timing + token metrics. ``started`` and ``fallback_to_fresh``
+    # are mid-flight markers and intentionally omit those fields.
+    is_terminal = event.endswith(".completed") or event.endswith(".failed")
+    if is_terminal:
+        extra["elapsed_ms"] = elapsed_ms
+        parts.append(f"elapsed_ms={elapsed_ms}")
+        # Carried even when None so consumers can distinguish
+        # "no-LLM-call flow / failed before token tally" from "field missing".
+        extra["tokens_used"] = tokens_used
+        parts.append(f"tokens_used={tokens_used}")
+
+    logger.info(" ".join(parts), extra=extra)
+
+
 @router.post("/projects/{project_id}/generate")
 async def generate_project(
     project_id: str,
@@ -414,6 +491,19 @@ async def regenerate_variation(
         if not adapted_prompt:
             fallback_to_fresh = True
 
+    # Issue 008: ``effective_strategy`` reflects the strategy that will
+    # *actually* be used: a retry that lacks a prior prompt is silently a
+    # fresh, so its effective_strategy is "fresh" even though the requested
+    # strategy is "retry". Computed pre-preflight so it's available to the
+    # ``started`` log line below and to ``event_stream`` via closure.
+    effective_strategy = "fresh" if (strategy == "fresh" or fallback_to_fresh) else "retry"
+    # Wall-clock anchor for ``elapsed_ms`` reported on terminal log lines.
+    # Captured BEFORE preflight so the operator-facing total includes the
+    # preflight-persist round-trip. Started log fires only after a
+    # successful preflight (see below) so a write-failure path does not
+    # leave a stranded ``started`` line in the logs.
+    regen_start_time = time.monotonic()
+
     # Preflight: mark variation/room as PROCESSING so concurrent regen requests
     # see the 409 mutex on `variation.status == PROCESSING`. Deliberately do
     # NOT clear `variation.image_url` — the pipeline captures it as
@@ -427,20 +517,60 @@ async def regenerate_variation(
     room.status = ItemStatus.PROCESSING
     storage.update_project(project_id, json.loads(project.json()))
 
+    # Issue 008 of the single-variation-regeneration PRD: emit the
+    # ``started`` log line AFTER the preflight write succeeds. If the
+    # preflight write raises, we never reach this line — that's intentional,
+    # since a regen that never entered durable processing should not appear
+    # in operator dashboards as having "started".
+    _log_regen_event(
+        event="staging.variation_regen.started",
+        project_id=project_id,
+        room_id=room_id,
+        variation_id=variation_id,
+        strategy=strategy,
+        effective_strategy=effective_strategy,
+    )
+
     async def event_stream():
         nonlocal adapted_prompt
         final_status = "completed"
+        # Track the terminal pipeline event so the post-loop log line knows
+        # whether the regen completed or failed. ``elapsed_ms`` is captured
+        # at terminal-event time as wall-clock from ``regen_start_time`` —
+        # the duck-checked rationale for wall-clock over the pipeline's
+        # ``elapsed_ms`` field is in ``_log_regen_event``'s docstring.
+        # ``tokens_used`` IS sourced from the pipeline event since that's
+        # an image-gen-internal value the endpoint can't compute itself.
+        # All three are captured BEFORE the corresponding ``yield`` so a
+        # client disconnect after the SSE event is sent (but before the
+        # generator resumes) still leaves ``finally`` with enough state to
+        # emit the matching ``completed`` / ``failed`` log line.
+        terminal_event_type: Optional[str] = None
+        terminal_elapsed_ms: Optional[int] = None
+        terminal_tokens_used: Optional[int] = None
 
         try:
             if fallback_to_fresh:
                 # Issue 004 of single-variation-regeneration PRD: surface
                 # the silent retry→fresh fallback as a dedicated SSE event
                 # so the frontend can toast "no previous prompt found —
-                # generating a fresh take instead." Emit BEFORE the heavy
-                # fresh-fallback prompt-generation work begins so the user
-                # sees the toast immediately. Continues normally to a
+                # generating a fresh take instead." Continues normally to a
                 # terminal ``project_completed`` event — this is a
                 # notification, not a cancellation.
+                #
+                # Issue 008: pair the SSE event with a structured log line
+                # so log analytics can count silent retry→fresh fallbacks
+                # without parsing the SSE stream. Log line emits BEFORE
+                # the yield so a client disconnect mid-yield doesn't
+                # silently drop the operator log.
+                _log_regen_event(
+                    event="staging.variation_regen.fallback_to_fresh",
+                    project_id=project_id,
+                    room_id=room_id,
+                    variation_id=variation_id,
+                    strategy=strategy,
+                    effective_strategy=effective_strategy,
+                )
                 yield _sse_event("variation_fallback", {
                     "room_id": room_id,
                     "variation_id": variation_id,
@@ -490,13 +620,49 @@ async def regenerate_variation(
                     adapted_prompt = prompts[0]
 
             if not adapted_prompt:
+                # Issue 008: prompt-generation never produced a usable
+                # prompt — this is a terminal failure of the regen flow.
+                # No pipeline event will fire. Set terminal state BEFORE
+                # the SSE yield so a client disconnect mid-yield still
+                # leaves enough state in ``finally`` to log ``failed``.
+                terminal_event_type = "variation_failed"
+                terminal_elapsed_ms = int((time.monotonic() - regen_start_time) * 1000)
+                terminal_tokens_used = None
                 yield _sse_event("error", {"error": "Failed to generate or retrieve adapted prompt"})
                 return
 
             async for event in pipeline.process_single_variation(
                 project, room, variation, adapted_prompt
             ):
+                # Issue 008: capture the pipeline's terminal event BEFORE
+                # the SSE yield. The pipeline contract is one terminal
+                # event per call; the last one observed wins if (against
+                # contract) more than one fires. ``elapsed_ms`` is wall-
+                # clock from regen acceptance to terminal-event observation
+                # — see ``_log_regen_event``'s docstring for the wall-clock
+                # vs pipeline-elapsed_ms rationale. ``tokens_used`` is taken
+                # from the pipeline event (image-gen-internal value).
+                if event.get("type") in ("variation_completed", "variation_failed"):
+                    terminal_event_type = event["type"]
+                    terminal_elapsed_ms = int((time.monotonic() - regen_start_time) * 1000)
+                    terminal_tokens_used = event.get("tokens_used")
                 yield _sse_event(event["type"], event)
+
+        except Exception:
+            # Issue 008 defense-in-depth: if the pipeline (or any of the
+            # prompt-generation helpers above) raises an exception instead
+            # of yielding a terminal SSE event, the regen still terminated
+            # — operator analytics must see a ``failed`` log line, not a
+            # stranded ``started`` with no terminal partner. Only synthesize
+            # terminal state if a real terminal event hasn't already been
+            # observed (covers the case where the pipeline yielded
+            # ``variation_failed`` and then raised on a subsequent yield —
+            # we keep the real terminal_elapsed_ms from the pipeline event).
+            if terminal_event_type is None:
+                terminal_event_type = "variation_failed"
+                terminal_elapsed_ms = int((time.monotonic() - regen_start_time) * 1000)
+                terminal_tokens_used = None
+            raise
 
         finally:
             # Recalculate room and project status
@@ -520,6 +686,34 @@ async def regenerate_variation(
                     fresh_project.status = "completed" if any_room_completed else "failed"
                 storage.update_project(project_id, json.loads(fresh_project.json()))
                 final_status = fresh_project.status
+
+            # Issue 008: emit the terminal log line ONCE we've observed the
+            # pipeline's terminal SSE event, OR the prompt-gen-failure path
+            # set ``terminal_event_type = "variation_failed"`` directly, OR
+            # the ``except Exception`` defense-in-depth branch synthesized
+            # a failure for an unhandled raise. Lives inside ``finally`` so
+            # it fires even when the client disconnects mid-stream — a
+            # regen that the worker finished server-side still gets its
+            # operator log line. ``elapsed_ms`` is wall-clock from regen
+            # acceptance to terminal-event observation (NOT the pipeline's
+            # image-gen-only ``elapsed_ms``); see ``_log_regen_event``'s
+            # docstring for the rationale.
+            if terminal_event_type is not None:
+                terminal_log_event = (
+                    "staging.variation_regen.completed"
+                    if terminal_event_type == "variation_completed"
+                    else "staging.variation_regen.failed"
+                )
+                _log_regen_event(
+                    event=terminal_log_event,
+                    project_id=project_id,
+                    room_id=room_id,
+                    variation_id=variation_id,
+                    strategy=strategy,
+                    effective_strategy=effective_strategy,
+                    elapsed_ms=terminal_elapsed_ms,
+                    tokens_used=terminal_tokens_used,
+                )
 
         yield _sse_event("project_completed", {"status": final_status})
 

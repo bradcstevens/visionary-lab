@@ -1131,3 +1131,437 @@ def test_fresh_strategy_does_not_emit_variation_fallback(client, mock_staging_de
     assert "variation_fallback" not in types, (
         f"strategy=fresh must NOT emit fallback event; got types={types}"
     )
+
+
+# ============================================================================
+# Issue 008 — Structured logging at four lifecycle events
+# ----------------------------------------------------------------------------
+# The regen endpoint must emit operator-facing structured log lines at the
+# four key lifecycle events of a single-variation regen, so log analytics can
+# answer questions about regen usage rates, success rates, fallback frequency,
+# and elapsed time without spelunking through unstructured logs.
+#
+# Contract (from PRD § Implementation Decisions → Backend, structured-logging
+# bullet, and issue 008):
+#
+#   1. ``staging.variation_regen.started`` — after concurrency / 404 / 400 /
+#      409 checks pass, before the pipeline call.
+#   2. ``staging.variation_regen.completed`` — on terminal success.
+#   3. ``staging.variation_regen.failed`` — on terminal failure.
+#   4. ``staging.variation_regen.fallback_to_fresh`` — alongside the
+#      ``variation_fallback`` SSE event when retry has no prior prompt.
+#
+# Each line includes structured fields ``project_id``, ``room_id``,
+# ``variation_id``, ``strategy``, ``effective_strategy``. The ``completed``
+# and ``failed`` lines additionally include ``elapsed_ms`` (always present)
+# and ``tokens_used`` (where available — None for retry-no-LLM-call flows).
+# No PII or secrets in the payload.
+#
+# Fields are duplicated on the LogRecord via ``extra=`` AND in the
+# human-readable message via ``key=value`` pairs (mirroring the
+# ``backend.core.retry`` pattern in ``test_call_with_retry.py``), so log
+# aggregators consuming either form can pick them up. The tests below assert
+# on the ``extra=`` projection (``record.event``, ``record.project_id``, …)
+# because that's the structured form log analytics actually queries.
+# ============================================================================
+
+import logging as _logging_for_regen_logs
+
+
+_REGEN_LOGGER_NAME = "backend.api.endpoints.staging"
+
+
+def _regen_log_records(caplog):
+    """Filter caplog records to ones that carry the structured ``event`` field
+    set to one of the four ``staging.variation_regen.*`` lifecycle events.
+
+    Other unrelated INFO logs from the endpoint (e.g., reconcile warnings,
+    blob-cleanup messages) are filtered out by the prefix match so the tests
+    can assert on the regen-specific ordering.
+    """
+    return [
+        r for r in caplog.records
+        if isinstance(getattr(r, "event", None), str)
+        and r.event.startswith("staging.variation_regen.")
+    ]
+
+
+def _psv_yielding(event_dict):
+    """Build a class-level ``process_single_variation`` replacement that
+    yields exactly one event dict, mirroring the real pipeline's contract
+    (one terminal event per call). The ``self`` arg matches the bound-method
+    signature so ``patch.object(StagingPipeline, "process_single_variation",
+    ...)`` swaps it in cleanly."""
+    async def _psv(self, *_args, **_kwargs):
+        yield event_dict
+    return _psv
+
+
+def test_regen_logs_started_and_completed_on_happy_retry(
+    client, mock_staging_deps, caplog,
+):
+    """Issue 008 AC: a happy-path retry emits exactly ``started`` and
+    ``completed`` log lines (no ``fallback_to_fresh``, no ``failed``).
+
+    With prior ``adapted_prompt`` available, retry uses it directly and skips
+    the LLM. ``effective_strategy`` matches the requested ``strategy=retry``.
+    ``tokens_used`` reflects the image-gen call's reported usage (the
+    retry-no-LLM-call flow only saves on the *prompt*-generation LLM call;
+    image generation still consumes tokens).
+    """
+    caplog.set_level(_logging_for_regen_logs.INFO, logger=_REGEN_LOGGER_NAME)
+
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=True, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    completed_event = {
+        "type": "variation_completed",
+        "room_id": "room-1",
+        "variation_index": 0,
+        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/new.png",
+        "error": None,
+        "elapsed_ms": 4321,
+        "tokens_used": 567,
+        "model": "gpt-image-2",
+        "adapted_prompt": "PRIOR PROMPT TEXT",
+    }
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch.object(
+        StagingPipeline, "process_single_variation", _psv_yielding(completed_event),
+    ):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    records = _regen_log_records(caplog)
+    events = [r.event for r in records]
+    assert events == [
+        "staging.variation_regen.started",
+        "staging.variation_regen.completed",
+    ], (
+        f"Happy retry must emit exactly started+completed; got {events!r}"
+    )
+
+    started, completed = records
+    assert started.project_id == "proj-fallback"
+    assert started.room_id == "room-1"
+    assert started.variation_id == "var-1"
+    assert started.strategy == "retry"
+    assert started.effective_strategy == "retry"
+
+    assert completed.project_id == "proj-fallback"
+    assert completed.room_id == "room-1"
+    assert completed.variation_id == "var-1"
+    assert completed.strategy == "retry"
+    assert completed.effective_strategy == "retry"
+    # ``elapsed_ms`` is operator-facing wall-clock from regen acceptance to
+    # terminal-event observation — NOT the pipeline's image-gen-only
+    # ``elapsed_ms`` (4321 in the mocked event above). We assert the field
+    # is present, integral, and non-negative; we do NOT pin a specific
+    # millisecond value because the wall-clock delta in tests is dominated
+    # by mock overhead and is intentionally non-deterministic.
+    assert isinstance(completed.elapsed_ms, int)
+    assert completed.elapsed_ms >= 0
+    assert completed.tokens_used == 567
+
+
+def test_regen_logs_started_and_completed_on_happy_fresh(
+    client, mock_staging_deps, caplog,
+):
+    """Issue 008 AC: a happy-path fresh emits exactly ``started`` and
+    ``completed`` (no fallback, no failed). ``strategy`` and
+    ``effective_strategy`` both equal ``fresh``.
+    """
+    caplog.set_level(_logging_for_regen_logs.INFO, logger=_REGEN_LOGGER_NAME)
+
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=True, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit living room", "features": []}
+
+    completed_event = {
+        "type": "variation_completed",
+        "room_id": "room-1",
+        "variation_index": 0,
+        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/new.png",
+        "error": None,
+        "elapsed_ms": 1500,
+        "tokens_used": 1200,
+        "model": "gpt-image-2",
+        "adapted_prompt": "fresh take",
+    }
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _psv_yielding(completed_event)), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    records = _regen_log_records(caplog)
+    events = [r.event for r in records]
+    assert events == [
+        "staging.variation_regen.started",
+        "staging.variation_regen.completed",
+    ], (
+        f"Happy fresh must emit exactly started+completed; got {events!r}"
+    )
+
+    started, completed = records
+    assert started.strategy == "fresh"
+    assert started.effective_strategy == "fresh"
+    assert completed.strategy == "fresh"
+    assert completed.effective_strategy == "fresh"
+    assert isinstance(completed.elapsed_ms, int)
+    assert completed.elapsed_ms >= 0
+    assert completed.tokens_used == 1200
+
+
+def test_regen_logs_started_fallback_to_fresh_completed_on_retry_no_prior(
+    client, mock_staging_deps, caplog,
+):
+    """Issue 008 AC: retry-with-no-prior-prompt emits ``started``,
+    ``fallback_to_fresh``, ``completed`` IN THAT ORDER.
+
+    On this path the user requested ``retry`` but no prior ``adapted_prompt``
+    is recorded, so the endpoint silently falls back to fresh prompt
+    generation (issue 004) and emits the ``variation_fallback`` SSE event.
+    The structured log line pairs with that SSE event.
+
+    ``strategy`` reflects the *requested* strategy ("retry");
+    ``effective_strategy`` reflects what was *actually* used ("fresh").
+    """
+    caplog.set_level(_logging_for_regen_logs.INFO, logger=_REGEN_LOGGER_NAME)
+
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=False, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit living room", "features": []}
+
+    completed_event = {
+        "type": "variation_completed",
+        "room_id": "room-1",
+        "variation_index": 0,
+        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/new.png",
+        "error": None,
+        "elapsed_ms": 2000,
+        "tokens_used": 800,
+        "model": "gpt-image-2",
+        "adapted_prompt": "fresh fallback take",
+    }
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _psv_yielding(completed_event)), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    records = _regen_log_records(caplog)
+    events = [r.event for r in records]
+    assert events == [
+        "staging.variation_regen.started",
+        "staging.variation_regen.fallback_to_fresh",
+        "staging.variation_regen.completed",
+    ], (
+        f"Retry with no prior prompt must emit started→fallback→completed "
+        f"in order; got {events!r}"
+    )
+
+    started, fallback, completed = records
+    # All three must agree on strategy="retry", effective_strategy="fresh".
+    for r in (started, fallback, completed):
+        assert r.project_id == "proj-fallback"
+        assert r.room_id == "room-1"
+        assert r.variation_id == "var-1"
+        assert r.strategy == "retry"
+        assert r.effective_strategy == "fresh"
+
+    # Only completed carries elapsed_ms / tokens_used; started + fallback
+    # do not (they're not "where applicable").
+    assert getattr(started, "elapsed_ms", None) is None
+    assert getattr(fallback, "elapsed_ms", None) is None
+    assert isinstance(completed.elapsed_ms, int)
+    assert completed.elapsed_ms >= 0
+    assert completed.tokens_used == 800
+
+
+def test_regen_logs_started_and_failed_on_failure(
+    client, mock_staging_deps, caplog,
+):
+    """Issue 008 AC: a terminal failure path emits ``started`` and ``failed``
+    (no ``completed``). The ``failed`` line still carries ``elapsed_ms``;
+    ``tokens_used`` is ``None`` on a failed image-gen path (the pipeline
+    surfaces it as None in the SSE event, see staging_pipeline.py).
+    """
+    caplog.set_level(_logging_for_regen_logs.INFO, logger=_REGEN_LOGGER_NAME)
+
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=True, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    failed_event = {
+        "type": "variation_failed",
+        "room_id": "room-1",
+        "variation_index": 0,
+        # On failure rollback, image_url is restored to the prior URL.
+        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/img.png",
+        "error": "Image generation failed: upstream 500",
+        "elapsed_ms": 800,
+        "tokens_used": None,
+        "model": "gpt-image-2",
+        "adapted_prompt": "PRIOR PROMPT TEXT",
+    }
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch.object(
+        StagingPipeline, "process_single_variation", _psv_yielding(failed_event),
+    ):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    records = _regen_log_records(caplog)
+    events = [r.event for r in records]
+    assert events == [
+        "staging.variation_regen.started",
+        "staging.variation_regen.failed",
+    ], (
+        f"Failure path must emit exactly started+failed (no completed); "
+        f"got {events!r}"
+    )
+
+    started, failed = records
+    assert started.strategy == "retry"
+    assert started.effective_strategy == "retry"
+
+    assert failed.project_id == "proj-fallback"
+    assert failed.room_id == "room-1"
+    assert failed.variation_id == "var-1"
+    assert failed.strategy == "retry"
+    assert failed.effective_strategy == "retry"
+    assert isinstance(failed.elapsed_ms, int)
+    assert failed.elapsed_ms >= 0
+    # tokens_used is explicitly carried even when None — log analytics needs
+    # to see "this was a no-LLM-call flow", not "this field was missing".
+    assert hasattr(failed, "tokens_used"), (
+        "failed log record must carry the tokens_used field even when None"
+    )
+    assert failed.tokens_used is None
+
+
+def test_regen_logs_started_and_failed_when_pipeline_raises_unexpectedly(
+    client, mock_staging_deps, caplog,
+):
+    """Issue 008 defense-in-depth (rubber-duck-driven): if the pipeline
+    raises an unexpected exception INSTEAD of yielding a terminal SSE event,
+    operator logs must still show ``started`` paired with ``failed``.
+
+    Without the ``except Exception`` branch in ``event_stream``, a stray
+    exception in ``process_single_variation`` (or in the prompt-generation
+    helpers above it) would leave a stranded ``started`` line in the logs
+    with no terminal partner — making it impossible for operators to
+    distinguish "this regen is still in flight" from "this regen crashed".
+
+    The synthesized ``failed`` line carries ``tokens_used=None`` (no image-
+    gen ever produced a token tally) and an integral wall-clock
+    ``elapsed_ms`` from regen acceptance to the moment the exception was
+    caught.
+    """
+    caplog.set_level(_logging_for_regen_logs.INFO, logger=_REGEN_LOGGER_NAME)
+
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=True, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    async def _psv_raises(self, *_args, **_kwargs):
+        raise RuntimeError("simulated upstream pipeline crash")
+        # (unreachable; required to make this a generator function so
+        # `async for` over it triggers the exception in event_stream.)
+        yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch.object(StagingPipeline, "process_single_variation", _psv_raises):
+        # The exception is raised *inside* the streaming response body.
+        # FastAPI/Starlette propagates streaming-body exceptions to the
+        # client by closing the connection mid-stream; the test client
+        # surfaces this either as the exception itself or as a truncated
+        # body. We don't care which — the assertion target is the log,
+        # not the HTTP wire format.
+        try:
+            with client.stream(
+                "POST",
+                "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+            ) as response:
+                assert response.status_code == 200, response.text
+                for _ in response.iter_bytes():
+                    pass
+        except RuntimeError:
+            pass
+
+    records = _regen_log_records(caplog)
+    events = [r.event for r in records]
+    assert events == [
+        "staging.variation_regen.started",
+        "staging.variation_regen.failed",
+    ], (
+        f"Pipeline raise must still produce started+failed (NOT a "
+        f"stranded started); got {events!r}"
+    )
+
+    started, failed = records
+    assert started.strategy == "retry"
+    assert started.effective_strategy == "retry"
+    assert failed.strategy == "retry"
+    assert failed.effective_strategy == "retry"
+    assert isinstance(failed.elapsed_ms, int)
+    assert failed.elapsed_ms >= 0
+    # No image-gen ever ran — tokens_used must be None, but the field MUST
+    # be present (so log analytics distinguishes "no token tally available"
+    # from "field missing on a non-terminal log line").
+    assert hasattr(failed, "tokens_used")
+    assert failed.tokens_used is None
