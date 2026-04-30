@@ -59,37 +59,36 @@ export function VariationThumbnail({
               fallbackText="Preview unavailable"
               overlay={
                 <>
-                  <Badge 
-                    variant="secondary" 
+                  <Badge
+                    variant="secondary"
                     className="absolute top-2 right-2 bg-black/70 text-white text-xs"
                   >
                     {index + 1}
                   </Badge>
                   {onRegenerate && (
-                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-200 rounded-lg flex items-center justify-center">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            className="opacity-0 group-hover:opacity-100 transition-opacity duration-200 h-8 w-8 p-0 rounded-full bg-white/90 hover:bg-white text-gray-700 shadow-md"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <RefreshCw className="h-4 w-4" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="center" side="top" className="w-48">
-                          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('retry'); }}>
-                            <RotateCcw className="h-4 w-4 mr-2" />
-                            Retry Same Prompt
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('fresh'); }}>
-                            <Sparkles className="h-4 w-4 mr-2" />
-                            Try Something New
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          aria-label={`Regenerate variation ${index + 1}`}
+                          className="absolute bottom-2 right-2 h-8 w-8 p-0 rounded-full bg-white/80 hover:bg-white text-gray-700 shadow-sm backdrop-blur-sm"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" side="top" className="w-48">
+                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('retry'); }}>
+                          <RotateCcw className="h-4 w-4 mr-2" />
+                          Retry Same Prompt
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('fresh'); }}>
+                          <Sparkles className="h-4 w-4 mr-2" />
+                          Try Something New
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   )}
                 </>
               }
@@ -174,7 +173,8 @@ export function VariationThumbnail({
   };
 
   return (
-    <div 
+    <div
+      aria-busy={!!isRegenerating}
       className={cn(
         "aspect-square w-full min-h-[120px] transition-all duration-200",
         onClick && status === 'completed' && "hover:scale-[1.02] hover:shadow-md"
