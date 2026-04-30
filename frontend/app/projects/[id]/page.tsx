@@ -312,6 +312,23 @@ export default function ProjectDetailPage() {
               ].filter(Boolean).join(' · ') || undefined,
             });
             break;
+          case 'variation_fallback':
+            // Issue 004 of single-variation-regeneration PRD: backend
+            // emits this when ``strategy=retry`` is requested but the
+            // variation has no prior ``adapted_prompt`` recorded. The
+            // regen continues normally; this is a one-line user
+            // notification that the retry silently became a fresh
+            // generation. Single info toast + activity-log entry — do
+            // NOT clear ``regeneratingVariationId`` (regen is still
+            // in flight).
+            activityLog.log({
+              level: 'info',
+              icon: 'ℹ',
+              message: `Variation ${variationIndex + 1}: no previous prompt found`,
+              detail: 'Generating a fresh take instead.',
+            });
+            toast.info('No previous prompt found — generating a fresh take instead.');
+            break;
           case 'variation_failed':
             activityLog.log({
               level: 'error',

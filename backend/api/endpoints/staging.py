@@ -432,6 +432,21 @@ async def regenerate_variation(
         final_status = "completed"
 
         try:
+            if fallback_to_fresh:
+                # Issue 004 of single-variation-regeneration PRD: surface
+                # the silent retry→fresh fallback as a dedicated SSE event
+                # so the frontend can toast "no previous prompt found —
+                # generating a fresh take instead." Emit BEFORE the heavy
+                # fresh-fallback prompt-generation work begins so the user
+                # sees the toast immediately. Continues normally to a
+                # terminal ``project_completed`` event — this is a
+                # notification, not a cancellation.
+                yield _sse_event("variation_fallback", {
+                    "room_id": room_id,
+                    "variation_id": variation_id,
+                    "reason": "no_prior_prompt",
+                })
+
             if strategy == "fresh" or fallback_to_fresh:
                 # Check for design brief first
                 if project.design_brief:

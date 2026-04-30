@@ -99,6 +99,7 @@ export type StagingStreamEventType =
   | 'variation_started' 
   | 'variation_completed' 
   | 'variation_failed' 
+  | 'variation_fallback'
   | 'project_completed' 
   | 'stream_ended'
   | 'error';

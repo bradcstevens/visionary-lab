@@ -902,3 +902,232 @@ def test_fresh_regen_no_prior_metadata_does_not_inject_steering(client, mock_sta
     sent = captured_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
     assert "REJECTED_PRIOR_DIRECTION" not in sent
     assert "REGENERATION STEERING" not in sent
+
+
+# ============================================================================
+# Issue 004 — Retry-to-fresh fallback signaling
+# ----------------------------------------------------------------------------
+# When a user picks ``Retry Same Prompt`` on a variation that has no prior
+# ``adapted_prompt`` recorded (legacy variation, or one that errored before
+# issue 001 closed the metadata-persistence gap), the backend silently falls
+# back to fresh prompt generation. This slice surfaces the fallback as a
+# dedicated ``variation_fallback`` SSE event so the frontend can toast the
+# user "no previous prompt found — generating a fresh take instead."
+#
+# Backend contract:
+#  - ``strategy=retry`` AND ``generation_metadata.adapted_prompt`` is missing
+#    → emit ``variation_fallback`` BEFORE the fresh-fallback prompt
+#    generation work begins. Payload:
+#       {"type": "variation_fallback",
+#        "room_id": "...", "variation_id": "...",
+#        "reason": "no_prior_prompt"}
+#  - ``strategy=retry`` AND prior prompt exists → no fallback event.
+#  - ``strategy=fresh`` (user explicit choice) → no fallback event.
+# ============================================================================
+
+
+def _parse_sse_stream(byte_chunks):
+    """Parse SSE-formatted bytes into a list of ``{type, ...data}`` dicts.
+
+    Joins the chunks into a single buffer and walks the standard
+    ``event:`` / ``data:`` framing emitted by ``_sse_event`` in the
+    endpoint. Used by the issue 004 fallback tests below.
+    """
+    buf = b"".join(byte_chunks).decode("utf-8")
+    events = []
+    current_event = None
+    current_data = None
+    for raw in buf.split("\n"):
+        line = raw.rstrip("\r")
+        if line.startswith("event: "):
+            current_event = line[7:].strip()
+        elif line.startswith("data: "):
+            current_data = line[6:]
+        elif line == "":
+            if current_event and current_data is not None:
+                try:
+                    parsed = _json_for_regen_tests.loads(current_data)
+                except _json_for_regen_tests.JSONDecodeError:
+                    parsed = {"raw": current_data}
+                if not isinstance(parsed, dict):
+                    parsed = {"value": parsed}
+                events.append({"type": current_event, **parsed})
+            current_event = None
+            current_data = None
+    return events
+
+
+def _project_for_fallback_test(*, with_prior_prompt: bool, with_brief: bool = False):
+    """Project containing one variation whose ``generation_metadata`` may or
+    may not include ``adapted_prompt``. Used by the fallback-event tests."""
+    project = {
+        "id": "proj-fallback",
+        "name": "Fallback Test",
+        "prompt": "Modern minimalist living room",
+        "status": "completed",
+        "rooms": [{
+            "id": "room-1",
+            "label": "Living Room",
+            "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/photo.png",
+            "status": "completed",
+            "analysis": {"description": "A sunlit living room", "features": ["floor"]},
+            "variations": [{
+                "id": "var-1",
+                "status": "completed",
+                "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/img.png",
+                "generation_metadata": (
+                    {"model": "gpt-image-2", "adapted_prompt": "PRIOR PROMPT TEXT", "generation_time_ms": 5000}
+                    if with_prior_prompt
+                    else {"model": "gpt-image-2", "generation_time_ms": 5000}
+                ),
+            }],
+        }],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "analyses": [{"room_id": "room-1", "description": "A sunlit living room", "features": ["floor"]}],
+    }
+    if with_brief:
+        project["design_brief"] = {
+            "global_instructions": "warm scandinavian palette",
+            "object_palette": [],
+            "placement_guide": {},
+            "per_image_notes": {},
+            "preserve_elements": [],
+            "per_image_objects": {},
+        }
+    return project
+
+
+def test_retry_no_prior_prompt_emits_variation_fallback_then_continues_normally(
+    client, mock_staging_deps,
+):
+    """Retry against a variation with no ``adapted_prompt`` must emit a
+    ``variation_fallback`` SSE event before doing fresh-fallback work, and
+    must continue to a terminal ``project_completed`` event (no early
+    termination)."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=False, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit living room", "features": []}
+
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    chunks: list[bytes] = []
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _empty_psv), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+
+    events = _parse_sse_stream(chunks)
+    types = [e["type"] for e in events]
+
+    fallback_events = [e for e in events if e["type"] == "variation_fallback"]
+    assert len(fallback_events) == 1, (
+        f"Expected exactly one variation_fallback event; got types={types}"
+    )
+    fb = fallback_events[0]
+    assert fb["room_id"] == "room-1"
+    assert fb["variation_id"] == "var-1"
+    assert fb["reason"] == "no_prior_prompt"
+
+    assert "project_completed" in types, (
+        f"Stream must reach terminal project_completed; got types={types}"
+    )
+
+    assert types.index("variation_fallback") < types.index("project_completed"), (
+        "variation_fallback must precede the terminal project_completed event"
+    )
+
+
+def test_retry_with_prior_prompt_does_not_emit_variation_fallback(
+    client, mock_staging_deps,
+):
+    """Retry against a variation whose ``generation_metadata.adapted_prompt``
+    is present must NOT emit ``variation_fallback`` — the prior prompt is
+    used as-is and there is no fallback."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=True, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    chunks: list[bytes] = []
+    with _patch.object(StagingPipeline, "process_single_variation", _empty_psv):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+
+    events = _parse_sse_stream(chunks)
+    types = [e["type"] for e in events]
+    assert "variation_fallback" not in types, (
+        f"Retry with valid prior prompt must NOT emit fallback event; "
+        f"got types={types}"
+    )
+
+
+def test_fresh_strategy_does_not_emit_variation_fallback(client, mock_staging_deps):
+    """``strategy=fresh`` is the user's explicit choice — it must not be
+    confused with a retry-fallback. Even when there is no prior prompt,
+    fresh must emit no fallback event."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_fallback_test(with_prior_prompt=False, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit living room", "features": []}
+
+    async def _empty_psv(self, *_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    chunks: list[bytes] = []
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _empty_psv), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-fallback/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+
+    events = _parse_sse_stream(chunks)
+    types = [e["type"] for e in events]
+    assert "variation_fallback" not in types, (
+        f"strategy=fresh must NOT emit fallback event; got types={types}"
+    )
