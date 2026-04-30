@@ -621,6 +621,117 @@ test.describe('Project Generation', () => {
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/10-variation-failure.png`, fullPage: true });
   });
+
+  test('failed-variation Retry regenerates only that variation, not the whole room', async ({ page }) => {
+    // Project starts with one failed variation alongside completed siblings.
+    // Clicking Retry on the failed thumbnail must hit the SINGLE-variation
+    // regen endpoint, NOT the room-wide regen endpoint, so completed siblings
+    // are preserved.
+    const projectWithFailure = makeMockProject({
+      status: 'completed',
+      rooms: [
+        makeRoom('room-1', 'Front Yard', 5, 'completed', [
+          { id: 'r1-v0', status: 'completed', image_url: 'https://example.com/v0.png', created_at: '', updated_at: '' },
+          { id: 'r1-v1', status: 'failed', error: 'Content policy violation', created_at: '', updated_at: '' },
+          { id: 'r1-v2', status: 'completed', image_url: 'https://example.com/v2.png', created_at: '', updated_at: '' },
+          { id: 'r1-v3', status: 'completed', image_url: 'https://example.com/v3.png', created_at: '', updated_at: '' },
+          { id: 'r1-v4', status: 'completed', image_url: 'https://example.com/v4.png', created_at: '', updated_at: '' },
+        ]),
+        makeRoom('room-2', 'Side Garden', 5),
+        makeRoom('room-3', 'Back Patio', 5),
+      ],
+    });
+
+    await setupMockedRoutes(page, projectWithFailure, projectWithFailure, '');
+
+    // Capture any regenerate requests so we can assert which endpoint was hit.
+    const regenRequests: string[] = [];
+    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`, (route: Route) => {
+      regenRequests.push(route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+        body: sseEvent('stream_ended', { type: 'stream_ended' }),
+      });
+    });
+
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // The failed thumbnail's Retry button is rendered inside the failed-state thumbnail.
+    const retryBtn = page.getByRole('button', { name: /Retry/i }).first();
+    await expect(retryBtn).toBeVisible();
+
+    const [request] = await Promise.all([
+      page.waitForRequest(
+        req => req.url().includes('/regenerate') && req.method() === 'POST',
+        { timeout: 5000 },
+      ),
+      retryBtn.click(),
+    ]);
+
+    // Critical assertion: must hit the variation-level endpoint, NOT room-level.
+    expect(request.url()).toContain('/variations/room-1-v1/regenerate');
+    expect(request.url()).toContain('strategy=fresh');
+    // And the room-level regen endpoint must NOT have been hit.
+    expect(request.url()).not.toMatch(/\/rooms\/[^/]+\/regenerate(\?|$)/);
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/10b-failed-retry-routes-to-variation-regen.png`,
+      fullPage: true,
+    });
+  });
+
+  test('room-header Regenerate still hits the room-level regen endpoint', async ({ page }) => {
+    // Guard against accidentally rerouting the room-header button alongside
+    // the failed-thumbnail Retry change. Room-level regen must remain.
+    const completed = makeMockProject({
+      status: 'completed',
+      rooms: [
+        makeRoom('room-1', 'Front Yard', 5, 'completed', [
+          { id: 'r1-v0', status: 'completed', image_url: 'https://example.com/v0.png', created_at: '', updated_at: '' },
+          { id: 'r1-v1', status: 'completed', image_url: 'https://example.com/v1.png', created_at: '', updated_at: '' },
+          { id: 'r1-v2', status: 'completed', image_url: 'https://example.com/v2.png', created_at: '', updated_at: '' },
+          { id: 'r1-v3', status: 'completed', image_url: 'https://example.com/v3.png', created_at: '', updated_at: '' },
+          { id: 'r1-v4', status: 'completed', image_url: 'https://example.com/v4.png', created_at: '', updated_at: '' },
+        ]),
+        makeRoom('room-2', 'Side Garden', 5, 'completed'),
+        makeRoom('room-3', 'Back Patio', 5, 'completed'),
+      ],
+    });
+
+    await setupMockedRoutes(page, completed, completed, '');
+
+    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`, (route: Route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+        body: sseEvent('stream_ended', { type: 'stream_ended' }),
+      }),
+    );
+
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // The room-header "Regenerate" button is the small ghost-style button
+    // adjacent to the room status badge.
+    const roomHeaderRegenBtn = page.getByRole('button', { name: /^Regenerate$/i }).first();
+    await expect(roomHeaderRegenBtn).toBeVisible();
+
+    const [request] = await Promise.all([
+      page.waitForRequest(
+        req => req.url().includes('/regenerate') && req.method() === 'POST',
+        { timeout: 5000 },
+      ),
+      roomHeaderRegenBtn.click(),
+    ]);
+
+    // Room-header regen must hit room-level endpoint, NOT variation-level.
+    expect(request.url()).toMatch(/\/rooms\/room-1\/regenerate(\?|$)/);
+    expect(request.url()).not.toContain('/variations/');
+  });
 });
 
 // ---------------------------------------------------------------------------

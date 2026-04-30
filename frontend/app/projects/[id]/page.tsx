@@ -344,8 +344,12 @@ export default function ProjectDetailPage() {
     handleRegenerateVariation(lightboxContext.room, lightboxContext.variationIndex, strategy);
   }, [lightboxContext, handleRegenerateVariation]);
 
-  const handleRetryVariation = (room: Room, _variationIndex: number) => {
-    handleRegenerateRoom(room);
+  const handleRetryVariation = (room: Room, variationIndex: number) => {
+    // Failed-variation Retry regenerates ONLY that variation, leaving sibling
+    // completed variations untouched. The room-header "Regenerate" button
+    // remains available for users who explicitly want a full-room redo.
+    // See PRD: prds/2026-04-29-single-variation-regeneration-prd.md (Frontend → RoomGroup).
+    handleRegenerateVariation(room, variationIndex, 'fresh');
   };
 
   const handleAddRooms = () => {

@@ -175,6 +175,14 @@ class StagingPipeline:
                         break
                     variation = room.variations[idx]
                     variation.status = ItemStatus.PROCESSING
+                    # Persist the attempted prompt BEFORE the image-gen call so a
+                    # subsequent retry can re-use it even if generation fails or
+                    # the worker process dies mid-call. See PRD Implementation
+                    # Decisions → Backend (`adapted_prompt` persistence bullet).
+                    variation.generation_metadata = {
+                        "model": project.settings.model,
+                        "adapted_prompt": adapted_prompt,
+                    }
                     self._update_room_in_project(project, room)
 
                     start_time = time.monotonic()
@@ -221,6 +229,7 @@ class StagingPipeline:
                                     "generation_time_ms": elapsed_ms,
                                 }
                             else:
+
                                 variation.status = ItemStatus.FAILED
                                 variation.error = "Save succeeded but no image URL returned"
                         else:
@@ -287,6 +296,14 @@ class StagingPipeline:
 
         async with self.semaphore:
             variation.status = ItemStatus.PROCESSING
+            # Persist the attempted prompt BEFORE the image-gen call so a
+            # subsequent retry can re-use it even if generation fails or the
+            # worker dies mid-call. See PRD Implementation Decisions → Backend
+            # (`adapted_prompt` persistence bullet).
+            variation.generation_metadata = {
+                "model": project.settings.model,
+                "adapted_prompt": adapted_prompt,
+            }
             self._update_room_in_project(project, room)
 
             start_time = time.monotonic()

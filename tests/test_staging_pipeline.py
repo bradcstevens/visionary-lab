@@ -332,3 +332,151 @@ async def test_process_single_variation_completes():
     assert completed_event["room_id"] == room.id
     assert variation.status == ItemStatus.COMPLETED
     assert variation.image_url is not None
+
+
+def _persisted_variation_for(mock_storage, room_id, variation_id):
+    """Return the most recent persisted variation dict for (room_id, variation_id)."""
+    found = None
+    for call in mock_storage.update_project.call_args_list:
+        # update_project signature: (project_id, project_dict)
+        args = call.args if call.args else ()
+        if len(args) < 2:
+            continue
+        project_dict = args[1]
+        for r in project_dict.get("rooms", []):
+            if r.get("id") != room_id:
+                continue
+            for v in r.get("variations", []):
+                if v.get("id") == variation_id:
+                    found = v
+    return found
+
+
+class TestFailedVariationPersistsAdaptedPrompt:
+    """Regression: failed variations must persist their attempted adapted_prompt
+    BEFORE the image-gen call, so a subsequent retry can re-use it."""
+
+    @pytest.mark.asyncio
+    async def test_process_room_persists_adapted_prompt_on_image_gen_failure(self):
+        """When image_pipeline.process_pipeline raises, the variation's
+        adapted_prompt must already be persisted to Cosmos so a later retry
+        can read it back."""
+        from backend.core.staging_pipeline import StagingPipeline
+
+        project = _make_project(n_rooms=1, n_variations=1)
+        room = project.rooms[0]
+        target_variation_id = room.variations[0].id
+
+        # Track the persisted adapted_prompt at the moment process_pipeline is invoked,
+        # not just after the failure has been handled.
+        persisted_prompt_at_call_time: dict = {}
+
+        mock_blob = MagicMock()
+        mock_blob.get_asset_content.return_value = (b"\x89PNG\r\n", "image/png")
+
+        mock_storage = MagicMock()
+        mock_storage.update_project = MagicMock()
+
+        mock_analyzer = AsyncMock()
+        mock_analyzer.async_image_chat.return_value = {
+            "description": "A modern room",
+            "features": [],
+        }
+
+        mock_llm = AsyncMock()
+        # The LLM will produce one adapted prompt
+        mock_llm.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='["Add a velvet teal sofa near the window"]'))]
+        )
+
+        async def _fail_after_inspecting_persistence(*_args, **_kwargs):
+            # By the time the pipeline is actually called, persistence must already
+            # contain the adapted_prompt for this variation.
+            v = _persisted_variation_for(mock_storage, room.id, target_variation_id)
+            persisted_prompt_at_call_time["value"] = (
+                (v or {}).get("generation_metadata", {}) or {}
+            ).get("adapted_prompt")
+            raise RuntimeError("simulated image-gen failure")
+
+        mock_pipeline = AsyncMock()
+        mock_pipeline.process_pipeline.side_effect = _fail_after_inspecting_persistence
+
+        staging = StagingPipeline(
+            async_llm_client=mock_llm,
+            llm_deployment="gpt-4o",
+            image_analyzer=mock_analyzer,
+            image_pipeline=mock_pipeline,
+            storage_service=mock_storage,
+            blob_service=mock_blob,
+        )
+
+        events = []
+        async for event in staging.process_room(project, room):
+            events.append(event)
+
+        # Persistence happened before the pipeline call, capturing the prompt:
+        assert persisted_prompt_at_call_time.get("value") == \
+            "Add a velvet teal sofa near the window", \
+            "adapted_prompt must be persisted to Cosmos BEFORE the image-gen call"
+
+        # Final state: variation is failed and still has the prompt on record:
+        assert room.variations[0].status == ItemStatus.FAILED
+        assert room.variations[0].generation_metadata is not None
+        # Existing convention in this codebase stores generation_metadata as a dict.
+        meta = room.variations[0].generation_metadata
+        meta_prompt = meta.get("adapted_prompt") if isinstance(meta, dict) else meta.adapted_prompt
+        assert meta_prompt == "Add a velvet teal sofa near the window"
+
+        # And the most recent persisted snapshot also carries the prompt:
+        final = _persisted_variation_for(mock_storage, room.id, target_variation_id)
+        assert final is not None
+        assert (final.get("generation_metadata") or {}).get("adapted_prompt") == \
+            "Add a velvet teal sofa near the window"
+
+    @pytest.mark.asyncio
+    async def test_process_single_variation_persists_adapted_prompt_on_image_gen_failure(self):
+        """Same regression for the single-variation regen pipeline."""
+        project = _make_project(n_rooms=1, n_variations=2)
+        room = project.rooms[0]
+        variation = room.variations[1]
+        adapted_prompt = "Add a sculptural pendant lamp over the dining table"
+
+        persisted_prompt_at_call_time: dict = {}
+
+        mock_storage = MagicMock()
+
+        async def _fail_after_inspecting_persistence(*_args, **_kwargs):
+            v = _persisted_variation_for(mock_storage, room.id, variation.id)
+            persisted_prompt_at_call_time["value"] = (
+                (v or {}).get("generation_metadata", {}) or {}
+            ).get("adapted_prompt")
+            raise RuntimeError("simulated image-gen failure")
+
+        with patch("backend.core.staging_pipeline.StagingPipeline.__init__", return_value=None):
+            pipeline = StagingPipeline.__new__(StagingPipeline)
+            pipeline.image_pipeline = AsyncMock()
+            pipeline.image_pipeline.process_pipeline.side_effect = _fail_after_inspecting_persistence
+            pipeline.blob_service = MagicMock()
+            pipeline.blob_service.get_asset_content.return_value = (b"fake-image-bytes", "image/png")
+            pipeline.storage_service = mock_storage
+            pipeline.semaphore = asyncio.Semaphore(1)
+
+            events = []
+            async for event in pipeline.process_single_variation(project, room, variation, adapted_prompt):
+                events.append(event)
+
+        # Persistence happened before the pipeline call:
+        assert persisted_prompt_at_call_time.get("value") == adapted_prompt, \
+            "adapted_prompt must be persisted to Cosmos BEFORE the image-gen call"
+
+        # Final state: variation is failed and still has the prompt on record:
+        assert variation.status == ItemStatus.FAILED
+        assert variation.generation_metadata is not None
+        meta = variation.generation_metadata
+        meta_prompt = meta.get("adapted_prompt") if isinstance(meta, dict) else meta.adapted_prompt
+        assert meta_prompt == adapted_prompt
+
+        # And the most recent persisted snapshot carries the prompt:
+        final = _persisted_variation_for(mock_storage, room.id, variation.id)
+        assert final is not None
+        assert (final.get("generation_metadata") or {}).get("adapted_prompt") == adapted_prompt
