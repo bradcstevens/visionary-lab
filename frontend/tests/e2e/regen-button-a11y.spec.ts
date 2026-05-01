@@ -173,7 +173,7 @@ test.describe('Regen button a11y (issue 007) — always-visible + keyboard', () 
       page.getByRole('menuitem', { name: /Retry Same Prompt/i }),
     ).toBeVisible();
     await expect(
-      page.getByRole('menuitem', { name: /Try Something New/i }),
+      page.getByRole('menuitem', { name: /Edit Prompt/i }),
     ).toBeVisible();
 
     // CRITICAL: activating the regen trigger MUST NOT open the lightbox.
@@ -202,7 +202,7 @@ test.describe('Regen button a11y (issue 007) — always-visible + keyboard', () 
       page.getByRole('menuitem', { name: /Retry Same Prompt/i }),
     ).toBeVisible();
     await expect(
-      page.getByRole('menuitem', { name: /Try Something New/i }),
+      page.getByRole('menuitem', { name: /Edit Prompt/i }),
     ).toBeVisible();
 
     await expect(page.locator('[data-slot="dialog-overlay"]')).toHaveCount(0);
@@ -235,7 +235,7 @@ test.describe('Regen button a11y (issue 007) — touch viewport', () => {
       page.getByRole('menuitem', { name: /Retry Same Prompt/i }),
     ).toBeVisible();
     await expect(
-      page.getByRole('menuitem', { name: /Try Something New/i }),
+      page.getByRole('menuitem', { name: /Edit Prompt/i }),
     ).toBeVisible();
 
     // Tapping the regen button must NOT open the lightbox.

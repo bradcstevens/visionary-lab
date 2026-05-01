@@ -18,7 +18,8 @@ import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
 import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
-import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, UpdateProjectBody } from "@/services/stagingApi";
+import { EditPromptDialog } from "@/components/staging/EditPromptDialog";
+import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, streamVariationEditPrompt, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -39,6 +40,15 @@ export default function ProjectDetailPage() {
   const [isResetting, setIsResetting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showSettingsSheet, setShowSettingsSheet] = useState(false);
+  // Issue 004 of projects-page-improvements PRD: per-variation Edit
+  // Prompt opens an inline Dialog with the source variation's prior
+  // adapted_prompt prefilled. The state captures BOTH the room and
+  // variation index so the dialog can read the source variation's
+  // metadata at render time (and falls back to project.prompt with a
+  // notice when generation_metadata.adapted_prompt is missing).
+  const [editPromptTarget, setEditPromptTarget] = useState<
+    { roomId: string; variationIndex: number } | null
+  >(null);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [regeneratingVariationId, setRegeneratingVariationId] = useState<string | null>(null);
   const streamCleanupRef = useRef<(() => void) | null>(null);
@@ -301,6 +311,109 @@ export default function ProjectDetailPage() {
     if (!room) return;
     handleRegenerateVariation(room, lightboxImage.variationIndex, strategy);
   }, [lightboxImage, project, handleRegenerateVariation]);
+
+  // Issue 004 of projects-page-improvements PRD: open the Edit Prompt
+  // dialog. Just records the target — submission goes through
+  // ``handleEditPromptSubmit`` below. Opening is allowed mid-
+  // generation (the dialog itself disables Generate via the dialog's
+  // ``isBlocked`` prop) so the user can preview / draft prompts
+  // without waiting for the current run to finish.
+  const handleEditPromptVariation = useCallback((room: Room, variationIndex: number) => {
+    setEditPromptTarget({ roomId: room.id, variationIndex });
+  }, []);
+
+  const handleEditPromptSubmit = useCallback(async (adaptedPrompt: string): Promise<void> => {
+    if (!editPromptTarget || !project) return;
+    if (isGenerating || regeneratingVariationId) {
+      toast.error('Wait for the current generation to finish before editing prompts.');
+      throw new Error('Generation in flight');
+    }
+    const room = project.rooms.find((r) => r.id === editPromptTarget.roomId);
+    if (!room) {
+      throw new Error('Room not found');
+    }
+    const variation = room.variations[editPromptTarget.variationIndex];
+    if (!variation) {
+      throw new Error('Variation not found');
+    }
+
+    // Mark the source variation as the "in flight" one so the
+    // existing busy-gate semantics apply (lightbox-blocked, retry-
+    // queue gating, etc.). The backend appends a NEW variation —
+    // we'll only learn its ID when loadProject() runs after
+    // project_completed lands. Meanwhile, gating on the source ID
+    // is a reasonable proxy: it's the user-visible "thing being
+    // edited" until the new variation surfaces in the UI.
+    setRegeneratingVariationId(variation.id);
+
+    return new Promise<void>((resolve, reject) => {
+      const variationLabel = `Variation ${editPromptTarget.variationIndex + 1}`;
+      const cleanup = streamVariationEditPrompt(
+        projectId,
+        room.id,
+        variation.id,
+        adaptedPrompt,
+        (event) => {
+          switch (event.type) {
+            case 'variation_completed': {
+              const completed = event as {
+                type: 'variation_completed';
+                model?: string;
+                tokens_used?: number;
+                elapsed_ms?: number;
+                adapted_prompt?: string;
+              };
+              const adapted = completed.adapted_prompt;
+              const snippet =
+                typeof adapted === 'string' && adapted.length > 0
+                  ? adapted.slice(0, 60) + (adapted.length > 60 ? '…' : '')
+                  : null;
+              activityLog.log({
+                level: 'success',
+                icon: '✓',
+                message: `${variationLabel}: new variation appended from edited prompt`,
+                detail: [
+                  completed.model,
+                  completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
+                  completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
+                  snippet,
+                ].filter(Boolean).join(' · ') || undefined,
+              });
+              break;
+            }
+            case 'variation_failed':
+              activityLog.log({
+                level: 'error',
+                icon: '✕',
+                message: `${variationLabel}: edit-prompt generation failed`,
+                detail: (event as { error?: string }).error || 'Unknown error',
+              });
+              toast.error(`Edit Prompt failed: ${(event as { error?: string }).error || 'Unknown error'}`);
+              break;
+            case 'project_completed':
+            case 'stream_ended':
+              setRegeneratingVariationId(null);
+              setEditPromptTarget(null);
+              loadProject();
+              resolve();
+              break;
+            case 'error':
+              setRegeneratingVariationId(null);
+              toast.error(event.error || 'Edit Prompt failed');
+              loadProject();
+              reject(new Error(event.error || 'Edit Prompt failed'));
+              break;
+          }
+        },
+      );
+
+      const previousCleanup = streamCleanupRef.current;
+      streamCleanupRef.current = () => {
+        cleanup();
+        previousCleanup?.();
+      };
+    });
+  }, [editPromptTarget, project, projectId, isGenerating, regeneratingVariationId, activityLog, loadProject]);
 
   // Issue 002 of failed-variation-retry-queue PRD: per-page in-memory
   // retry queue. Failed-variation Retry clicks during in-flight
@@ -847,6 +960,7 @@ export default function ProjectDetailPage() {
               onRetryVariation={handleRetryVariation}
               onRegenerateRoom={handleRegenerateRoom}
               onRegenerateVariation={handleRegenerateVariation}
+              onEditPromptVariation={handleEditPromptVariation}
               onUpdateAddendum={handleUpdateRoomAddendum}
               regeneratingVariationId={regeneratingVariationId}
               isGenerating={isGenerating}
@@ -911,6 +1025,30 @@ export default function ProjectDetailPage() {
         project={project}
         onSave={handleProjectSettingsSave}
       />
+
+      {/* Edit Prompt dialog — issue 004 of projects-page-improvements
+          PRD. Replaces the prior "Try Something New" destructive
+          action with an explicit prompt-edit flow that APPENDS a new
+          variation alongside the original (preserves the original for
+          A/B comparison). Only renders when a target is set. */}
+      {editPromptTarget && (() => {
+        const room = project.rooms.find((r) => r.id === editPromptTarget.roomId);
+        const variation = room?.variations[editPromptTarget.variationIndex];
+        const initialPrompt = variation?.generation_metadata?.adapted_prompt;
+        return (
+          <EditPromptDialog
+            open
+            onOpenChange={(open) => {
+              if (!open) setEditPromptTarget(null);
+            }}
+            initialPrompt={initialPrompt}
+            fallbackPrompt={project.prompt}
+            variationLabel={`Variation ${editPromptTarget.variationIndex + 1}`}
+            isBlocked={isGenerating || regeneratingVariationId !== null}
+            onSubmit={handleEditPromptSubmit}
+          />
+        );
+      })()}
     </div>
   );
 }

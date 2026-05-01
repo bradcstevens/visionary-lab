@@ -1,6 +1,6 @@
 "use client"
 
-import { AlertCircle, RefreshCw, Loader2, RotateCcw, Sparkles, Clock } from "lucide-react";
+import { AlertCircle, RefreshCw, Loader2, RotateCcw, Pencil, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -21,6 +21,12 @@ interface VariationThumbnailProps {
   onClick?: () => void;
   onRetry?: () => void;
   onRegenerate?: (strategy: 'retry' | 'fresh') => void;
+  // Issue 004 of projects-page-improvements PRD: per-variation Edit
+  // Prompt opens a dialog with the variation's prior adapted_prompt
+  // prefilled. Distinct from onRegenerate('fresh') (the prior "Try
+  // Something New") because Edit Prompt APPENDS a new variation
+  // instead of mutating in place.
+  onEditPrompt?: () => void;
   isRegenerating?: boolean;
   isQueued?: boolean;
 }
@@ -33,6 +39,7 @@ export function VariationThumbnail({
   onClick, 
   onRetry,
   onRegenerate,
+  onEditPrompt,
   isRegenerating,
   isQueued,
 }: VariationThumbnailProps) {
@@ -67,7 +74,7 @@ export function VariationThumbnail({
                   >
                     {index + 1}
                   </Badge>
-                  {onRegenerate && (
+                  {(onRegenerate || onEditPrompt) && (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -76,19 +83,30 @@ export function VariationThumbnail({
                           aria-label={`Regenerate variation ${index + 1}`}
                           className="absolute bottom-2 right-2 h-8 w-8 p-0 rounded-full bg-white/80 hover:bg-white text-gray-700 shadow-sm backdrop-blur-sm"
                           onClick={(e) => e.stopPropagation()}
+                          data-testid={`variation-${index + 1}-regen-trigger`}
                         >
                           <RefreshCw className="h-3.5 w-3.5" />
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" side="top" className="w-48">
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('retry'); }}>
-                          <RotateCcw className="h-4 w-4 mr-2" />
-                          Retry Same Prompt
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); onRegenerate('fresh'); }}>
-                          <Sparkles className="h-4 w-4 mr-2" />
-                          Try Something New
-                        </DropdownMenuItem>
+                        {onRegenerate && (
+                          <DropdownMenuItem
+                            onClick={(e) => { e.stopPropagation(); onRegenerate('retry'); }}
+                            data-testid={`variation-${index + 1}-retry-same-prompt`}
+                          >
+                            <RotateCcw className="h-4 w-4 mr-2" />
+                            Retry Same Prompt
+                          </DropdownMenuItem>
+                        )}
+                        {onEditPrompt && (
+                          <DropdownMenuItem
+                            onClick={(e) => { e.stopPropagation(); onEditPrompt(); }}
+                            data-testid={`variation-${index + 1}-edit-prompt`}
+                          >
+                            <Pencil className="h-4 w-4 mr-2" />
+                            Edit Prompt
+                          </DropdownMenuItem>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   )}

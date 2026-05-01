@@ -183,6 +183,36 @@ class UpdateProjectRequest(BaseModel):
         return v
 
 
+class EditPromptRequest(BaseModel):
+    """Body for ``POST /projects/{id}/rooms/{rid}/variations/{vid}/edit-prompt``
+    (issue 004 of the projects-page-improvements PRD).
+
+    The user-supplied ``adapted_prompt`` is the ENTIRE base of the new
+    variation's prompt — ``BriefGeneratorService.brief_to_prompts`` is
+    bypassed entirely on this path so the user's text is authoritative.
+    The room's ``prompt_addendum`` (if any) is still composed onto the
+    end of the prompt by ``PromptComposer``.
+
+    Required field; empty / whitespace-only → 422 (clients shouldn't
+    send no-op edits — there's a Cancel button for that).
+    """
+    adapted_prompt: str = Field(
+        ...,
+        description=(
+            "User-typed prompt that becomes the variation's base. Bypasses "
+            "the design brief; the room's prompt_addendum is still appended."
+        ),
+    )
+
+    @validator("adapted_prompt")
+    def _adapted_prompt_non_empty(cls, v):
+        if v is None:
+            raise ValueError("adapted_prompt is required")
+        if not v.strip():
+            raise ValueError("adapted_prompt cannot be empty or whitespace-only")
+        return v
+
+
 class UploadRoomsResponse(BaseModel):
     project_id: str
     rooms_added: int

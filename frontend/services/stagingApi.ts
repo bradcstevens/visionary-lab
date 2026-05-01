@@ -37,11 +37,17 @@ export interface StagingSettings {
 }
 
 export interface GenerationMetadata {
-  generated_at: string;
-  model_version: string;
-  processing_time_ms: number;
-  prompt_tokens?: number;
-  completion_tokens?: number;
+  // Aligned with backend ``backend.models.staging.GenerationMetadata``.
+  // Issue 002 of projects-page-improvements PRD: prior shape was a
+  // bogus subset (``generated_at`` / ``model_version`` /
+  // ``processing_time_ms`` / ``prompt_tokens`` / ``completion_tokens``)
+  // that never matched what the backend actually serializes. Issue 004
+  // (per-variation Edit Prompt) needs to read ``adapted_prompt`` to
+  // prefill the dialog textarea, so the shape is now corrected.
+  model?: string;
+  adapted_prompt?: string;
+  tokens_used?: number;
+  generation_time_ms?: number;
 }
 
 export interface Variation {
@@ -49,7 +55,9 @@ export interface Variation {
   status: 'pending' | 'processing' | 'completed' | 'failed';
   image_url?: string;
   error?: string;
-  metadata?: GenerationMetadata;
+  // Backend serializes ``generation_metadata`` (issue 002 fix renamed
+  // the prior frontend ``metadata?`` field which never matched).
+  generation_metadata?: GenerationMetadata;
   created_at: string;
   updated_at: string;
 }
@@ -618,6 +626,118 @@ export function streamVariationRegeneration(
 
   fetch(url, {
     method: 'POST',
+    signal: abortController.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const errorText = await response.text();
+        onEvent({ type: 'error', error: `HTTP ${response.status}: ${errorText}` });
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onEvent({ type: 'error', error: 'No response body' });
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEventType: string | null = null;
+      let currentData: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            currentData = line.slice(6);
+          } else if (line === '' && currentEventType && currentData) {
+            try {
+              const parsedData = JSON.parse(currentData);
+              const event: StagingStreamEvent = {
+                type: currentEventType as StagingStreamEventType,
+                ...parsedData,
+              };
+
+              if (currentEventType === 'project_completed' || currentEventType === 'error') {
+                receivedTerminalEvent = true;
+              }
+
+              if (API_DEBUG) {
+                console.log('SSE event:', event);
+              }
+
+              onEvent(event);
+            } catch (parseError) {
+              console.error('Failed to parse SSE data:', currentData, parseError);
+            }
+
+            currentEventType = null;
+            currentData = null;
+          }
+        }
+      }
+
+      if (!receivedTerminalEvent) {
+        onEvent({ type: 'stream_ended' });
+      }
+    })
+    .catch((error) => {
+      if (error.name === 'AbortError') return;
+      console.error('SSE stream error:', error);
+      onEvent({ type: 'error', error: error.message || 'Stream error' });
+    });
+
+  return () => {
+    abortController.abort();
+  };
+}
+
+/**
+ * Stream a per-variation Edit Prompt request — issue 004 of the
+ * projects-page-improvements PRD.
+ *
+ * Posts to ``POST /projects/{pid}/rooms/{rid}/variations/{vid}/edit-prompt``
+ * with a JSON body of ``{adapted_prompt: string}``. The backend appends
+ * a fresh variation generated from the user-supplied prompt — the
+ * source variation identified by ``variationId`` is preserved
+ * untouched (the whole point of Edit Prompt vs Try Something New).
+ *
+ * Mirrors the SSE stream / abort / terminal-event accounting of
+ * ``streamVariationRegeneration``. The only differences are the URL
+ * suffix (``/edit-prompt`` vs ``/regenerate``) and the JSON body
+ * (Edit Prompt sends the user-typed text instead of a query-string
+ * strategy).
+ */
+export function streamVariationEditPrompt(
+  projectId: string,
+  roomId: string,
+  variationId: string,
+  adaptedPrompt: string,
+  onEvent: StagingStreamEventCallback,
+): () => void {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}/variations/${variationId}/edit-prompt`;
+
+  if (API_DEBUG) {
+    console.log(`Starting SSE stream for variation edit-prompt`);
+    console.log(`POST ${url}`);
+  }
+
+  const abortController = new AbortController();
+  let receivedTerminalEvent = false;
+
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ adapted_prompt: adaptedPrompt }),
     signal: abortController.signal,
   })
     .then(async (response) => {

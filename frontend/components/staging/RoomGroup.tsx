@@ -16,13 +16,16 @@ interface RoomGroupProps {
   onRetryVariation?: (room: Room, variationIndex: number) => void;
   onRegenerateRoom?: (room: Room) => void;
   onRegenerateVariation?: (room: Room, variationIndex: number, strategy: 'retry' | 'fresh') => void;
+  // Issue 004 of projects-page-improvements PRD: opens the Edit Prompt
+  // dialog for the chosen variation (parent owns the dialog state).
+  onEditPromptVariation?: (room: Room, variationIndex: number) => void;
   onUpdateAddendum?: (room: Room, promptAddendum: string | null) => Promise<void>;
   regeneratingVariationId?: string | null;
   isGenerating?: boolean;
   queuedVariationIds?: ReadonlySet<string>;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onUpdateAddendum, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
   // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
   // the projects-page-improvements PRD). The draft is reset to the persisted
   // value every time the popover opens so a Cancel followed by another open
@@ -241,6 +244,11 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
             onRegenerate={
               variation.status === 'completed' && onRegenerateVariation && !isGenerating
                 ? (strategy) => onRegenerateVariation(room, index, strategy)
+                : undefined
+            }
+            onEditPrompt={
+              variation.status === 'completed' && onEditPromptVariation && !isGenerating
+                ? () => onEditPromptVariation(room, index)
                 : undefined
             }
             isRegenerating={regeneratingVariationId === variation.id}

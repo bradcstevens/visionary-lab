@@ -25,6 +25,7 @@ from backend.models.design_brief import (
 )
 from backend.models.staging import (
     CreateProjectRequest,
+    EditPromptRequest,
     ItemStatus,
     ProjectListResponse,
     ProjectResponse,
@@ -900,6 +901,293 @@ async def regenerate_variation(
                     variation_id=variation_id,
                     strategy=strategy,
                     effective_strategy=effective_strategy,
+                    elapsed_ms=terminal_elapsed_ms,
+                    tokens_used=terminal_tokens_used,
+                )
+
+        yield _sse_event("project_completed", {"status": final_status})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _log_edit_prompt_event(
+    *,
+    event: str,
+    project_id: str,
+    room_id: str,
+    new_variation_id: str,
+    source_variation_id: str,
+    elapsed_ms: Optional[int] = None,
+    tokens_used: Optional[int] = None,
+) -> None:
+    """Emit a structured log line for an Edit Prompt lifecycle event.
+
+    Issue 004 of the projects-page-improvements PRD § Solution → 4 +
+    Implementation Decisions → Backend modules: log analytics needs to
+    count Edit Prompt usage SEPARATELY from regen usage so dashboards
+    can answer "how often do users actually edit prompts vs retry vs
+    try-something-new". Therefore the event names form a dedicated
+    family ``staging.variation_edit_prompt.{started, completed, failed}``
+    instead of aliasing the existing ``staging.variation_regen.*`` lines.
+
+    Field contract (mirrors ``_log_regen_event`` for analytics
+    consistency, minus the regen-specific ``strategy`` /
+    ``effective_strategy`` fields which don't apply here):
+
+    - ``project_id`` / ``room_id`` / ``new_variation_id`` /
+      ``source_variation_id`` — entity identifiers. ``source_variation_id``
+      lets analytics trace which existing variation triggered each Edit
+      Prompt; ``new_variation_id`` identifies the freshly-appended one.
+    - ``elapsed_ms`` — wall-clock milliseconds from request acceptance
+      to terminal-event observation. Sourced from ``time.monotonic()``
+      deltas in the endpoint so the operator-facing total includes
+      preflight + image-gen + persistence (NOT the pipeline's image-gen-
+      only ``elapsed_ms``). Carried on ``completed`` / ``failed``.
+    - ``tokens_used`` — image-gen token usage from the pipeline's
+      terminal event (``None`` for failed image-gen). Carried on
+      ``completed`` / ``failed`` even when None so consumers can
+      distinguish "no image-gen happened" from "field missing".
+    """
+    extra = {
+        "event": event,
+        "project_id": project_id,
+        "room_id": room_id,
+        "new_variation_id": new_variation_id,
+        "source_variation_id": source_variation_id,
+    }
+    parts = [
+        f"event={event}",
+        f"project_id={project_id}",
+        f"room_id={room_id}",
+        f"new_variation_id={new_variation_id}",
+        f"source_variation_id={source_variation_id}",
+    ]
+    is_terminal = event.endswith(".completed") or event.endswith(".failed")
+    if is_terminal:
+        extra["elapsed_ms"] = elapsed_ms
+        parts.append(f"elapsed_ms={elapsed_ms}")
+        extra["tokens_used"] = tokens_used
+        parts.append(f"tokens_used={tokens_used}")
+
+    logger.info(" ".join(parts), extra=extra)
+
+
+@router.post("/projects/{project_id}/rooms/{room_id}/variations/{variation_id}/edit-prompt")
+async def edit_variation_prompt(
+    project_id: str,
+    room_id: str,
+    variation_id: str,
+    body: EditPromptRequest,
+    storage: StagingStorageService = Depends(get_staging_storage),
+    pipeline=Depends(get_staging_pipeline),
+):
+    """Append a NEW variation generated from a user-edited prompt.
+
+    Issue 004 of the projects-page-improvements PRD: lets users edit
+    the prompt that produced a generated image and have the new image
+    appear as a fresh variation alongside the original — preserving
+    the original for A/B comparison.
+
+    Distinct from ``regenerate_variation`` which mutates the existing
+    variation in place. The ``variation_id`` URL segment identifies the
+    "source" variation the user clicked Edit on but is NOT mutated by
+    this endpoint; a fresh ``Variation`` is appended to
+    ``room.variations`` with its own UUID.
+
+    Pipeline path bypasses ``BriefGeneratorService.brief_to_prompts``
+    entirely: the user's text flows straight through
+    ``PromptComposer.compose`` as ``variation_override``. The room's
+    ``prompt_addendum`` (issue 003) is still composed onto the end so
+    the addendum constraint applies even to user-typed prompts.
+
+    Concurrency: the preflight read-append-write is wrapped in the
+    per-project asyncio lock (issue 002 pattern) — appending to a list
+    is more racy than the regen preflight's status flip, so the lock
+    is mandatory here even though ``regenerate_variation`` historically
+    didn't have one. The finalizer write is also wrapped in the lock
+    (mirrors the regen finalizer pattern).
+
+    Status fix-up: ``process_single_variation``'s built-in failure
+    rollback restores ``prior_status`` for the variation, which for an
+    appended variation pre-set to PROCESSING means it would strand in
+    PROCESSING after a failure. The endpoint's finally block detects
+    this and forces the variation to FAILED with the captured error
+    message so the room/project status calculator sees a truthful
+    terminal state.
+    """
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
+    project = StagingProject(**clean)
+
+    room = next((r for r in project.rooms if r.id == room_id), None)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    source_variation = next((v for v in room.variations if v.id == variation_id), None)
+    if not source_variation:
+        raise HTTPException(status_code=404, detail="Variation not found")
+
+    # 409 mutex: don't accept Edit Prompt while the source variation is
+    # mid-regen. Mirrors regenerate_variation's PROCESSING guard.
+    if source_variation.status == ItemStatus.PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail="Source variation is currently being processed; wait for it to finish before editing its prompt",
+        )
+
+    # Compose the final adapted_prompt. The user's text is the
+    # variation_override (highest precedence in PromptComposer); the
+    # room's prompt_addendum is layered on top per slice 003 contract.
+    # design_brief=None bypasses BriefGeneratorService entirely per
+    # PRD § Solution → 4.
+    composed_prompt = PromptComposer.compose(
+        project_prompt=project.prompt,
+        design_brief=None,
+        room_addendum=room.prompt_addendum,
+        variation_override=body.adapted_prompt,
+    )
+
+    # Append a fresh variation. Preset status=PROCESSING so concurrent
+    # callers see it as in-flight (the 409 mutex above keys off this
+    # state). Capture the new ID before appending so we can locate the
+    # variation in fresh storage reads later.
+    new_variation = Variation(
+        id=str(uuid.uuid4()),
+        status=ItemStatus.PROCESSING,
+    )
+
+    # Preflight write — wrapped in the per-project lock per the rubber-
+    # duck-flagged blocker. Appending to room.variations is a list-
+    # append; outside the lock a concurrent worker write to room.status
+    # or sibling-variation state could clobber the append (Cosmos
+    # writes are full-doc replacements). The per-project lock pattern
+    # (issue 002) serializes us with both pipeline workers
+    # (`_persist_project_locked`) and PATCH endpoints.
+    async with _get_project_lock(project_id):
+        # Re-read inside the lock so we observe any concurrent worker
+        # writes that landed between our pre-lock read and now.
+        fresh = storage.get_project(project_id)
+        if not fresh:
+            raise HTTPException(status_code=404, detail="Project not found")
+        clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+        project = StagingProject(**clean_fresh)
+        room = next((r for r in project.rooms if r.id == room_id), None)
+        if not room:
+            raise HTTPException(status_code=404, detail="Room not found")
+        # Re-validate the source variation under the lock — a concurrent
+        # delete or status flip could have raced past our pre-lock check.
+        source_variation = next((v for v in room.variations if v.id == variation_id), None)
+        if not source_variation:
+            raise HTTPException(status_code=404, detail="Variation not found")
+        if source_variation.status == ItemStatus.PROCESSING:
+            raise HTTPException(status_code=409, detail="Source variation is currently being processed")
+        room.variations.append(new_variation)
+        room.status = ItemStatus.PROCESSING
+        storage.update_project(project_id, json.loads(project.json()))
+
+    # Started log fires AFTER the preflight write succeeds — same
+    # pattern as regenerate_variation: a write-failure path doesn't
+    # leave a stranded "started" log line with no terminal partner.
+    edit_prompt_start_time = time.monotonic()
+    _log_edit_prompt_event(
+        event="staging.variation_edit_prompt.started",
+        project_id=project_id,
+        room_id=room_id,
+        new_variation_id=new_variation.id,
+        source_variation_id=variation_id,
+    )
+
+    async def event_stream():
+        terminal_event_type: Optional[str] = None
+        terminal_elapsed_ms: Optional[int] = None
+        terminal_tokens_used: Optional[int] = None
+        terminal_error_message: Optional[str] = None
+        final_status = "completed"
+
+        try:
+            async for event in pipeline.process_single_variation(
+                project, room, new_variation, composed_prompt
+            ):
+                if event.get("type") in ("variation_completed", "variation_failed"):
+                    terminal_event_type = event["type"]
+                    terminal_elapsed_ms = int((time.monotonic() - edit_prompt_start_time) * 1000)
+                    terminal_tokens_used = event.get("tokens_used")
+                    if event["type"] == "variation_failed":
+                        terminal_error_message = event.get("error") or "Generation failed"
+                yield _sse_event(event["type"], event)
+        except Exception:
+            # Defense-in-depth: if the pipeline raises instead of
+            # yielding a terminal event, synthesize a failure so the
+            # log line + finalizer fix-up still fire.
+            if terminal_event_type is None:
+                terminal_event_type = "variation_failed"
+                terminal_elapsed_ms = int((time.monotonic() - edit_prompt_start_time) * 1000)
+                terminal_tokens_used = None
+                terminal_error_message = "Generation failed (pipeline exception)"
+            raise
+        finally:
+            # Recompute room + project status under the per-project
+            # lock so we serialize with any concurrent worker writes.
+            # ALSO: force the appended variation to FAILED if it didn't
+            # reach a terminal-success state — process_single_variation's
+            # built-in rollback restores prior_status (PROCESSING for an
+            # appended variation), which would otherwise strand the new
+            # variation forever. See test
+            # `test_edit_prompt_failure_marks_appended_variation_failed_not_stranded`.
+            async with _get_project_lock(project_id):
+                fresh = storage.get_project(project_id)
+                if fresh:
+                    clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+                    fresh_project = StagingProject(**clean_fresh)
+                    target_room = next((r for r in fresh_project.rooms if r.id == room_id), None)
+                    if target_room:
+                        # Find our appended variation in the fresh state.
+                        appended = next(
+                            (v for v in target_room.variations if v.id == new_variation.id),
+                            None,
+                        )
+                        if appended is not None and appended.status != ItemStatus.COMPLETED:
+                            # Force to FAILED so the room calculator sees a
+                            # terminal state. Use the captured error or a
+                            # generic fallback if no terminal SSE event was
+                            # observed (e.g. client disconnect before any
+                            # event landed).
+                            appended.status = ItemStatus.FAILED
+                            appended.error = (
+                                terminal_error_message
+                                or appended.error
+                                or "Edit Prompt generation did not complete"
+                            )
+                        # Recompute room status (mirrors
+                        # regenerate_variation's per-room rule).
+                        any_completed = any(v.status == "completed" for v in target_room.variations)
+                        any_pending = any(v.status in ("pending", "processing") for v in target_room.variations)
+                        if any_pending:
+                            target_room.status = "processing"
+                        elif any_completed:
+                            target_room.status = "completed"
+                        else:
+                            target_room.status = "failed"
+                    # Single source of truth for project status (issue 001).
+                    fresh_project.status = ProjectStatusCalculator.compute_status(fresh_project.rooms)
+                    storage.update_project(project_id, json.loads(fresh_project.json()))
+                    final_status = fresh_project.status
+
+            if terminal_event_type is not None:
+                terminal_log_event = (
+                    "staging.variation_edit_prompt.completed"
+                    if terminal_event_type == "variation_completed"
+                    else "staging.variation_edit_prompt.failed"
+                )
+                _log_edit_prompt_event(
+                    event=terminal_log_event,
+                    project_id=project_id,
+                    room_id=room_id,
+                    new_variation_id=new_variation.id,
+                    source_variation_id=variation_id,
                     elapsed_ms=terminal_elapsed_ms,
                     tokens_used=terminal_tokens_used,
                 )
