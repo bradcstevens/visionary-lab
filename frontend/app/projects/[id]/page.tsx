@@ -238,37 +238,6 @@ export default function ProjectDetailPage() {
     }
   }, [activityLog, debouncedReload, loadProject]);
 
-  const startGeneration = useCallback(() => {
-    if (isGenerating) return;
-    // Abort any existing stream before starting a new one
-    streamCleanupRef.current?.();
-    setIsGenerating(true);
-    setGenerationError(null);
-    activityLog.log({
-      level: 'info',
-      icon: '▶',
-      message: `Starting generation for "${project?.name}"`,
-      detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
-    });
-    streamCleanupRef.current = streamGeneration(projectId, handleStreamEvent);
-  }, [activityLog, project, totalVariations, isGenerating, projectId, handleStreamEvent]);
-
-  const handleRegenerateRoom = useCallback((room: Room) => {
-    if (isGenerating) return;
-    // Abort any existing stream before starting a new one
-    streamCleanupRef.current?.();
-    setIsGenerating(true);
-    setGenerationError(null);
-    toast.info(`Regenerating ${room.label}...`);
-    streamCleanupRef.current = streamRoomRegeneration(projectId, room.id, handleStreamEvent);
-  }, [isGenerating, projectId, handleStreamEvent]);
-
-  const handleRegenerateAll = () => {
-    if (isGenerating) return;
-    startGeneration();
-    toast.info('Regenerating all rooms...');
-  };
-
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
     if (variation.status === 'completed' && variation.image_url) {
@@ -436,6 +405,59 @@ export default function ProjectDetailPage() {
     onDispatch: handleRegenerateVariation,
     onDrop: onDropQueuedRetry,
   });
+
+  // Issue 003 of failed-variation-retry-queue PRD: the three "larger
+  // regen action" entry points — startGeneration (Generate Remaining
+  // / first Generate), handleRegenerateRoom (per-room Regenerate),
+  // handleRegenerateAll (Regenerate All) — each call ``retryQueue.clear()``
+  // BEFORE their existing ``isGenerating`` guard. The supersede semantic:
+  // when the user triggers a regen action that subsumes individual
+  // failed-variation retries, the queued per-variation retries are
+  // silently cleared so they don't fire redundantly after the bigger
+  // action completes. Placing the clear() BEFORE the guard ensures the
+  // queue is consistently cleared even on accidental double-clicks
+  // (where the second click is short-circuited by the guard but the
+  // clear() still runs first). See PRD §"Page integration" (clear()
+  // paragraph).
+  //
+  // These callbacks are defined AFTER useRetryQueue so they can
+  // reference ``retryQueue.clear`` directly (rather than via a forward
+  // ref). They were moved here from above-handleRegenerateVariation in
+  // a no-op refactor; the prior placement was historical, not load-
+  // bearing.
+  const startGeneration = useCallback(() => {
+    retryQueue.clear();
+    if (isGenerating) return;
+    // Abort any existing stream before starting a new one
+    streamCleanupRef.current?.();
+    setIsGenerating(true);
+    setGenerationError(null);
+    activityLog.log({
+      level: 'info',
+      icon: '▶',
+      message: `Starting generation for "${project?.name}"`,
+      detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
+    });
+    streamCleanupRef.current = streamGeneration(projectId, handleStreamEvent);
+  }, [retryQueue, activityLog, project, totalVariations, isGenerating, projectId, handleStreamEvent]);
+
+  const handleRegenerateRoom = useCallback((room: Room) => {
+    retryQueue.clear();
+    if (isGenerating) return;
+    // Abort any existing stream before starting a new one
+    streamCleanupRef.current?.();
+    setIsGenerating(true);
+    setGenerationError(null);
+    toast.info(`Regenerating ${room.label}...`);
+    streamCleanupRef.current = streamRoomRegeneration(projectId, room.id, handleStreamEvent);
+  }, [retryQueue, isGenerating, projectId, handleStreamEvent]);
+
+  const handleRegenerateAll = () => {
+    retryQueue.clear();
+    if (isGenerating) return;
+    startGeneration();
+    toast.info('Regenerating all rooms...');
+  };
 
   const handleRetryVariation = (room: Room, variationIndex: number) => {
     // Failed-variation Retry regenerates ONLY that variation, leaving sibling
