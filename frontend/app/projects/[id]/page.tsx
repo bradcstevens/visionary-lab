@@ -1099,7 +1099,7 @@ export default function ProjectDetailPage() {
             </div>
           </div>
         ) : (
-          project.rooms.map((room) => {
+          project.rooms.map((room, index) => {
             // Issue 007: per-room derived state. The hook tracks each
             // operation's scope; the page projects it down to the props
             // RoomGroup (and its children) need.
@@ -1210,6 +1210,8 @@ export default function ProjectDetailPage() {
                   isRoomBusy={isRoomBusy}
                   inFlightVariationIds={inFlightVariations}
                   queuedVariationIds={retryQueue.queuedIds}
+                  roomIndex={index + 1}
+                  totalRooms={project.rooms.length}
                 />
               </div>
             );

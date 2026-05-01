@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { RefreshCw, Clock, Info, AlertTriangle, Pencil, Loader2 } from "lucide-react";
@@ -39,9 +40,19 @@ interface RoomGroupProps {
    */
   inFlightVariationIds?: ReadonlySet<string>;
   queuedVariationIds?: ReadonlySet<string>;
+  /**
+   * Issue 005 of projects-page-improvements PRD: positional context.
+   * 1-based index of this room within `project.rooms`. Combined with
+   * `totalRooms` to render a small "Image N of M" label next to the
+   * room title. Both props are optional so callers that haven't been
+   * updated still render correctly (label is suppressed when either
+   * is missing).
+   */
+  roomIndex?: number;
+  totalRooms?: number;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds, roomIndex, totalRooms }: RoomGroupProps) {
   // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
   // the projects-page-improvements PRD). The draft is reset to the persisted
   // value every time the popover opens so a Cancel followed by another open
@@ -113,11 +124,34 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
   };
 
   return (
-    <div className="space-y-4">
+    // Issue 005 of projects-page-improvements PRD: each room is wrapped
+    // in the existing Card primitive so the per-room Generate /
+    // Regenerate button is visibly enclosed in the same container as
+    // the images it acts on. The Card primitive defaults to
+    // `flex flex-col gap-6 rounded-xl border py-6 shadow-sm`; we
+    // override `py-6 → p-4` for a tighter padding and `gap-6 → gap-3`
+    // to achieve the issue spec's `space-y-3` intent (writing literal
+    // `space-y-3` would stack 12px margin-top on top of the existing
+    // 24px flex gap because tailwind-merge does not collapse
+    // `space-y-*` against `gap-*`). Per the PRD this should be a
+    // subtle boundary, not heavy chrome.
+    <Card data-testid={`room-card-${room.id}`} className="p-4 gap-3">
       {/* Room Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <h3 className="text-lg font-semibold">{room.label}</h3>
+          {/* Positional context: small "Image N of M" label reflecting
+              this room's position in the project's room list. Rendered
+              before the addendum pencil so the title row reads
+              "title — positional context — controls — status". */}
+          {roomIndex !== undefined && totalRooms !== undefined && totalRooms > 0 && (
+            <span
+              className="text-xs text-muted-foreground"
+              data-testid={`room-position-${room.id}`}
+            >
+              Image {roomIndex} of {totalRooms}
+            </span>
+          )}
           {onUpdateAddendum && (
             <Popover open={isAddendumOpen} onOpenChange={handleAddendumOpenChange}>
               <PopoverTrigger asChild>
@@ -285,6 +319,6 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
           );
         })}
       </div>
-    </div>
+    </Card>
   );
 }
