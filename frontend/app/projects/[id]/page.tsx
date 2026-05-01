@@ -1280,30 +1280,41 @@ export default function ProjectDetailPage() {
       />
 
       {/* Edit Prompt dialog — issue 004 of projects-page-improvements
-          PRD. Replaces the prior "Try Something New" destructive
-          action with an explicit prompt-edit flow that APPENDS a new
-          variation alongside the original (preserves the original for
-          A/B comparison). Only renders when a target is set. */}
-      {editPromptTarget && (() => {
-        const room = project.rooms.find((r) => r.id === editPromptTarget.roomId);
-        const variation = room?.variations[editPromptTarget.variationIndex];
+          PRD; mount-pattern standardized in issue 003 of
+          radix-dialog-body-lock-fix PRD. ALWAYS MOUNTED (controlled
+          via the `open` prop) so the close path does not race
+          Radix's body-lock cleanup. The dialog's own open-edge
+          effect re-snaps the draft on each open. */}
+      {(() => {
+        const room = editPromptTarget
+          ? project.rooms.find((r) => r.id === editPromptTarget.roomId)
+          : null;
+        const variation = editPromptTarget && room
+          ? room.variations[editPromptTarget.variationIndex]
+          : null;
         const initialPrompt = variation?.generation_metadata?.adapted_prompt;
         // Issue 007: per-variation gate, not global isAnyInFlight. Allows
         // the user to draft Edit Prompt for room B's variation while room
         // A streams concurrently.
-        const editPromptBlocked =
-          inFlightProject ||
-          (room ? inFlightRooms.has(room.id) : false) ||
-          (variation ? inFlightVariations.has(variation.id) : false);
+        const editPromptBlocked = editPromptTarget
+          ? (
+              inFlightProject ||
+              (room ? inFlightRooms.has(room.id) : false) ||
+              (variation ? inFlightVariations.has(variation.id) : false)
+            )
+          : false;
+        const variationLabel = editPromptTarget
+          ? `Variation ${editPromptTarget.variationIndex + 1}`
+          : "variation";
         return (
           <EditPromptDialog
-            open
+            open={!!editPromptTarget}
             onOpenChange={(open) => {
               if (!open) setEditPromptTarget(null);
             }}
             initialPrompt={initialPrompt}
             fallbackPrompt={project.prompt}
-            variationLabel={`Variation ${editPromptTarget.variationIndex + 1}`}
+            variationLabel={variationLabel}
             isBlocked={editPromptBlocked}
             onSubmit={handleEditPromptSubmit}
           />

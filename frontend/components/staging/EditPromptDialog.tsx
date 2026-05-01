@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -29,13 +29,36 @@ import { Loader2, AlertTriangle } from "lucide-react";
  *      visible notice so the user knows the dialog couldn't recover
  *      the original adapted prompt.
  *
- * Component contract: the parent CONDITIONALLY mounts this dialog
- * (``{target && <EditPromptDialog open ... />}``) so each open is a
- * fresh mount. The draft state is initialized from props at mount
- * time, which avoids the set-state-in-effect lint rule that the
- * useEffect-based reset would trigger. On submit failure the dialog
- * stays open and the parent does not unmount it, so the user's
- * draft is preserved across retry without any effect.
+ * Component contract (issue 003 of radix-dialog-body-lock-fix PRD):
+ * this dialog is ALWAYS MOUNTED by its parent and driven by the
+ * controlled ``open`` prop. The parent does NOT wrap the dialog in
+ * ``{target && <EditPromptDialog ... />}`` — that prior pattern was
+ * the structural cause of an unmount-while-Radix-is-still-cleaning-up
+ * landmine that left the page non-interactive after every close
+ * (the body-lock leak).
+ *
+ * Draft state is reset on the rising edge of ``open`` via the effect
+ * below. The ESLint ``react-hooks/set-state-in-effect`` rule does NOT
+ * fire on this pattern (verified empirically — the rule has
+ * heuristics that recognize a guarded rising-edge reset and treat it
+ * as the documented "adjust state when a prop changes" escape
+ * hatch). The React docs explicitly endorse this pattern (see
+ * https://react.dev/reference/react/useEffect#adjusting-some-state-when-a-prop-changes
+ * — the documented escape hatch for the rare case where a prop
+ * change must trigger a state reset and a key-based remount is not
+ * acceptable).
+ *
+ * On submit failure the dialog stays open (the parent does not
+ * close it via onOpenChange), so the user's draft is preserved for
+ * retry. On submit success the parent calls ``onOpenChange(false)``
+ * which leaves the dialog mounted but closed — the next open on
+ * any variation re-derives ``sourcePrompt`` from the latest props
+ * and resets the draft fresh.
+ *
+ * DO NOT re-introduce conditional mounting. The body-lock guard at
+ * the layout level (see ``frontend/components/BodyLockGuard.tsx``)
+ * is a defense-in-depth backstop, NOT a license to revert this
+ * mount pattern.
  */
 
 interface EditPromptDialogProps {
@@ -79,6 +102,27 @@ export function EditPromptDialog({
   const [draft, setDraft] = useState<string>(sourcePrompt);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Open-edge reset (issue 003 of radix-dialog-body-lock-fix PRD):
+  // when ``open`` transitions from false to true, snap the draft back
+  // to whatever ``sourcePrompt`` evaluates to AT THAT MOMENT (so a
+  // close-without-save followed by re-open on the same — or a
+  // different — variation never carries an abandoned draft into the
+  // next session). The ``prevOpenRef`` makes this a true rising-edge
+  // detector: re-runs of the effect while ``open`` stays true (e.g.
+  // because ``sourcePrompt`` changed identity) do not stomp the
+  // user's in-progress draft. ``isSubmitting`` is reset defensively
+  // even though the submit handler's ``finally`` already clears it —
+  // covers the unlikely race where the dialog reopens while a prior
+  // submit is still in flight.
+  const prevOpenRef = useRef(false);
+  useEffect(() => {
+    if (open && !prevOpenRef.current) {
+      setDraft(sourcePrompt);
+      setIsSubmitting(false);
+    }
+    prevOpenRef.current = open;
+  }, [open, sourcePrompt]);
+
   const trimmed = draft.trim();
   const canGenerate = trimmed.length > 0 && !isSubmitting && !isBlocked;
 
@@ -87,8 +131,10 @@ export function EditPromptDialog({
     setIsSubmitting(true);
     try {
       await onSubmit(trimmed);
-      // Parent closes the dialog on success via onOpenChange(false)
-      // (which unmounts this component, so no draft reset is needed).
+      // Parent closes the dialog on success via onOpenChange(false).
+      // The dialog stays mounted (per issue 003 of radix-dialog-body-
+      // lock-fix); the next open re-derives sourcePrompt from the
+      // freshest props via the rising-edge effect above.
     } catch {
       // Keep dialog open with draft preserved so the user can retry.
     } finally {
