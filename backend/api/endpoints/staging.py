@@ -402,10 +402,103 @@ async def update_project(
             # ``None`` is meaningful here — clears the brief.
             project_data["design_brief"] = body.design_brief
 
+        # Issue 001 of project-settings-completeness PRD:
+        # mirror ``project.prompt`` and
+        # ``project.design_brief.global_instructions`` so the user sees
+        # one coherent "prompt" across Settings, Brief, gallery
+        # dialogs, project cards, regenerate flows, and any future
+        # snapshot-restore path. The mirror runs AFTER the field-
+        # application block so it operates on the fully-applied
+        # incoming state (it reads ``project_data["design_brief"]``,
+        # not ``body.design_brief``, so the "brief explicitly cleared
+        # to None" branch falls through cleanly).
+        #
+        # The mirror is intentionally scoped to PATCH /projects/{id}
+        # and PUT /brief — the two USER-FACING inbound update paths.
+        # POST /brief (generate_brief) is system-driven brief-synthesis
+        # whose output is downstream of the prompt the user already
+        # controls via PATCH; mirroring it would risk overwriting the
+        # user's prompt with an LLM-synthesized variant on every
+        # regenerate-brief, which the PRD explicitly forbids ("the
+        # user keeps their edits").
+        _mirror_prompt_and_brief_in_place(
+            project_data=project_data,
+            sent=sent,
+            body_prompt=body.prompt,
+        )
+
         storage.update_project(project_id, project_data)
 
     clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
     return ProjectResponse(project=StagingProject(**clean))
+
+
+def _is_nonempty_str(value: object) -> bool:
+    """Mirror gate: a value is "non-empty" when it's a string AND
+    contains at least one non-whitespace character. The PRD says the
+    mirror skips empty global_instructions; we extend "empty" to
+    whitespace-only so we don't propagate visual garbage between the
+    prompt and the brief."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _mirror_prompt_and_brief_in_place(
+    *,
+    project_data: dict,
+    sent: set,
+    body_prompt: Optional[str],
+) -> None:
+    """Apply the prompt ↔ design_brief.global_instructions mirror to
+    ``project_data`` in place. See the inline comment at the call site
+    in ``update_project`` for the rationale and scope decisions.
+
+    Rules (verbatim from PRD § Backend mirror behavior):
+
+    1. Both ``prompt`` and ``design_brief`` in ``sent``:
+       brief wins. If the persisted brief is a dict and its
+       ``global_instructions`` is non-empty (after strip) →
+       ``project_data["prompt"]`` is set from it. Otherwise the
+       user-supplied ``body_prompt`` is preserved (already applied by
+       the caller; nothing to do).
+    2. Only ``prompt`` in ``sent``:
+       If a brief is currently persisted (dict), copy ``body_prompt``
+       into ``brief["global_instructions"]``. If no brief, no-op (the
+       caller has already updated ``project_data["prompt"]``).
+    3. Only ``design_brief`` in ``sent``:
+       If brief is dict and ``global_instructions`` is non-empty →
+       ``project_data["prompt"]`` mirrors. Otherwise (brief cleared via
+       ``None``, brief is empty ``{}``, ``global_instructions`` missing
+       or empty/whitespace-only) → ``project_data["prompt"]`` is
+       untouched.
+    """
+    prompt_in = "prompt" in sent
+    brief_in = "design_brief" in sent
+    if not (prompt_in or brief_in):
+        return
+
+    brief = project_data.get("design_brief")
+    brief_is_dict = isinstance(brief, dict)
+
+    if prompt_in and brief_in:
+        # Brief wins when it has something to win with.
+        if brief_is_dict and _is_nonempty_str(brief.get("global_instructions")):
+            project_data["prompt"] = brief["global_instructions"]
+        # Else: keep the user-supplied prompt the caller already wrote.
+    elif prompt_in:
+        # Only prompt sent. If a brief exists, mirror prompt INTO brief.
+        # We mutate the existing dict in place — the storage layer does
+        # a full ``replace_item`` on the project doc so reference identity
+        # doesn't matter, and the existing endpoint code already mutates
+        # nested dicts in place (see the settings-merge a few lines up).
+        if brief_is_dict:
+            brief["global_instructions"] = body_prompt
+            project_data["design_brief"] = brief
+    else:
+        # Only design_brief sent. Mirror non-empty global_instructions
+        # OUT to project.prompt. ``brief`` here is whatever the caller
+        # just wrote — possibly None (clear), possibly a dict.
+        if brief_is_dict and _is_nonempty_str(brief.get("global_instructions")):
+            project_data["prompt"] = brief["global_instructions"]
 
 
 def _sse_event(event_type: str, data: dict) -> str:
@@ -1340,12 +1433,42 @@ async def update_brief(
     brief: DesignBrief,
     storage: StagingStorageService = Depends(get_staging_storage),
 ):
-    """Save user edits to the Design Brief."""
-    project_data = storage.get_project(project_id)
-    if not project_data:
-        raise HTTPException(status_code=404, detail="Project not found")
+    """Save user edits to the Design Brief.
 
-    brief_dict = brief.dict()
-    storage.update_project(project_id, {"design_brief": brief_dict})
+    Issue 001 of the project-settings-completeness PRD: the brief and
+    ``project.prompt`` are kept in sync — when the user saves a brief
+    whose ``global_instructions`` is non-empty, ``project.prompt``
+    mirrors that value in the same Cosmos write. This keeps the user's
+    "prompt" coherent across Settings, Brief, gallery dialogs, project
+    cards, and regenerate flows regardless of which surface they
+    edited from.
+
+    The handler now runs inside ``_get_project_lock`` for the same
+    reason ``update_project`` does: Cosmos writes are full-document
+    replacements, and adding mirror-driven ``prompt`` writes to this
+    path widened the loss surface beyond just ``design_brief``. Without
+    the lock, a concurrent ``PATCH /projects/{id}`` (which holds the
+    lock and also writes ``prompt``) could be clobbered by an
+    unserialized PUT here.
+
+    Returns ``{"brief": <persisted brief dict>}`` so the frontend's
+    ``updateBrief`` wrapper (``frontend/services/stagingApi.ts``) can
+    do its expected ``return data.brief``. The pre-fix handler had no
+    explicit return — FastAPI sent ``null`` as the body, and the
+    frontend's ``data.brief`` access crashed silently into the wizard's
+    "Failed to save Design Brief" toast. Adding the return statement
+    is a tightly-coupled bug fix to the same handler this issue
+    rewrites for the lock + mirror.
+    """
+    async with _get_project_lock(project_id):
+        project_data = storage.get_project(project_id)
+        if not project_data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        brief_dict = brief.dict()
+        updates = {"design_brief": brief_dict}
+        if _is_nonempty_str(brief_dict.get("global_instructions")):
+            updates["prompt"] = brief_dict["global_instructions"]
+        storage.update_project(project_id, updates)
 
     return {"brief": brief_dict}

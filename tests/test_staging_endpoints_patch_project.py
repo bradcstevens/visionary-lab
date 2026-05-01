@@ -249,7 +249,17 @@ def test_patch_project_all_fields_atomic(client, mock_staging_deps):
     """A PATCH with every editable field updates them atomically — one
     storage write, all fields applied. This is the most-realistic
     payload from the frontend Settings sheet (Save with multiple dirty
-    fields)."""
+    fields).
+
+    Note on the both-present prompt+brief assertion below: issue 001
+    of the project-settings-completeness PRD added a mirror that makes
+    ``design_brief.global_instructions`` win on ``project.prompt`` when
+    both are sent in the same PATCH. So the persisted ``prompt`` ends
+    up equal to ``new_brief["global_instructions"]`` (``"all-fields"``),
+    NOT the user-supplied ``"all-fields prompt"``. The full mirror
+    contract has dedicated coverage in
+    ``test_staging_endpoints_prompt_brief_mirror.py``.
+    """
     mock_container = mock_staging_deps["container"]
     project_data = _project_with_two_rooms_for_patch_project()
     mock_container.read_item.return_value = project_data
@@ -272,7 +282,8 @@ def test_patch_project_all_fields_atomic(client, mock_staging_deps):
 
     persisted = _captured_replace_body(mock_container)
     assert persisted["name"] == "All Fields"
-    assert persisted["prompt"] == "all-fields prompt"
+    # Brief wins on prompt (mirror — see docstring above).
+    assert persisted["prompt"] == "all-fields"
     assert persisted["settings"] == {
         "variations_per_room": 7,
         "model": "gpt-image-2",
