@@ -30,11 +30,10 @@ const API_DEBUG = process.env.NEXT_PUBLIC_DEBUG_MODE === 'true';
 
 // Types
 export interface StagingSettings {
-  style: string;
-  room_count: number;
   variations_per_room: number;
-  output_format?: string;
-  quality?: string;
+  model: string;
+  quality: string;
+  size: string;
 }
 
 export interface GenerationMetadata {
@@ -73,6 +72,10 @@ export interface StagingProject {
   status: 'uploading' | 'pending' | 'processing' | 'completed' | 'failed';
   settings: StagingSettings;
   rooms: Room[];
+  // Issue 002 of projects-page-improvements PRD: design_brief is editable
+  // through the Project Settings sheet. Optional/null when the project
+  // hasn't run an AI Design Session yet.
+  design_brief?: DesignBrief | null;
   created_at?: string;
   updated_at?: string;
   total_variations?: number;
@@ -789,6 +792,37 @@ export async function updateRoomAddendum(
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to update room addendum: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.project;
+}
+
+// Issue 002 of the projects-page-improvements PRD. Each field is
+// optional — omit a field to leave it unchanged on the server. Sending
+// ``design_brief: null`` explicitly clears the brief; sending null for
+// the other three fields is a 422.
+export interface UpdateProjectBody {
+  name?: string;
+  prompt?: string;
+  // Partial settings — only the keys you supply are MERGED onto the
+  // persisted settings (the backend preserves keys you don't send).
+  settings?: Partial<StagingSettings>;
+  design_brief?: DesignBrief | null;
+}
+
+export async function updateProject(
+  projectId: string,
+  updates: UpdateProjectBody,
+): Promise<StagingProject> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}`;
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to update project: ${response.status} ${errorText}`);
   }
   const data = await response.json();
   return data.project;

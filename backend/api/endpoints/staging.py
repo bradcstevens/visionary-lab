@@ -30,6 +30,7 @@ from backend.models.staging import (
     ProjectResponse,
     Room,
     StagingProject,
+    UpdateProjectRequest,
     UpdateRoomRequest,
     UploadRoomsResponse,
     Variation,
@@ -322,6 +323,83 @@ async def update_room(
         elif isinstance(addendum, str):
             addendum = addendum.strip()
         room["prompt_addendum"] = addendum
+
+        storage.update_project(project_id, project_data)
+
+    clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
+    return ProjectResponse(project=StagingProject(**clean))
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project(
+    project_id: str,
+    body: UpdateProjectRequest,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Partial-update editable project-level fields (``name``,
+    ``prompt``, ``settings``, ``design_brief``).
+
+    Issue 002 of the projects-page-improvements PRD. Per the PRD's
+    Solution → 2 paragraph, saved changes apply only to FUTURE
+    generations — every existing variation and its prompt stays exactly
+    as it was. The endpoint:
+
+    - Updates ONLY the fields the client actually sent (uses
+      ``__fields_set__`` to distinguish "absent" from "explicit null").
+    - For ``settings``: MERGES the supplied keys onto the persisted
+      settings rather than replacing the whole object. This means a
+      partial update like ``{settings: {variations_per_room: 3}}``
+      changes only that key — ``model``/``quality``/``size`` keep their
+      persisted values. Without the merge, defaults from
+      ``StagingSettings.__init__`` would silently overwrite whatever the
+      user previously chose.
+    - For ``design_brief``: ``None`` is meaningful — it clears the brief.
+    - NEVER modifies ``rooms``, ``analyses``, or ``status``. The shape
+      of ``UpdateProjectRequest`` intentionally has no fields for them
+      so a misbehaving client cannot edit them through this endpoint.
+    - Does NOT trigger any generation — plain JSON response, no SSE.
+
+    The read-modify-write is wrapped in the per-project asyncio lock
+    from ``staging_pipeline._get_project_lock`` so concurrent writes
+    (PATCH, regen finalizers, pipeline persists) serialize at the
+    storage boundary. This is necessary because Cosmos writes are full-
+    doc replacements; without serialization a finalizer write that
+    started reading state BEFORE this PATCH could clobber the PATCH on
+    its way out. Pairs with the surgical fix in
+    ``StagingPipeline._persist_project_locked`` that scopes worker
+    writes to ``{rooms, status}`` only — the latter prevents the
+    *content* clobber while this lock prevents the *write-order*
+    clobber.
+    """
+    async with _get_project_lock(project_id):
+        project_data = storage.get_project(project_id)
+        if not project_data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Use ``__fields_set__`` to distinguish "absent" from "explicit
+        # null". The Pydantic v1 validators on ``UpdateProjectRequest``
+        # already rejected explicit null for name/prompt/settings (those
+        # raise 422 at parse time), so by the time we get here all
+        # values in the set are non-None for those three fields.
+        sent = body.__fields_set__
+
+        if "name" in sent:
+            project_data["name"] = body.name
+        if "prompt" in sent:
+            project_data["prompt"] = body.prompt
+        if "settings" in sent:
+            # Merge supplied keys onto the persisted settings. The
+            # ``body.dict(exclude_unset=True)["settings"]`` form returns
+            # only the keys the client actually sent (Pydantic v1 tracks
+            # this on the nested model too), so we don't accidentally
+            # overwrite ``model``/``quality``/``size`` with defaults
+            # when the client only wanted to change ``variations_per_room``.
+            settings_update = body.dict(exclude_unset=True).get("settings", {})
+            existing_settings = project_data.get("settings") or {}
+            project_data["settings"] = {**existing_settings, **settings_update}
+        if "design_brief" in sent:
+            # ``None`` is meaningful here — clears the brief.
+            project_data["design_brief"] = body.design_brief
 
         storage.update_project(project_id, project_data)
 

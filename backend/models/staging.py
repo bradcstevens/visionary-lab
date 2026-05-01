@@ -109,6 +109,80 @@ class UpdateRoomRequest(BaseModel):
     )
 
 
+class UpdateProjectRequest(BaseModel):
+    """Partial-update body for ``PATCH /projects/{id}`` (issue 002 of
+    the projects-page-improvements PRD).
+
+    Every field is optional — omit to leave the persisted value
+    untouched. The endpoint applies updates ONLY to the fields the
+    client actually sends (uses Pydantic's ``__fields_set__`` to
+    distinguish "not present" from "explicitly null").
+
+    Field semantics:
+
+    - ``name`` / ``prompt`` / ``settings``: required project state.
+      Sending ``null`` for any of these raises 422 — clients shouldn't
+      clear required fields. Empty / whitespace-only ``name`` and
+      ``prompt`` are also 422.
+
+    - ``settings``: when present, the endpoint MERGES the supplied keys
+      onto the persisted settings rather than replacing the whole
+      object. This means ``{settings: {variations_per_room: 3}}`` only
+      updates that one key — ``model``/``quality``/``size`` keep their
+      persisted values.
+
+    - ``design_brief``: ``None`` is meaningful — it clears the brief.
+
+    The endpoint NEVER modifies ``rooms``, ``analyses``, or ``status`` —
+    those are owned by the generation pipeline. The shape of this
+    request body intentionally has no fields for them so a misbehaving
+    client cannot edit them through this endpoint.
+    """
+    name: Optional[str] = Field(None, description="Project display name.")
+    prompt: Optional[str] = Field(None, description="Top-level styling prompt.")
+    settings: Optional[StagingSettings] = Field(
+        None,
+        description=(
+            "Partial settings update — only the keys you supply are merged "
+            "onto the persisted settings."
+        ),
+    )
+    design_brief: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Structured design brief; pass null to clear.",
+    )
+
+    @validator("name")
+    def _name_non_empty(cls, v):
+        # Validators in Pydantic v1 run when the field is explicitly
+        # present in the input (including when sent as ``null``), but
+        # the ``Optional[str] = None`` default short-circuits before the
+        # validator if the field is absent — so this only fires for
+        # explicit values.
+        if v is None:
+            raise ValueError("name cannot be null; omit the field to leave unchanged")
+        if not v.strip():
+            raise ValueError("name cannot be empty or whitespace-only")
+        return v
+
+    @validator("prompt")
+    def _prompt_non_empty(cls, v):
+        if v is None:
+            raise ValueError("prompt cannot be null; omit the field to leave unchanged")
+        if not v.strip():
+            raise ValueError("prompt cannot be empty or whitespace-only")
+        return v
+
+    @validator("settings")
+    def _settings_not_explicit_null(cls, v):
+        # Same rationale as above — the field default is None, so
+        # absent-from-input does not invoke the validator. An explicit
+        # null in the JSON body parses to None and lands here.
+        if v is None:
+            raise ValueError("settings cannot be null; omit the field to leave unchanged")
+        return v
+
+
 class UploadRoomsResponse(BaseModel):
     project_id: str
     rooms_added: int

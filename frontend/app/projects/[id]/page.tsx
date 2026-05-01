@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2, MoreHorizontal, ChevronDown } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Loader2, Play, AlertTriangle, Trash2, MoreHorizontal, ChevronDown, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -17,7 +17,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
-import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, updateRoomAddendum, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
+import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -37,6 +38,7 @@ export default function ProjectDetailPage() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showSettingsSheet, setShowSettingsSheet] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [regeneratingVariationId, setRegeneratingVariationId] = useState<string | null>(null);
   const streamCleanupRef = useRef<(() => void) | null>(null);
@@ -498,6 +500,32 @@ export default function ProjectDetailPage() {
     }
   }, [projectId, activityLog]);
 
+  const handleProjectSettingsSave = useCallback(async (updates: UpdateProjectBody) => {
+    // Issue 002 of projects-page-improvements PRD: persist edits to
+    // ``name``, ``prompt``, and/or ``settings`` without triggering any
+    // regeneration. Mirrors ``handleUpdateRoomAddendum``'s pattern:
+    // call ``resolveImageUrls(updated)`` BEFORE ``setProject(updated)``
+    // so the SAS-suffixed URLs already in local state aren't replaced
+    // by the bare blob URLs in the PATCH response — same regression
+    // the per-room-prompt-addendum spec pinned.
+    try {
+      const updated = await updateProject(projectId, updates);
+      await resolveImageUrls(updated);
+      setProject(updated);
+      toast.success('Project settings saved — applies to future generations');
+      const changedKeys = Object.keys(updates).filter((k) => k !== 'design_brief' || updates.design_brief !== undefined);
+      activityLog.log({
+        level: 'info',
+        icon: '⚙',
+        message: `Project settings updated`,
+        detail: `Changed: ${changedKeys.join(', ')}. Applies to future generations only.`,
+      });
+    } catch (error) {
+      toast.error(parseApiError(error, 'Failed to save project settings'));
+      throw error;
+    }
+  }, [projectId, activityLog]);
+
   const handleDeleteProject = async () => {
     setIsDeleting(true);
     try {
@@ -621,6 +649,14 @@ export default function ProjectDetailPage() {
                 <DropdownMenuItem onClick={handleAddRooms} disabled={isGenerating}>
                   <Plus className="h-4 w-4 mr-2" />
                   Add more images
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setShowSettingsSheet(true)}
+                  disabled={isGenerating}
+                  data-testid="overflow-menu-project-settings"
+                >
+                  <Settings className="h-4 w-4 mr-2" />
+                  Project settings
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -810,6 +846,16 @@ export default function ProjectDetailPage() {
         // ImageLightbox suppresses the tooltip when isRegenerating
         // (this variation) is true so the existing spinner UI wins.
         isBlocked={isGenerating || regeneratingVariationId !== null}
+      />
+
+      {/* Project Settings side sheet — issue 002 of projects-page-
+          improvements PRD. Lets the user edit name/prompt/settings
+          mid-project. Saves apply to FUTURE generations only. */}
+      <ProjectSettingsSheet
+        open={showSettingsSheet}
+        onOpenChange={setShowSettingsSheet}
+        project={project}
+        onSave={handleProjectSettingsSave}
       />
     </div>
   );

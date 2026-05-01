@@ -863,6 +863,40 @@ class StagingPipeline:
         """Serialize project to a JSON-safe dict (datetime → ISO string)."""
         return json.loads(project.json())
 
+    @staticmethod
+    def _serialize_pipeline_owned_fields(project: StagingProject) -> Dict[str, Any]:
+        """Serialize ONLY the fields the pipeline owns: ``rooms`` and
+        ``status``. Used by ``_persist_project_locked`` so worker writes
+        cannot clobber user-owned scalars (``name``, ``prompt``,
+        ``settings``, ``design_brief``) that may have been mutated by a
+        ``PATCH /projects/{id}`` call while the pipeline ran with a
+        stale in-memory snapshot.
+
+        Storage's ``update_project`` does a key-by-key dict merge, so
+        passing a sparse dict here means only those keys are
+        overwritten in the persisted document — every other top-level
+        field (PATCH-touched or not) is preserved.
+
+        Why ``rooms`` + ``status`` are the right scope: the pipeline
+        only ever assigns ``project.status = ...`` and mutates
+        ``project.rooms[i] = room`` (see ``generate_project`` and
+        ``_update_room_in_project``). It never assigns to
+        ``project.name``, ``project.prompt``, ``project.settings``, or
+        ``project.design_brief``. Issue 002 of the projects-page-
+        improvements PRD adds the PATCH endpoint that DOES write those
+        scalars; without scoping the pipeline's persist, a worker
+        finishing AFTER the PATCH would clobber it back to the in-
+        memory snapshot's value.
+        """
+        return {
+            "rooms": [json.loads(r.json()) for r in project.rooms],
+            "status": (
+                project.status.value
+                if hasattr(project.status, "value")
+                else project.status
+            ),
+        }
+
     def _get_project_lock(self, project_id: str) -> asyncio.Lock:
         """Return the per-project asyncio.Lock, delegating to the module-level
         registry so locks are shared across all StagingPipeline instances in
@@ -871,7 +905,8 @@ class StagingPipeline:
         return _get_project_lock(project_id)
 
     async def _persist_project_locked(self, project: StagingProject) -> Dict[str, Any]:
-        """Persist the full project document under the per-project lock.
+        """Persist the pipeline-owned fields (``rooms`` + ``status``) under
+        the per-project lock.
 
         Wraps `storage_service.update_project` (which performs a Cosmos
         read-modify-write) inside the lock so concurrent persists for the
@@ -883,6 +918,14 @@ class StagingPipeline:
 
         The lock is per-project, so persists for *different* project IDs
         run in parallel.
+
+        Scope of write (issue 002 of projects-page-improvements PRD):
+        only ``rooms`` and ``status`` are sent to storage. Storage's
+        ``update_project`` does a dict merge, so user-owned top-level
+        scalars (``name``, ``prompt``, ``settings``, ``design_brief``)
+        that may have been mutated by a concurrent ``PATCH
+        /projects/{id}`` call are preserved. See
+        ``_serialize_pipeline_owned_fields`` for the full rationale.
 
         Cancellation safety: once the thread starts, Python threads cannot
         be cancelled. If the caller's task is cancelled mid-`to_thread`,
@@ -897,7 +940,7 @@ class StagingPipeline:
                 asyncio.to_thread(
                     self.storage_service.update_project,
                     project.id,
-                    self._serialize_project(project),
+                    self._serialize_pipeline_owned_fields(project),
                 )
             )
             try:
