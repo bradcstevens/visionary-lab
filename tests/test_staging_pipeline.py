@@ -1040,3 +1040,241 @@ class TestProjectStatusDelegatesToCalculator:
         # The terminal SSE event must carry the same truthful status —
         # without this, the frontend optimistic state would stay stale.
         assert events[-1] == {"type": "project_completed", "status": ProjectStatus.PENDING}
+
+
+class TestProcessRoomComposesAddendum:
+    """Issue 003 (projects-page-improvements PRD): ``process_room`` must
+    compose ``room.prompt_addendum`` onto every per-variation base prompt
+    (whether it came from ``brief_prompts`` or from ``adapt_prompt``)
+    before fanning out to ``_process_one_variation``. The composed value
+    is what gets persisted into ``generation_metadata.adapted_prompt``,
+    so a subsequent Retry Same Prompt reuses the composed value verbatim.
+    """
+
+    @pytest.mark.asyncio
+    async def test_addendum_composed_when_brief_prompts_provided(self):
+        """The brief-path supplies the per-variation base prompts via
+        the ``brief_prompts`` arg. The addendum must be appended to each
+        before fan-out."""
+        addendum = "ADDENDUM_SENTINEL — always upright in front of fence"
+        rooms = [
+            Room(
+                id="room-1",
+                label="Living Room",
+                original_image_url="https://acct.blob.core.windows.net/images/x.png",
+                status=ItemStatus.PENDING,
+                prompt_addendum=addendum,
+                variations=[Variation(id="v-0"), Variation(id="v-1")],
+            ),
+        ]
+        project = StagingProject(
+            id="proj-addendum",
+            name="Addendum Pipeline Test",
+            prompt="USER_INTENT — modern",
+            settings=StagingSettings(variations_per_room=2),
+            rooms=rooms,
+        )
+
+        captured_prompts = []
+
+        async def _capturing_one(self, *, project, room, variation, idx,
+                                 adapted_prompt, image_b64, event_queue):
+            captured_prompts.append(adapted_prompt)
+            event_queue.put_nowait({
+                "type": "variation_completed",
+                "room_id": room.id,
+                "variation_index": idx,
+                "image_url": "https://x",
+                "elapsed_ms": 0,
+                "tokens_used": 0,
+                "model": "gpt-image-2",
+            })
+
+        # Stub out blob fetch + analyze + persistence helpers — none are
+        # exercised by what we're testing.
+        blob_service = MagicMock()
+        blob_service.get_asset_content.return_value = (b"FAKE", "image/png")
+
+        analyzer = MagicMock()
+
+        async def _fake_analyze(image_base64, system_message=None):
+            return {"description": "A sunlit room", "features": []}
+
+        analyzer.async_image_chat = _fake_analyze
+
+        storage = MagicMock()
+        storage.get_project.return_value = {"id": project.id}
+        storage.update_project.side_effect = lambda *a, **kw: None
+
+        staging = StagingPipeline(
+            async_llm_client=AsyncMock(),
+            llm_deployment="gpt-4o",
+            image_analyzer=analyzer,
+            image_pipeline=MagicMock(),
+            storage_service=storage,
+            blob_service=blob_service,
+        )
+
+        with patch.object(StagingPipeline, "_process_one_variation", _capturing_one):
+            events = []
+            async for event in staging.process_room(
+                project,
+                rooms[0],
+                brief_prompts={"room-1": ["brief prompt 0", "brief prompt 1"]},
+            ):
+                events.append(event)
+
+        assert len(captured_prompts) == 2
+        assert captured_prompts[0] == f"brief prompt 0\n\n{addendum}", (
+            f"Variation 0's adapted_prompt must be brief base + addendum "
+            f"(composed). Got: {captured_prompts[0]!r}"
+        )
+        assert captured_prompts[1] == f"brief prompt 1\n\n{addendum}"
+
+    @pytest.mark.asyncio
+    async def test_addendum_composed_when_adapt_prompt_path_used(self):
+        """The no-brief path uses ``adapt_prompt`` to generate base
+        prompts. The composer still applies."""
+        addendum = "always preserve the pergola"
+        rooms = [
+            Room(
+                id="room-1",
+                label="Living Room",
+                original_image_url="https://acct.blob.core.windows.net/images/x.png",
+                status=ItemStatus.PENDING,
+                prompt_addendum=addendum,
+                variations=[Variation(id="v-0")],
+            ),
+        ]
+        project = StagingProject(
+            id="proj-addendum-no-brief",
+            name="Addendum No-Brief",
+            prompt="modern",
+            settings=StagingSettings(variations_per_room=1),
+            rooms=rooms,
+        )
+
+        captured_prompts = []
+
+        async def _capturing_one(self, *, project, room, variation, idx,
+                                 adapted_prompt, image_b64, event_queue):
+            captured_prompts.append(adapted_prompt)
+            event_queue.put_nowait({
+                "type": "variation_completed",
+                "room_id": room.id,
+                "variation_index": idx,
+                "image_url": "https://x",
+                "elapsed_ms": 0,
+                "tokens_used": 0,
+                "model": "gpt-image-2",
+            })
+
+        async def _stub_adapt(self, user_prompt, room_analysis, n_variations,
+                              rejected_prompt=None):
+            return ["adapt-prompt base"]
+
+        blob_service = MagicMock()
+        blob_service.get_asset_content.return_value = (b"FAKE", "image/png")
+        analyzer = MagicMock()
+
+        async def _fake_analyze(image_base64, system_message=None):
+            return {"description": "A room", "features": []}
+
+        analyzer.async_image_chat = _fake_analyze
+
+        storage = MagicMock()
+        storage.get_project.return_value = {"id": project.id}
+        storage.update_project.side_effect = lambda *a, **kw: None
+
+        staging = StagingPipeline(
+            async_llm_client=AsyncMock(),
+            llm_deployment="gpt-4o",
+            image_analyzer=analyzer,
+            image_pipeline=MagicMock(),
+            storage_service=storage,
+            blob_service=blob_service,
+        )
+
+        with patch.object(StagingPipeline, "_process_one_variation", _capturing_one), \
+             patch.object(StagingPipeline, "adapt_prompt", _stub_adapt):
+            events = []
+            async for event in staging.process_room(project, rooms[0]):
+                events.append(event)
+
+        assert captured_prompts == [f"adapt-prompt base\n\n{addendum}"]
+
+    @pytest.mark.asyncio
+    async def test_no_addendum_leaves_prompts_unchanged(self):
+        """Default ``prompt_addendum=None`` is a no-op: prompts pass
+        through to ``_process_one_variation`` unchanged. This is the
+        backward-compat guarantee for existing rooms."""
+        rooms = [
+            Room(
+                id="room-1",
+                label="Living Room",
+                original_image_url="https://acct.blob.core.windows.net/images/x.png",
+                status=ItemStatus.PENDING,
+                variations=[Variation(id="v-0")],
+            ),
+        ]
+        assert rooms[0].prompt_addendum is None  # default
+
+        project = StagingProject(
+            id="proj-no-addendum",
+            name="No Addendum",
+            prompt="modern",
+            settings=StagingSettings(variations_per_room=1),
+            rooms=rooms,
+        )
+
+        captured_prompts = []
+
+        async def _capturing_one(self, *, project, room, variation, idx,
+                                 adapted_prompt, image_b64, event_queue):
+            captured_prompts.append(adapted_prompt)
+            event_queue.put_nowait({
+                "type": "variation_completed",
+                "room_id": room.id,
+                "variation_index": idx,
+                "image_url": "https://x",
+                "elapsed_ms": 0,
+                "tokens_used": 0,
+                "model": "gpt-image-2",
+            })
+
+        blob_service = MagicMock()
+        blob_service.get_asset_content.return_value = (b"FAKE", "image/png")
+        analyzer = MagicMock()
+
+        async def _fake_analyze(image_base64, system_message=None):
+            return {"description": "A room", "features": []}
+
+        analyzer.async_image_chat = _fake_analyze
+
+        storage = MagicMock()
+        storage.get_project.return_value = {"id": project.id}
+        storage.update_project.side_effect = lambda *a, **kw: None
+
+        staging = StagingPipeline(
+            async_llm_client=AsyncMock(),
+            llm_deployment="gpt-4o",
+            image_analyzer=analyzer,
+            image_pipeline=MagicMock(),
+            storage_service=storage,
+            blob_service=blob_service,
+        )
+
+        with patch.object(StagingPipeline, "_process_one_variation", _capturing_one):
+            events = []
+            async for event in staging.process_room(
+                project,
+                rooms[0],
+                brief_prompts={"room-1": ["brief prompt 0"]},
+            ):
+                events.append(event)
+
+        # The addendum is None → composer not invoked → prompt is the
+        # brief base verbatim. (The composer would still be a no-op if
+        # called with addendum=None, but the early ``if room.prompt_addendum``
+        # guard avoids the work.)
+        assert captured_prompts == ["brief prompt 0"]

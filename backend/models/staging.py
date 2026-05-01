@@ -58,6 +58,14 @@ class Room(BaseModel):
     status: str = Field(ItemStatus.PENDING, description="Room processing status")
     error: Optional[str] = None
     variations: List[Variation] = Field(default_factory=list)
+    prompt_addendum: Optional[str] = Field(
+        None,
+        description=(
+            "Optional per-room clarification appended to the project prompt for "
+            "every future generation of this room. Existing variations are not "
+            "regenerated when this changes."
+        ),
+    )
 
 
 class StagingProject(BaseModel):
@@ -78,6 +86,27 @@ class CreateProjectRequest(BaseModel):
     name: str = Field(..., description="Project name", examples=["Modern Minimalist Refresh"])
     prompt: str = Field(..., description="Overall styling direction", examples=["Clean lines, warm wood tones, lots of greenery"])
     settings: StagingSettings = Field(default_factory=StagingSettings)
+
+
+class UpdateRoomRequest(BaseModel):
+    """Partial-update body for ``PATCH /projects/{id}/rooms/{rid}``.
+
+    Only ``prompt_addendum`` is editable today (issue 003 of the
+    projects-page-improvements PRD). Other Room fields (``status``,
+    ``variations``, ``original_image_url``) are derived from generation
+    activity and must not be edited through this endpoint.
+
+    ``prompt_addendum=None`` is meaningful: it explicitly clears the
+    addendum. The endpoint normalizes empty / whitespace-only strings to
+    ``None`` before persisting so the model stays clean.
+    """
+    prompt_addendum: Optional[str] = Field(
+        None,
+        description=(
+            "Per-room clarification appended to the project prompt for future "
+            "generations of this room. Pass null or omit to clear."
+        ),
+    )
 
 
 class UploadRoomsResponse(BaseModel):

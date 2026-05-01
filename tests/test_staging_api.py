@@ -1748,3 +1748,489 @@ def test_regenerate_room_finalizer_persists_pending_when_sibling_room_outstandin
         "``if not any_processing`` branch never fired in this scenario "
         "and left the stale 'completed' value intact."
     )
+
+
+# ============================================================================
+# Issue 003 (projects-page-improvements PRD) — Per-room prompt addendum
+# ----------------------------------------------------------------------------
+# Two surfaces to test:
+#
+#   1. PATCH /projects/{id}/rooms/{rid} accepts ``{prompt_addendum: ...}``,
+#      updates only that field, normalizes empty/whitespace to None, leaves
+#      sibling rooms / variations / status untouched, and never triggers any
+#      generation.
+#
+#   2. The per-variation regen path (the canonical "future generation"
+#      surface) honors ``room.prompt_addendum`` by composing it into the
+#      ``adapted_prompt`` that reaches ``process_single_variation``.
+#      ``strategy="retry"`` does NOT recompose — it uses the prior
+#      ``generation_metadata.adapted_prompt`` verbatim, since that prior
+#      value already includes whatever addendum was in effect when it ran.
+# ============================================================================
+
+
+_ADDENDUM_TEXT = "ADDENDUM_SENTINEL — always upright in front of fence"
+
+
+def _project_with_two_rooms_for_patch():
+    """Two-room project so ``patch room A`` tests can assert room B is
+    byte-for-byte unchanged after the write."""
+    return {
+        "id": "proj-patch",
+        "name": "Patch Test",
+        "prompt": "modern minimalist",
+        "status": "completed",
+        "rooms": [
+            {
+                "id": "room-A",
+                "label": "Living Room",
+                "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/a.png",
+                "status": "completed",
+                "variations": [
+                    {
+                        "id": "var-A1",
+                        "status": "completed",
+                        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-A/v1.png",
+                        "generation_metadata": {
+                            "model": "gpt-image-2",
+                            "adapted_prompt": "earlier prompt for A",
+                        },
+                    }
+                ],
+            },
+            {
+                "id": "room-B",
+                "label": "Kitchen",
+                "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/b.png",
+                "status": "completed",
+                "prompt_addendum": "B's existing addendum",
+                "variations": [
+                    {
+                        "id": "var-B1",
+                        "status": "completed",
+                        "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-B/v1.png",
+                    }
+                ],
+            },
+        ],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+
+def test_patch_room_addendum_persists_only_target_room(client, mock_staging_deps):
+    """PATCH /projects/{id}/rooms/{rid} writes the addendum onto the
+    target room only. Sibling room must be byte-identical (existing
+    addendum, status, variations all unchanged). The endpoint normalizes
+    whitespace-only / empty to None so the model stays clean.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_two_rooms_for_patch()
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    sibling_before = _json_for_regen_tests.dumps(project_data["rooms"][1], sort_keys=True)
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-A",
+        json={"prompt_addendum": "  always upright   "},
+    )
+    assert response.status_code == 200, response.text
+
+    persisted_body = mock_container.replace_item.call_args.kwargs.get("body")
+    if persisted_body is None:
+        persisted_body = mock_container.replace_item.call_args.args[1]
+
+    room_a = next(r for r in persisted_body["rooms"] if r["id"] == "room-A")
+    room_b = next(r for r in persisted_body["rooms"] if r["id"] == "room-B")
+
+    # Whitespace stripped before persist — model stays clean.
+    assert room_a["prompt_addendum"] == "always upright"
+    # Sibling room unchanged byte-for-byte.
+    assert _json_for_regen_tests.dumps(room_b, sort_keys=True) == sibling_before
+    # Project-level fields not touched.
+    assert persisted_body["status"] == "completed"
+    assert persisted_body["prompt"] == "modern minimalist"
+
+
+def test_patch_room_addendum_does_not_touch_room_internal_fields(client, mock_staging_deps):
+    """The endpoint must not modify the target room's variations, status,
+    image URL, or label. Those are owned by the generation pipeline."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_two_rooms_for_patch()
+    original_room_a = _json_for_regen_tests.dumps(project_data["rooms"][0], sort_keys=True)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-A",
+        json={"prompt_addendum": "new addendum"},
+    )
+    assert response.status_code == 200
+
+    persisted_body = mock_container.replace_item.call_args.kwargs.get("body") \
+        or mock_container.replace_item.call_args.args[1]
+    room_a = next(r for r in persisted_body["rooms"] if r["id"] == "room-A")
+
+    # Reconstruct what room-A "should" look like with only addendum changed
+    # and assert all other fields match the original byte-for-byte.
+    room_a_minus_addendum = {k: v for k, v in room_a.items() if k != "prompt_addendum"}
+    original_minus_addendum = {
+        k: v for k, v in _json_for_regen_tests.loads(original_room_a).items()
+        if k != "prompt_addendum"
+    }
+    assert room_a_minus_addendum == original_minus_addendum
+
+
+def test_patch_room_addendum_normalizes_empty_to_none(client, mock_staging_deps):
+    """Empty string and whitespace-only strings are normalized to None
+    so the persisted shape stays consistent. This matches the composer's
+    treatment of empty/whitespace as 'absent'."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_two_rooms_for_patch()
+    # Pre-existing addendum on room-B that we'll clear.
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-B",
+        json={"prompt_addendum": "   \n  "},
+    )
+    assert response.status_code == 200
+
+    persisted_body = mock_container.replace_item.call_args.kwargs.get("body") \
+        or mock_container.replace_item.call_args.args[1]
+    room_b = next(r for r in persisted_body["rooms"] if r["id"] == "room-B")
+    assert room_b["prompt_addendum"] is None
+
+
+def test_patch_room_addendum_explicit_null_clears_existing(client, mock_staging_deps):
+    """Passing ``null`` explicitly clears any existing addendum."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_two_rooms_for_patch()
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-B",
+        json={"prompt_addendum": None},
+    )
+    assert response.status_code == 200
+
+    persisted_body = mock_container.replace_item.call_args.kwargs.get("body") \
+        or mock_container.replace_item.call_args.args[1]
+    room_b = next(r for r in persisted_body["rooms"] if r["id"] == "room-B")
+    assert room_b["prompt_addendum"] is None
+
+
+def test_patch_room_returns_404_when_project_missing(client, mock_staging_deps):
+    from azure.cosmos.exceptions import CosmosResourceNotFoundError
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.side_effect = CosmosResourceNotFoundError(
+        status_code=404, message="Not found"
+    )
+    response = client.patch(
+        "/api/v1/staging/projects/nope/rooms/room-A",
+        json={"prompt_addendum": "x"},
+    )
+    assert response.status_code == 404
+
+
+def test_patch_room_returns_404_when_room_missing(client, mock_staging_deps):
+    mock_container = mock_staging_deps["container"]
+    mock_container.read_item.return_value = _project_with_two_rooms_for_patch()
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-DOES-NOT-EXIST",
+        json={"prompt_addendum": "x"},
+    )
+    assert response.status_code == 404
+
+
+def test_patch_room_does_not_trigger_regeneration(client, mock_staging_deps):
+    """The endpoint must not enqueue any generation work. Verifies the
+    pipeline is never called and the response is a plain JSON
+    Project payload (not an SSE stream)."""
+    mock_container = mock_staging_deps["container"]
+    mock_pipeline = mock_staging_deps["pipeline"]
+    project_data = _project_with_two_rooms_for_patch()
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-A",
+        json={"prompt_addendum": "new"},
+    )
+    assert response.status_code == 200
+    # Plain JSON, not text/event-stream.
+    assert response.headers["content-type"].startswith("application/json")
+    # Pipeline never invoked.
+    assert not mock_pipeline.process_room.called
+    assert not mock_pipeline.generate_project.called
+    assert not mock_pipeline.process_single_variation.called
+
+
+def test_patch_room_returns_updated_project(client, mock_staging_deps):
+    """The response payload must include the freshly-updated project
+    so the frontend can update its local state without an extra GET."""
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_with_two_rooms_for_patch()
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    response = client.patch(
+        "/api/v1/staging/projects/proj-patch/rooms/room-A",
+        json={"prompt_addendum": "fresh addendum"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "project" in body
+    project = body["project"]
+    room_a = next(r for r in project["rooms"] if r["id"] == "room-A")
+    assert room_a["prompt_addendum"] == "fresh addendum"
+
+
+# ----------------------------------------------------------------------------
+# Generation behavior — the addendum actually reaches the image-gen prompt
+# ----------------------------------------------------------------------------
+
+
+def _project_for_addendum_regen(*, addendum, with_brief=True):
+    """One-room project with ``room.prompt_addendum`` set. Used to
+    verify the per-variation regen path composes the addendum into the
+    final ``adapted_prompt`` that reaches ``process_single_variation``.
+    """
+    project = {
+        "id": "proj-addendum",
+        "name": "Addendum Regen Test",
+        "prompt": "USER_INTENT_SENTINEL — modern",
+        "status": "completed",
+        "rooms": [{
+            "id": "room-1",
+            "label": "Living Room",
+            "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/photo.png",
+            "status": "completed",
+            "prompt_addendum": addendum,
+            "analysis": {"description": "A sunlit room", "features": []},
+            "variations": [{
+                "id": "var-1",
+                "status": "completed",
+                "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/img.png",
+                "generation_metadata": {
+                    "model": "gpt-image-2",
+                    "adapted_prompt": _PRIOR_PROMPT,
+                    "generation_time_ms": 5000,
+                },
+            }],
+        }],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+        "analyses": [{"room_id": "room-1", "description": "A sunlit room", "features": []}],
+    }
+    if with_brief:
+        project["design_brief"] = {
+            "global_instructions": "BRIEF_INTENT_SENTINEL — warm scandinavian",
+            "object_palette": [
+                {"name": "Sofa", "category": "furniture", "default_quantity": 1, "size": "3-seater", "placement": "facing window"},
+            ],
+            "placement_guide": {"back_row": "art"},
+            "per_image_notes": {},
+            "preserve_elements": [],
+            "per_image_objects": {},
+        }
+    return project
+
+
+def test_fresh_regen_composes_room_addendum_into_adapted_prompt(
+    client, mock_staging_deps,
+):
+    """When ``room.prompt_addendum`` is set, the per-variation
+    ``strategy=fresh`` regen path must compose the addendum into the
+    ``adapted_prompt`` that reaches ``process_single_variation``.
+
+    The composer appends the addendum to whatever base prompt source
+    won (brief or adapt_prompt). We assert on the captured
+    ``adapted_prompt`` argument because that's what gets persisted to
+    ``generation_metadata.adapted_prompt`` and what determines the
+    image-gen call.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_addendum_regen(addendum=_ADDENDUM_TEXT, with_brief=True)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+
+    captured_prompts: list[str] = []
+
+    async def _capturing_psv(self, project, room, variation, adapted_prompt):
+        captured_prompts.append(adapted_prompt)
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _capturing_psv):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-addendum/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    assert len(captured_prompts) == 1, (
+        f"process_single_variation must be called exactly once; got {captured_prompts!r}"
+    )
+    final_prompt = captured_prompts[0]
+    assert _ADDENDUM_TEXT in final_prompt, (
+        f"The room addendum must appear in the final adapted_prompt that "
+        f"reaches process_single_variation. Got: {final_prompt!r}"
+    )
+    # Sanity: the LLM-generated base ("new direction" from the captured
+    # mock) is ALSO present, separated by a paragraph break.
+    assert "new direction\n\n" + _ADDENDUM_TEXT == final_prompt
+
+
+def test_fresh_regen_no_brief_path_composes_room_addendum(
+    client, mock_staging_deps,
+):
+    """The no-brief fallback path (``adapt_prompt`` instead of
+    ``brief_to_prompts``) must also compose the addendum. The composer
+    is at the last mile so any source of base prompt flows through it.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_addendum_regen(addendum=_ADDENDUM_TEXT, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_llm = _make_captured_llm()
+    captured_prompts: list[str] = []
+
+    async def _capturing_psv(self, project, room, variation, adapted_prompt):
+        captured_prompts.append(adapted_prompt)
+        if False:
+            yield  # pragma: no cover
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A sunlit room", "features": []}
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch("backend.core.async_llm_client", captured_llm), \
+         _patch.object(StagingPipeline, "process_single_variation", _capturing_psv), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-addendum/rooms/room-1/variations/var-1/regenerate?strategy=fresh",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    assert len(captured_prompts) == 1
+    assert _ADDENDUM_TEXT in captured_prompts[0]
+
+
+def test_retry_regen_does_not_recompose_addendum(client, mock_staging_deps):
+    """``strategy=retry`` uses the prior ``adapted_prompt`` verbatim and
+    does NOT pass through the composer. Per PRD § Further Notes:
+
+        > Retry semantics intentionally do not re-run the composer. To pick
+        > up a new addendum on an existing variation the user must use Edit
+        > Prompt or regenerate the whole room.
+
+    This guards against a regression where someone "helpfully" composes
+    the addendum onto a Retry, double-appending the addendum (since the
+    prior prompt already includes whatever addendum was in effect when
+    it was first generated).
+    """
+    mock_container = mock_staging_deps["container"]
+    # The prior prompt does NOT contain the current addendum text.
+    project_data = _project_for_addendum_regen(addendum=_ADDENDUM_TEXT, with_brief=False)
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_prompts: list[str] = []
+
+    async def _capturing_psv(self, project, room, variation, adapted_prompt):
+        captured_prompts.append(adapted_prompt)
+        if False:
+            yield  # pragma: no cover
+
+    from backend.core.staging_pipeline import StagingPipeline
+
+    with _patch.object(StagingPipeline, "process_single_variation", _capturing_psv):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-addendum/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    assert len(captured_prompts) == 1
+    final_prompt = captured_prompts[0]
+    # Retry path uses the prior prompt VERBATIM.
+    assert final_prompt == _PRIOR_PROMPT, (
+        f"Retry must use prior adapted_prompt verbatim (no recomposition). "
+        f"Got: {final_prompt!r}"
+    )
+    # The current addendum text must NOT have been appended.
+    assert _ADDENDUM_TEXT not in final_prompt
+
+
+def test_retry_with_no_prior_prompt_falls_back_to_fresh_and_composes_addendum(
+    client, mock_staging_deps,
+):
+    """Retry with no prior ``adapted_prompt`` falls back to the fresh
+    path (per issue 004 of single-variation-regen PRD), and the fresh
+    path composes the room addendum onto the freshly-generated base
+    prompt. This pins the joint behavior across two prior PRDs.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _project_for_addendum_regen(addendum=_ADDENDUM_TEXT, with_brief=False)
+    # Strip the prior adapted_prompt so retry MUST fall back to fresh.
+    project_data["rooms"][0]["variations"][0]["generation_metadata"] = {
+        "model": "gpt-image-2",
+        "adapted_prompt": None,
+    }
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    captured_prompts: list[str] = []
+
+    async def _capturing_psv(self, project, room, variation, adapted_prompt):
+        captured_prompts.append(adapted_prompt)
+        if False:
+            yield  # pragma: no cover
+
+    async def _stub_adapt(self, user_prompt, room_analysis, n_variations,
+                          rejected_prompt=None):
+        return ["fresh-fallback base"]
+
+    async def _fake_analyze_room(self, image_b64):
+        return {"description": "A room", "features": []}
+
+    from backend.core.staging_pipeline import StagingPipeline
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    with _patch.object(StagingPipeline, "process_single_variation", _capturing_psv), \
+         _patch.object(StagingPipeline, "adapt_prompt", _stub_adapt), \
+         _patch.object(StagingPipeline, "analyze_room", _fake_analyze_room), \
+         _patch.object(AzureBlobStorageService, "get_asset_content",
+                       return_value=(b"FAKE_IMG", "image/png")):
+        with client.stream(
+            "POST",
+            "/api/v1/staging/projects/proj-addendum/rooms/room-1/variations/var-1/regenerate?strategy=retry",
+        ) as response:
+            assert response.status_code == 200, response.text
+            for _ in response.iter_bytes():
+                pass
+
+    # Composer ran on the fresh-fallback base.
+    assert captured_prompts == [f"fresh-fallback base\n\n{_ADDENDUM_TEXT}"], (
+        f"Retry-with-no-prior must fall back to fresh AND compose the "
+        f"addendum. Got: {captured_prompts!r}"
+    )

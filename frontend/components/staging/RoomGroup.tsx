@@ -1,8 +1,11 @@
 "use client"
 
+import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { RefreshCw, Clock, Info, AlertTriangle } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Textarea } from "@/components/ui/textarea";
+import { RefreshCw, Clock, Info, AlertTriangle, Pencil, Loader2 } from "lucide-react";
 import { VariationThumbnail } from "./VariationThumbnail";
 import { StorageImage } from "./StorageImage";
 import { Room } from "@/services/stagingApi";
@@ -13,12 +16,47 @@ interface RoomGroupProps {
   onRetryVariation?: (room: Room, variationIndex: number) => void;
   onRegenerateRoom?: (room: Room) => void;
   onRegenerateVariation?: (room: Room, variationIndex: number, strategy: 'retry' | 'fresh') => void;
+  onUpdateAddendum?: (room: Room, promptAddendum: string | null) => Promise<void>;
   regeneratingVariationId?: string | null;
   isGenerating?: boolean;
   queuedVariationIds?: ReadonlySet<string>;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onUpdateAddendum, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
+  // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
+  // the projects-page-improvements PRD). The draft is reset to the persisted
+  // value every time the popover opens so a Cancel followed by another open
+  // shows the saved state, not the stale draft.
+  const [isAddendumOpen, setIsAddendumOpen] = useState(false);
+  const [addendumDraft, setAddendumDraft] = useState<string>(room.prompt_addendum ?? "");
+  const [isSavingAddendum, setIsSavingAddendum] = useState(false);
+
+  const handleAddendumOpenChange = (open: boolean) => {
+    if (open) {
+      // Resync the draft from the persisted value on every open so a
+      // post-save reload (which changes ``room.prompt_addendum``) is
+      // reflected before the user types again.
+      setAddendumDraft(room.prompt_addendum ?? "");
+    }
+    setIsAddendumOpen(open);
+  };
+
+  const handleSaveAddendum = async () => {
+    if (!onUpdateAddendum) return;
+    setIsSavingAddendum(true);
+    try {
+      // Empty / whitespace-only sends `null` so the backend clears the
+      // field. The server normalizes both to `null` on persist; sending
+      // explicit `null` keeps the request body unambiguous.
+      const trimmed = addendumDraft.trim();
+      const next: string | null = trimmed.length === 0 ? null : trimmed;
+      await onUpdateAddendum(room, next);
+      setIsAddendumOpen(false);
+    } finally {
+      setIsSavingAddendum(false);
+    }
+  };
+
   const getStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
     switch (status) {
       case 'completed':
@@ -61,6 +99,66 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <h3 className="text-lg font-semibold">{room.label}</h3>
+          {onUpdateAddendum && (
+            <Popover open={isAddendumOpen} onOpenChange={handleAddendumOpenChange}>
+              <PopoverTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-7 w-7"
+                  aria-label={
+                    room.prompt_addendum
+                      ? `Edit per-image addendum for ${room.label}`
+                      : `Add per-image addendum for ${room.label}`
+                  }
+                  data-testid={`room-addendum-trigger-${room.id}`}
+                  data-has-addendum={room.prompt_addendum ? "true" : "false"}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="start"
+                className="w-80 space-y-3"
+                data-testid={`room-addendum-popover-${room.id}`}
+              >
+                <div className="space-y-1">
+                  <h4 className="text-sm font-medium">Per-image addendum</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Appended to this room&apos;s prompt for future generations.
+                    Existing variations are not changed.
+                  </p>
+                </div>
+                <Textarea
+                  value={addendumDraft}
+                  onChange={(e) => setAddendumDraft(e.target.value)}
+                  placeholder="e.g. always in front of the fence, never behind"
+                  rows={4}
+                  disabled={isSavingAddendum}
+                  data-testid={`room-addendum-textarea-${room.id}`}
+                />
+                <div className="flex justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setIsAddendumOpen(false)}
+                    disabled={isSavingAddendum}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={handleSaveAddendum}
+                    disabled={isSavingAddendum}
+                    data-testid={`room-addendum-save-${room.id}`}
+                  >
+                    {isSavingAddendum && <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />}
+                    Save
+                  </Button>
+                </div>
+              </PopoverContent>
+            </Popover>
+          )}
           <Badge variant={getStatusVariant(room.status)} className="text-xs">
             {room.status}
           </Badge>

@@ -12,6 +12,7 @@ from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
 from backend.core.project_status import ProjectStatusCalculator
+from backend.core.prompt_composer import PromptComposer
 from backend.core.staging_pipeline import _get_project_lock
 from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
@@ -29,6 +30,7 @@ from backend.models.staging import (
     ProjectResponse,
     Room,
     StagingProject,
+    UpdateRoomRequest,
     UploadRoomsResponse,
     Variation,
 )
@@ -265,6 +267,66 @@ async def upload_rooms(
     storage.update_project(project_id, updates)
 
     return UploadRoomsResponse(project_id=project_id, rooms_added=len(new_rooms), rooms=new_rooms)
+
+
+@router.patch("/projects/{project_id}/rooms/{room_id}", response_model=ProjectResponse)
+async def update_room(
+    project_id: str,
+    room_id: str,
+    body: UpdateRoomRequest,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Partial-update editable Room fields (currently just
+    ``prompt_addendum``).
+
+    Issue 003 of the projects-page-improvements PRD. Per the PRD's
+    Further Notes the implementer chose a dedicated room-scoped endpoint
+    over extending ``PATCH /projects/{id}`` because:
+
+    - ``PATCH /projects/{id}`` doesn't exist yet (slice 002).
+    - The URL semantics match the resource being edited.
+    - Keeps room-scoped concerns out of the project-level PATCH.
+
+    The endpoint:
+
+    - Updates only ``room.prompt_addendum`` on the target room.
+    - Normalizes ``""``, ``None``, and whitespace-only to ``None`` so the
+      persisted shape stays consistent with the composer's "absent" rule.
+    - Leaves variations / status / image_url / label untouched.
+    - Leaves all sibling rooms byte-for-byte unchanged.
+    - Leaves project-level status / prompt / settings untouched.
+    - Does NOT trigger any generation.
+
+    The read-modify-write is wrapped in the per-project asyncio lock from
+    ``staging_pipeline._get_project_lock`` so concurrent edits across
+    different rooms (or a parallel regen finalizer) cannot clobber each
+    other through Cosmos's full-doc replacement semantics. This mirrors
+    the protection already in place on the regen-finalizer write paths.
+    """
+    async with _get_project_lock(project_id):
+        project_data = storage.get_project(project_id)
+        if not project_data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        rooms = project_data.get("rooms", [])
+        room = next((r for r in rooms if r.get("id") == room_id), None)
+        if not room:
+            raise HTTPException(status_code=404, detail="Room not found")
+
+        # Normalize empty / whitespace-only addendum to None so the
+        # persisted shape stays clean. Mirrors ``PromptComposer``'s
+        # "absent if it strips to empty" treatment.
+        addendum = body.prompt_addendum
+        if isinstance(addendum, str) and not addendum.strip():
+            addendum = None
+        elif isinstance(addendum, str):
+            addendum = addendum.strip()
+        room["prompt_addendum"] = addendum
+
+        storage.update_project(project_id, project_data)
+
+    clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
+    return ProjectResponse(project=StagingProject(**clean))
 
 
 def _sse_event(event_type: str, data: dict) -> str:
@@ -636,6 +698,26 @@ async def regenerate_variation(
                         rejected_prompt=prior_adapted_prompt,
                     )
                     adapted_prompt = prompts[0]
+
+                # Issue 003 (projects-page-improvements PRD): per-room
+                # ``prompt_addendum`` is composed onto the freshly-
+                # generated base prompt at the LAST MILE (after either
+                # the brief OR adapt_prompt path produced the base) so
+                # both source paths get the addendum uniformly. The
+                # composer is a no-op when ``room.prompt_addendum`` is
+                # None / empty / whitespace-only — existing rooms
+                # without an addendum see the original behavior.
+                # Retry path is intentionally NOT touched: it uses the
+                # prior ``generation_metadata.adapted_prompt`` verbatim
+                # (which already includes whatever addendum was in
+                # effect at the original generation time), so re-
+                # composing would double-append.
+                if adapted_prompt is not None:
+                    adapted_prompt = PromptComposer.compose(
+                        project_prompt=project.prompt,
+                        design_brief=adapted_prompt,
+                        room_addendum=room.prompt_addendum,
+                    )
 
             if not adapted_prompt:
                 # Issue 008: prompt-generation never produced a usable

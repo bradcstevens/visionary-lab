@@ -17,7 +17,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { RoomGroup } from "@/components/staging/RoomGroup";
 import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
-import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
+import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, updateRoomAddendum, StagingProject, Room, StagingStreamEvent } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -466,6 +466,38 @@ export default function ProjectDetailPage() {
     toast.info('Add rooms feature coming soon');
   };
 
+  const handleUpdateRoomAddendum = useCallback(async (room: Room, promptAddendum: string | null) => {
+    // Issue 003 of projects-page-improvements PRD: persist a per-room
+    // addendum without triggering any regeneration. The backend
+    // normalizes empty / whitespace-only to null and returns the freshly-
+    // updated project. We MUST resolveImageUrls() before swapping state
+    // in — otherwise the bare blob URLs from the PATCH response would
+    // replace the SAS-suffixed URLs already in local state, breaking
+    // image previews and the lightbox until the next full reload.
+    try {
+      const updated = await updateRoomAddendum(projectId, room.id, promptAddendum);
+      await resolveImageUrls(updated);
+      setProject(updated);
+      toast.success(
+        promptAddendum === null
+          ? `Cleared addendum for ${room.label}`
+          : `Saved addendum for ${room.label}`
+      );
+      activityLog.log({
+        level: 'info',
+        icon: '✏',
+        message:
+          promptAddendum === null
+            ? `Cleared per-image addendum for ${room.label}`
+            : `Updated per-image addendum for ${room.label}`,
+        detail: 'Applies to future generations only.',
+      });
+    } catch (error) {
+      toast.error(parseApiError(error, 'Failed to save addendum'));
+      throw error;
+    }
+  }, [projectId, activityLog]);
+
   const handleDeleteProject = async () => {
     setIsDeleting(true);
     try {
@@ -725,6 +757,7 @@ export default function ProjectDetailPage() {
               onRetryVariation={handleRetryVariation}
               onRegenerateRoom={handleRegenerateRoom}
               onRegenerateVariation={handleRegenerateVariation}
+              onUpdateAddendum={handleUpdateRoomAddendum}
               regeneratingVariationId={regeneratingVariationId}
               isGenerating={isGenerating}
               queuedVariationIds={retryQueue.queuedIds}

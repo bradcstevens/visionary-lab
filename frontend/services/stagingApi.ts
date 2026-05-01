@@ -61,6 +61,7 @@ export interface Room {
   original_image_url: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   variations: Variation[];
+  prompt_addendum?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -772,4 +773,23 @@ export async function updateBrief(projectId: string, brief: DesignBrief): Promis
   }
   const data = await response.json();
   return data.brief;
+}
+
+export async function updateRoomAddendum(
+  projectId: string,
+  roomId: string,
+  promptAddendum: string | null,
+): Promise<StagingProject> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}`;
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt_addendum: promptAddendum }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to update room addendum: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.project;
 }

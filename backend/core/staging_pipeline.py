@@ -14,6 +14,7 @@ from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.image_pipeline import ImagePipelineService
 from backend.core.project_status import ProjectStatusCalculator
+from backend.core.prompt_composer import PromptComposer
 from backend.core.prompt_diversity import build_diversifying_prompt
 from backend.core.retry import call_with_retry
 from backend.core.staging_storage import StagingStorageService
@@ -242,6 +243,28 @@ class StagingPipeline:
                         room_analysis=room_description,
                         n_variations=project.settings.variations_per_room,
                     )
+
+                # Issue 003 (projects-page-improvements PRD): per-room
+                # ``prompt_addendum`` is composed onto every per-variation
+                # base prompt at the LAST MILE so both source paths
+                # (brief and adapt_prompt) get the addendum uniformly.
+                # The composer is a no-op when ``room.prompt_addendum``
+                # is None / empty / whitespace, so existing rooms
+                # without an addendum see no change. The composed value
+                # is what gets fanned out to ``_variation_worker`` and
+                # persisted into ``generation_metadata.adapted_prompt``,
+                # which means a subsequent ``Retry Same Prompt`` reuses
+                # the composed value verbatim — matching the PRD's Retry
+                # semantic ("Retry does not re-run the composer").
+                if room.prompt_addendum:
+                    adapted_prompts = [
+                        PromptComposer.compose(
+                            project_prompt=project.prompt,
+                            design_brief=p,
+                            room_addendum=room.prompt_addendum,
+                        )
+                        for p in adapted_prompts
+                    ]
 
                 # Cap prompts at #variations and warn on excess; truncate
                 # before fan-out so we don't spawn workers for missing slots.
