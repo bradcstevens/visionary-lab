@@ -21,11 +21,27 @@ interface RoomGroupProps {
   onEditPromptVariation?: (room: Room, variationIndex: number) => void;
   onUpdateAddendum?: (room: Room, promptAddendum: string | null) => Promise<void>;
   regeneratingVariationId?: string | null;
-  isGenerating?: boolean;
+  /**
+   * Issue 007 of projects-page-improvements PRD: per-room busy gate.
+   * True iff a project-level OR this-room-level generation is in flight.
+   * Replaces the prior global ``isGenerating`` prop. Disables the
+   * room-level Regenerate button. NOT set true by an in-flight variation
+   * regen in this room — that case is handled by the per-variation gate
+   * below (preserves the retry-queue scenario 3 supersede semantic where
+   * Regenerate Room can be clicked while a variation in the room is
+   * mid-regen).
+   */
+  isRoomBusy?: boolean;
+  /**
+   * Per-variation in-flight set. The menu items on a variation are gated
+   * on `!isRoomBusy && !inFlightVariationIds.has(variation.id)` so a
+   * variation already mid-regen / mid-edit-prompt does not re-fire.
+   */
+  inFlightVariationIds?: ReadonlySet<string>;
   queuedVariationIds?: ReadonlySet<string>;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds }: RoomGroupProps) {
   // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
   // the projects-page-improvements PRD). The draft is reset to the persisted
   // value every time the popover opens so a Cancel followed by another open
@@ -176,7 +192,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
             size="sm"
             variant="ghost"
             onClick={() => onRegenerateRoom(room)}
-            disabled={isGenerating}
+            disabled={isRoomBusy}
           >
             <RefreshCw className="h-3.5 w-3.5 mr-1" />
             Regenerate
@@ -224,37 +240,50 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
         </div>
 
         {/* Variation Thumbnails */}
-        {room.variations.map((variation, index) => (
-          <VariationThumbnail
-            key={variation.id}
-            imageUrl={variation.image_url}
-            status={variation.status}
-            error={variation.error}
-            index={index}
-            onClick={
-              variation.status === 'completed' && onVariationClick
-                ? () => onVariationClick(room, index)
-                : undefined
-            }
-            onRetry={
-              variation.status === 'failed' && onRetryVariation
-                ? () => onRetryVariation(room, index)
-                : undefined
-            }
-            onRegenerate={
-              variation.status === 'completed' && onRegenerateVariation && !isGenerating
-                ? (strategy) => onRegenerateVariation(room, index, strategy)
-                : undefined
-            }
-            onEditPrompt={
-              variation.status === 'completed' && onEditPromptVariation && !isGenerating
-                ? () => onEditPromptVariation(room, index)
-                : undefined
-            }
-            isRegenerating={regeneratingVariationId === variation.id}
-            isQueued={queuedVariationIds?.has(variation.id) ?? false}
-          />
-        ))}
+        {room.variations.map((variation, index) => {
+          // Issue 007: per-variation gating — a variation's regen / edit-
+          // prompt menu is hidden when EITHER the room is busy (project
+          // op or this room's own regen) OR this specific variation is
+          // already mid-regen / mid-edit-prompt. The two conditions catch
+          // distinct cases: room-busy hides the menu on every variation;
+          // per-variation hides only the one in flight (matching the
+          // pre-issue-007 behavior where the spinner appeared exactly on
+          // the in-flight variation while siblings stayed clickable
+          // outside of room-level generation).
+          const variationInFlight = inFlightVariationIds?.has(variation.id) ?? false;
+          const variationActionsAllowed = !isRoomBusy && !variationInFlight;
+          return (
+            <VariationThumbnail
+              key={variation.id}
+              imageUrl={variation.image_url}
+              status={variation.status}
+              error={variation.error}
+              index={index}
+              onClick={
+                variation.status === 'completed' && onVariationClick
+                  ? () => onVariationClick(room, index)
+                  : undefined
+              }
+              onRetry={
+                variation.status === 'failed' && onRetryVariation
+                  ? () => onRetryVariation(room, index)
+                  : undefined
+              }
+              onRegenerate={
+                variation.status === 'completed' && onRegenerateVariation && variationActionsAllowed
+                  ? (strategy) => onRegenerateVariation(room, index, strategy)
+                  : undefined
+              }
+              onEditPrompt={
+                variation.status === 'completed' && onEditPromptVariation && variationActionsAllowed
+                  ? () => onEditPromptVariation(room, index)
+                  : undefined
+              }
+              isRegenerating={regeneratingVariationId === variation.id}
+              isQueued={queuedVariationIds?.has(variation.id) ?? false}
+            />
+          );
+        })}
       </div>
     </div>
   );

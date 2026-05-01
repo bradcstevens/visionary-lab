@@ -19,13 +19,14 @@ import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
 import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
 import { EditPromptDialog } from "@/components/staging/EditPromptDialog";
-import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRegeneration, streamVariationRegeneration, streamVariationEditPrompt, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, UpdateProjectBody } from "@/services/stagingApi";
+import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
 import { getHeaderAction } from "@/utils/staging-header";
 import { useActivityLog } from "@/context/activity-log-context";
 import { useRetryQueue } from "@/hooks/useRetryQueue";
+import { useGenerationFleet, type LostOp } from "@/hooks/useGenerationFleet";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -34,7 +35,11 @@ export default function ProjectDetailPage() {
 
   const [project, setProject] = useState<StagingProject | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isGenerating, setIsGenerating] = useState(false);
+  // Issue 007 of projects-page-improvements PRD: the prior global
+  // `isGenerating` flag is replaced by per-operation state tracked in the
+  // `useGenerationFleet` hook (see below). Reads of `isAnyInFlight` /
+  // `inFlightRooms` / `inFlightVariations` substitute for the prior reads
+  // of `isGenerating` / `regeneratingVariationId`.
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
@@ -50,8 +55,6 @@ export default function ProjectDetailPage() {
     { roomId: string; variationIndex: number } | null
   >(null);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
-  const [regeneratingVariationId, setRegeneratingVariationId] = useState<string | null>(null);
-  const streamCleanupRef = useRef<(() => void) | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestLoadIdRef = useRef(0);
 
@@ -62,10 +65,11 @@ export default function ProjectDetailPage() {
     return () => activityLog.clear();
   }, []);
 
-  // Abort any active stream and pending reloads on unmount
+  // Abort all active streams and pending reloads on unmount. The
+  // useGenerationFleet hook's own unmount effect aborts all active streams
+  // it is tracking; the reload timer is page-local so we clear it here.
   useEffect(() => {
     return () => {
-      streamCleanupRef.current?.();
       if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
     };
   }, []);
@@ -171,6 +175,42 @@ export default function ProjectDetailPage() {
   // See PRD §"Page integration" (last sentence about the ``'error'``
   // case) and §"Testing Decisions" → scenario 4.
 
+  // Issue 007 of projects-page-improvements PRD: per-operation generation
+  // state replaces the prior global ``isGenerating`` flag. Each
+  // ``start*`` method on the hook opens its own SSE stream, registers the
+  // operation in the appropriate in-flight set on click (UI ack is
+  // immediate per AC #2), attaches a 120-second silence watchdog per
+  // stream (resets on every event of any type), and removes the
+  // operation on terminal events / abort / unmount / watchdog fire.
+  // ``onStreamLost`` is called when the watchdog fires; the hook also
+  // exposes ``lostOps`` so the page can render a per-room (or per-project)
+  // banner with a Retry action that replays the EXACT lost operation.
+  const fleet = useGenerationFleet({
+    onStreamLost: useCallback(
+      (lostOp: LostOp) => {
+        const scopeLabel =
+          lostOp.kind === 'project'
+            ? 'project generation'
+            : lostOp.kind === 'room'
+              ? `room ${lostOp.roomId.slice(0, 8)}`
+              : `variation in room ${lostOp.roomId.slice(0, 8)}`;
+        const toastBody =
+          lostOp.kind === 'project'
+            ? 'Stream lost — click Retry on the project banner above the rooms list.'
+            : 'Stream lost — click Retry on the affected room banner.';
+        activityLog.log({
+          level: 'warn',
+          icon: '⚠',
+          message: `Stream lost for ${scopeLabel}`,
+          detail: 'No SSE events arrived for 2 minutes — click Retry on the banner to try again.',
+        });
+        toast.warning(toastBody);
+      },
+      [activityLog],
+    ),
+  });
+  const { isAnyInFlight, inFlightProject, inFlightRooms, inFlightVariations } = fleet;
+
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
     if (variation.status === 'completed' && variation.image_url) {
@@ -194,10 +234,16 @@ export default function ProjectDetailPage() {
     }
   };
 
+  // Issue 007: per-variation regen now flows through the fleet hook so
+  // the in-flight Set populates synchronously, the watchdog attaches per
+  // stream, and unmount/abort cleanup is centralized. The hook's startVariation
+  // is idempotent on the same variationId, so we don't need the prior
+  // `if (regeneratingVariationId)` guard at the call site (the hook silently
+  // dedupes). The hook also aborts other variations in the same room when
+  // the user supersedes via Regenerate Room (preserves retry-queue scenario 3).
   const handleRegenerateVariation = useCallback((room: Room, variationIndex: number, strategy: 'retry' | 'fresh') => {
-    if (isGenerating || regeneratingVariationId) return;
     const variation = room.variations[variationIndex];
-    setRegeneratingVariationId(variation.id);
+    if (!variation) return;
 
     // Issue 006 of single-variation-regeneration PRD: closure-scoped flag —
     // each ``handleRegenerateVariation`` invocation gets its own. Set on
@@ -205,105 +251,90 @@ export default function ProjectDetailPage() {
     // the effective strategy label "(fresh — no prior prompt)".
     let fellBackToFresh = false;
 
-    const cleanup = streamVariationRegeneration(
-      projectId,
-      room.id,
-      variation.id,
-      strategy,
-      (event) => {
-        switch (event.type) {
-          case 'variation_completed': {
-            // Issue 006 success activity-log copy: include the strategy
-            // label and (when present) a 60-char snippet of the
-            // ``adapted_prompt`` that produced the result.
-            const completed = event as {
-              type: 'variation_completed';
-              model?: string;
-              tokens_used?: number;
-              elapsed_ms?: number;
-              adapted_prompt?: string;
-            };
-            const label = fellBackToFresh
-              ? '(fresh — no prior prompt)'
-              : strategy === 'retry'
-                ? '(retry)'
-                : '(fresh)';
-            const adaptedPrompt = completed.adapted_prompt;
-            const snippet =
-              typeof adaptedPrompt === 'string' && adaptedPrompt.length > 0
-                ? adaptedPrompt.slice(0, 60) + (adaptedPrompt.length > 60 ? '…' : '')
-                : null;
-            activityLog.log({
-              level: 'success',
-              icon: '✓',
-              message: `Variation ${variationIndex + 1} regenerated ${label}`,
-              detail: [
-                completed.model,
-                completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
-                completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
-                snippet,
-              ].filter(Boolean).join(' · ') || undefined,
-            });
-            break;
-          }
-          case 'variation_fallback':
-            // Issue 004 of single-variation-regeneration PRD: backend
-            // emits this when ``strategy=retry`` is requested but the
-            // variation has no prior ``adapted_prompt`` recorded. The
-            // regen continues normally; this is a one-line user
-            // notification that the retry silently became a fresh
-            // generation. Single info toast + activity-log entry — do
-            // NOT clear ``regeneratingVariationId`` (regen is still
-            // in flight). Also flip ``fellBackToFresh`` so the
-            // ``variation_completed`` activity entry shows the
-            // "(fresh — no prior prompt)" label per issue 006.
-            fellBackToFresh = true;
-            activityLog.log({
-              level: 'info',
-              icon: 'ℹ',
-              message: `Variation ${variationIndex + 1}: no previous prompt found`,
-              detail: 'Generating a fresh take instead.',
-            });
-            toast.info('No previous prompt found — generating a fresh take instead.');
-            break;
-          case 'variation_failed':
-            activityLog.log({
-              level: 'error',
-              icon: '✕',
-              message: `Variation ${variationIndex + 1} regeneration failed`,
-              detail: (event as any).error || 'Unknown error',
-            });
-            toast.error(`Regeneration failed: ${(event as any).error || 'Unknown error'}`);
-            break;
-          case 'project_completed':
-          case 'stream_ended':
-            // Issue 006: drop the spurious ``toast.success('Variation
-            // regenerated!')``. The success activity-log entry already
-            // landed on ``variation_completed``; an additional toast
-            // here would (a) duplicate that signal on the happy path
-            // and (b) flash a misleading success after a failure on
-            // the unhappy path (the double-toast bug). Both
-            // ``project_completed`` and ``stream_ended`` resolve to the
-            // same cleanup — clear the regen state and reload the
-            // project to surface the new variation.
-            setRegeneratingVariationId(null);
-            loadProject();
-            break;
-          case 'error':
-            setRegeneratingVariationId(null);
-            toast.error(event.error || 'Regeneration failed');
-            loadProject();
-            break;
+    fleet.startVariation(projectId, room.id, variation.id, strategy, (event) => {
+      switch (event.type) {
+        case 'variation_completed': {
+          // Issue 006 success activity-log copy: include the strategy
+          // label and (when present) a 60-char snippet of the
+          // ``adapted_prompt`` that produced the result.
+          const completed = event as {
+            type: 'variation_completed';
+            model?: string;
+            tokens_used?: number;
+            elapsed_ms?: number;
+            adapted_prompt?: string;
+          };
+          const label = fellBackToFresh
+            ? '(fresh — no prior prompt)'
+            : strategy === 'retry'
+              ? '(retry)'
+              : '(fresh)';
+          const adaptedPrompt = completed.adapted_prompt;
+          const snippet =
+            typeof adaptedPrompt === 'string' && adaptedPrompt.length > 0
+              ? adaptedPrompt.slice(0, 60) + (adaptedPrompt.length > 60 ? '…' : '')
+              : null;
+          activityLog.log({
+            level: 'success',
+            icon: '✓',
+            message: `Variation ${variationIndex + 1} regenerated ${label}`,
+            detail: [
+              completed.model,
+              completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
+              completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
+              snippet,
+            ].filter(Boolean).join(' · ') || undefined,
+          });
+          break;
         }
-      },
-    );
-
-    const previousCleanup = streamCleanupRef.current;
-    streamCleanupRef.current = () => {
-      cleanup();
-      previousCleanup?.();
-    };
-  }, [isGenerating, regeneratingVariationId, projectId, activityLog, loadProject]);
+        case 'variation_fallback':
+          // Issue 004 of single-variation-regeneration PRD: backend
+          // emits this when ``strategy=retry`` is requested but the
+          // variation has no prior ``adapted_prompt`` recorded. The
+          // regen continues normally; this is a one-line user
+          // notification that the retry silently became a fresh
+          // generation. Single info toast + activity-log entry. The
+          // hook keeps the variation in the in-flight set until a
+          // terminal event lands.
+          fellBackToFresh = true;
+          activityLog.log({
+            level: 'info',
+            icon: 'ℹ',
+            message: `Variation ${variationIndex + 1}: no previous prompt found`,
+            detail: 'Generating a fresh take instead.',
+          });
+          toast.info('No previous prompt found — generating a fresh take instead.');
+          break;
+        case 'variation_failed':
+          activityLog.log({
+            level: 'error',
+            icon: '✕',
+            message: `Variation ${variationIndex + 1} regeneration failed`,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            detail: (event as any).error || 'Unknown error',
+          });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          toast.error(`Regeneration failed: ${(event as any).error || 'Unknown error'}`);
+          break;
+        case 'project_completed':
+        case 'stream_ended':
+          // Issue 006: drop the spurious ``toast.success('Variation
+          // regenerated!')``. The success activity-log entry already
+          // landed on ``variation_completed``; an additional toast
+          // here would duplicate that signal on the happy path. Both
+          // ``project_completed`` and ``stream_ended`` resolve to the
+          // same cleanup — reload the project to surface the new
+          // variation. The hook clears the variation from inFlightVariations
+          // automatically.
+          loadProject();
+          break;
+        case 'error':
+          toast.error(event.error || 'Regeneration failed');
+          loadProject();
+          break;
+      }
+    });
+  }, [fleet, projectId, activityLog, loadProject]);
 
   const handleLightboxRegenerate = useCallback((strategy: 'retry' | 'fresh') => {
     if (!lightboxImage || !project) return;
@@ -324,10 +355,6 @@ export default function ProjectDetailPage() {
 
   const handleEditPromptSubmit = useCallback(async (adaptedPrompt: string): Promise<void> => {
     if (!editPromptTarget || !project) return;
-    if (isGenerating || regeneratingVariationId) {
-      toast.error('Wait for the current generation to finish before editing prompts.');
-      throw new Error('Generation in flight');
-    }
     const room = project.rooms.find((r) => r.id === editPromptTarget.roomId);
     if (!room) {
       throw new Error('Room not found');
@@ -336,84 +363,80 @@ export default function ProjectDetailPage() {
     if (!variation) {
       throw new Error('Variation not found');
     }
-
-    // Mark the source variation as the "in flight" one so the
-    // existing busy-gate semantics apply (lightbox-blocked, retry-
-    // queue gating, etc.). The backend appends a NEW variation —
-    // we'll only learn its ID when loadProject() runs after
-    // project_completed lands. Meanwhile, gating on the source ID
-    // is a reasonable proxy: it's the user-visible "thing being
-    // edited" until the new variation surfaces in the UI.
-    setRegeneratingVariationId(variation.id);
+    // Issue 007 per-variation gating (rubber-duck-flagged): the prior
+    // global isAnyInFlight gate also blocked Edit Prompt for room B
+    // while room A streamed. The new fleet model lets variation-level
+    // ops proceed concurrently with unrelated room/variation ops, so
+    // the gate now narrows to "this variation, room, OR project is in
+    // flight". Same predicate as the per-variation menu-item gate in
+    // RoomGroup so the check is consistent end-to-end.
+    if (
+      inFlightProject ||
+      inFlightRooms.has(room.id) ||
+      inFlightVariations.has(variation.id)
+    ) {
+      toast.error('Wait for this room to finish before editing prompts.');
+      throw new Error('Generation in flight');
+    }
 
     return new Promise<void>((resolve, reject) => {
       const variationLabel = `Variation ${editPromptTarget.variationIndex + 1}`;
-      const cleanup = streamVariationEditPrompt(
-        projectId,
-        room.id,
-        variation.id,
-        adaptedPrompt,
-        (event) => {
-          switch (event.type) {
-            case 'variation_completed': {
-              const completed = event as {
-                type: 'variation_completed';
-                model?: string;
-                tokens_used?: number;
-                elapsed_ms?: number;
-                adapted_prompt?: string;
-              };
-              const adapted = completed.adapted_prompt;
-              const snippet =
-                typeof adapted === 'string' && adapted.length > 0
-                  ? adapted.slice(0, 60) + (adapted.length > 60 ? '…' : '')
-                  : null;
-              activityLog.log({
-                level: 'success',
-                icon: '✓',
-                message: `${variationLabel}: new variation appended from edited prompt`,
-                detail: [
-                  completed.model,
-                  completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
-                  completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
-                  snippet,
-                ].filter(Boolean).join(' · ') || undefined,
-              });
-              break;
-            }
-            case 'variation_failed':
-              activityLog.log({
-                level: 'error',
-                icon: '✕',
-                message: `${variationLabel}: edit-prompt generation failed`,
-                detail: (event as { error?: string }).error || 'Unknown error',
-              });
-              toast.error(`Edit Prompt failed: ${(event as { error?: string }).error || 'Unknown error'}`);
-              break;
-            case 'project_completed':
-            case 'stream_ended':
-              setRegeneratingVariationId(null);
-              setEditPromptTarget(null);
-              loadProject();
-              resolve();
-              break;
-            case 'error':
-              setRegeneratingVariationId(null);
-              toast.error(event.error || 'Edit Prompt failed');
-              loadProject();
-              reject(new Error(event.error || 'Edit Prompt failed'));
-              break;
+      // The hook marks the source variation as in flight via inFlightVariations
+      // (the backend appends a NEW variation but until that surfaces in the
+      // UI on loadProject(), the source variation is the user-visible "thing
+      // being edited" — same proxy as before issue 007).
+      fleet.editPrompt(projectId, room.id, variation.id, adaptedPrompt, (event) => {
+        switch (event.type) {
+          case 'variation_completed': {
+            const completed = event as {
+              type: 'variation_completed';
+              model?: string;
+              tokens_used?: number;
+              elapsed_ms?: number;
+              adapted_prompt?: string;
+            };
+            const adapted = completed.adapted_prompt;
+            const snippet =
+              typeof adapted === 'string' && adapted.length > 0
+                ? adapted.slice(0, 60) + (adapted.length > 60 ? '…' : '')
+                : null;
+            activityLog.log({
+              level: 'success',
+              icon: '✓',
+              message: `${variationLabel}: new variation appended from edited prompt`,
+              detail: [
+                completed.model,
+                completed.tokens_used ? `${Number(completed.tokens_used).toLocaleString()} tokens` : null,
+                completed.elapsed_ms ? `${(completed.elapsed_ms / 1000).toFixed(1)}s` : null,
+                snippet,
+              ].filter(Boolean).join(' · ') || undefined,
+            });
+            break;
           }
-        },
-      );
-
-      const previousCleanup = streamCleanupRef.current;
-      streamCleanupRef.current = () => {
-        cleanup();
-        previousCleanup?.();
-      };
+          case 'variation_failed':
+            activityLog.log({
+              level: 'error',
+              icon: '✕',
+              message: `${variationLabel}: edit-prompt generation failed`,
+              detail: (event as { error?: string }).error || 'Unknown error',
+            });
+            toast.error(`Edit Prompt failed: ${(event as { error?: string }).error || 'Unknown error'}`);
+            break;
+          case 'project_completed':
+          case 'stream_ended':
+            setEditPromptTarget(null);
+            loadProject();
+            resolve();
+            break;
+          case 'error':
+            toast.error(event.error || 'Edit Prompt failed');
+            loadProject();
+            reject(new Error(event.error || 'Edit Prompt failed'));
+            break;
+        }
+      });
     });
-  }, [editPromptTarget, project, projectId, isGenerating, regeneratingVariationId, activityLog, loadProject]);
+  }, [editPromptTarget, project, projectId, inFlightProject, inFlightRooms, inFlightVariations, fleet, activityLog, loadProject]);
 
   // Issue 002 of failed-variation-retry-queue PRD: per-page in-memory
   // retry queue. Failed-variation Retry clicks during in-flight
@@ -436,8 +459,17 @@ export default function ProjectDetailPage() {
   );
   const retryQueue = useRetryQueue({
     project,
-    isGenerating,
-    regeneratingVariationId,
+    // Issue 007: the retry queue's "is anything in flight?" check is now
+    // satisfied by the fleet's derived `isAnyInFlight` boolean, replacing
+    // the prior (isGenerating, regeneratingVariationId) pair. The retry
+    // queue's interface intentionally stays as-is — the second field is
+    // wired to `null` so its drain effect's `regeneratingVariationId !==
+    // null` check is benign. The first field carries the unified busy
+    // signal. This preserves the four existing retry-queue scenarios
+    // (queue, dedup, supersede on Regenerate Room, drop on global error)
+    // verbatim against the new fleet-driven state.
+    isGenerating: isAnyInFlight,
+    regeneratingVariationId: null,
     onDispatch: handleRegenerateVariation,
     onDrop: onDropQueuedRetry,
   });
@@ -448,7 +480,9 @@ export default function ProjectDetailPage() {
         activityLog.log({
           level: 'info',
           icon: '▶',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           message: `Starting generation for "${(event as any).label ?? 'room'}"`,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
         });
         debouncedReload();
@@ -457,10 +491,14 @@ export default function ProjectDetailPage() {
         activityLog.log({
           level: 'success',
           icon: '✓',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           message: `Variation ${((event as any).variation_index ?? 0) + 1} saved`,
           detail: [
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (event as any).model,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
           ].filter(Boolean).join(' · ') || undefined,
         });
@@ -470,7 +508,9 @@ export default function ProjectDetailPage() {
         activityLog.log({
           level: 'error',
           icon: '✕',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           message: `Variation ${((event as any).variation_index ?? 0) + 1} failed`,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           detail: (event as any).error || 'Unknown error',
         });
         debouncedReload();
@@ -483,6 +523,7 @@ export default function ProjectDetailPage() {
           level: 'success',
           icon: '✓',
           message: 'Room complete',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
         });
         debouncedReload();
@@ -492,6 +533,7 @@ export default function ProjectDetailPage() {
           level: 'error',
           icon: '✕',
           message: 'Room failed',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           detail: (event as any).error || 'Unknown error',
         });
         debouncedReload();
@@ -504,7 +546,8 @@ export default function ProjectDetailPage() {
           icon: '🎉',
           message: 'Generation complete!',
         });
-        setIsGenerating(false);
+        // The fleet hook clears the in-flight flag on terminal events; the
+        // page just resets its own page-level error state.
         setGenerationError(null);
         toast.success('Generation completed!');
         loadProject();
@@ -512,10 +555,9 @@ export default function ProjectDetailPage() {
       case 'stream_ended':
         // Fallback: stream closed without a terminal event — reconcile state
         if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
-        setIsGenerating(false);
         loadProject();
         break;
-      case 'error':
+      case 'error': {
         if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
         activityLog.log({
           level: 'error',
@@ -523,21 +565,17 @@ export default function ProjectDetailPage() {
           message: 'Generation error',
           detail: event.error || 'Unknown error',
         });
-        setIsGenerating(false);
         setGenerationError(event.error || 'Generation failed');
         toast.error(event.error || 'Generation failed');
         loadProject();
         // Issue 004 of failed-variation-retry-queue PRD: drop queued
-        // retries on global stream error so we don't immediately fire
-        // N more requests against the same broken upstream after the
-        // banner appears. ``clear()`` returns the count of dropped
-        // entries so the activity-log message is truthful without
-        // racing against the rendered ``queuedIds`` Set (which is
-        // populated via setState and may be one render behind
-        // ``queueRef``). When the queue was already empty the call
-        // is a no-op and no log entry fires (avoids noise on every
-        // unrelated error). See PRD §"Page integration" (last
-        // sentence about the ``'error'`` case).
+        // retries on global stream error so we don't immediately fire N
+        // more requests against the same broken upstream after the banner
+        // appears. ``clear()`` returns the count of dropped entries so
+        // the activity-log message is truthful without racing against the
+        // rendered ``queuedIds`` Set (which is populated via setState
+        // and may be one render behind ``queueRef``). When the queue was
+        // already empty the call is a no-op and no log entry fires.
         const droppedCount = retryQueue.clear();
         if (droppedCount > 0) {
           activityLog.log({
@@ -548,34 +586,23 @@ export default function ProjectDetailPage() {
           });
         }
         break;
+      }
     }
   }, [retryQueue, activityLog, debouncedReload, loadProject]);
 
-  // Issue 003 of failed-variation-retry-queue PRD: the three "larger
-  // regen action" entry points — startGeneration (Generate Remaining
-  // / first Generate), handleRegenerateRoom (per-room Regenerate),
-  // handleRegenerateAll (Regenerate All) — each call ``retryQueue.clear()``
-  // BEFORE their existing ``isGenerating`` guard. The supersede semantic:
-  // when the user triggers a regen action that subsumes individual
-  // failed-variation retries, the queued per-variation retries are
-  // silently cleared so they don't fire redundantly after the bigger
-  // action completes. Placing the clear() BEFORE the guard ensures the
-  // queue is consistently cleared even on accidental double-clicks
-  // (where the second click is short-circuited by the guard but the
-  // clear() still runs first). See PRD §"Page integration" (clear()
-  // paragraph).
-  //
-  // These callbacks are defined AFTER useRetryQueue so they can
-  // reference ``retryQueue.clear`` directly (rather than via a forward
-  // ref). They were moved here from above-handleRegenerateVariation in
-  // a no-op refactor; the prior placement was historical, not load-
-  // bearing.
+  // Issue 003 of failed-variation-retry-queue PRD + issue 007 of projects-
+  // page-improvements PRD: the three "larger regen action" entry points
+  // each call ``retryQueue.clear()`` BEFORE delegating to the fleet hook.
+  // The supersede semantic is preserved: when the user triggers a regen
+  // action that subsumes individual failed-variation retries, the queued
+  // per-variation retries are silently cleared. The fleet hook also
+  // cascades: startProject() aborts ALL in-flight streams; startRoom()
+  // aborts in-flight variations within the same room (preserves retry-
+  // queue scenario 3). The page no longer manages a single
+  // ``streamCleanupRef``; the hook owns each stream's abort.
   const startGeneration = useCallback(() => {
     retryQueue.clear();
-    if (isGenerating) return;
-    // Abort any existing stream before starting a new one
-    streamCleanupRef.current?.();
-    setIsGenerating(true);
+    if (isAnyInFlight) return;
     setGenerationError(null);
     activityLog.log({
       level: 'info',
@@ -583,23 +610,26 @@ export default function ProjectDetailPage() {
       message: `Starting generation for "${project?.name}"`,
       detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
     });
-    streamCleanupRef.current = streamGeneration(projectId, handleStreamEvent);
-  }, [retryQueue, activityLog, project, totalVariations, isGenerating, projectId, handleStreamEvent]);
+    fleet.startProject(projectId, handleStreamEvent);
+  }, [retryQueue, activityLog, project, totalVariations, isAnyInFlight, fleet, projectId, handleStreamEvent]);
 
   const handleRegenerateRoom = useCallback((room: Room) => {
     retryQueue.clear();
-    if (isGenerating) return;
-    // Abort any existing stream before starting a new one
-    streamCleanupRef.current?.();
-    setIsGenerating(true);
+    // Per the new disabling rules (issue 007), the room-level Regenerate
+    // is disabled iff `inFlightProject || inFlightRooms.has(room.id)`.
+    // The fleet hook is also idempotent on the same roomId, so a double-
+    // click is silently deduped. We DO NOT gate on `isAnyInFlight` here
+    // because variation regen in this room shouldn't block room
+    // Regenerate (preserves the retry-queue scenario 3 supersede path).
+    if (inFlightProject || inFlightRooms.has(room.id)) return;
     setGenerationError(null);
     toast.info(`Regenerating ${room.label}...`);
-    streamCleanupRef.current = streamRoomRegeneration(projectId, room.id, handleStreamEvent);
-  }, [retryQueue, isGenerating, projectId, handleStreamEvent]);
+    fleet.startRoom(projectId, room.id, handleStreamEvent);
+  }, [retryQueue, inFlightProject, inFlightRooms, fleet, projectId, handleStreamEvent]);
 
   const handleRegenerateAll = () => {
     retryQueue.clear();
-    if (isGenerating) return;
+    if (isAnyInFlight) return;
     startGeneration();
     toast.info('Regenerating all rooms...');
   };
@@ -723,7 +753,7 @@ export default function ProjectDetailPage() {
   };
 
   // Detect stale processing: project loaded with 'processing' but no active SSE stream
-  const isStaleProcessing = project?.status === 'processing' && !isGenerating;
+  const isStaleProcessing = project?.status === 'processing' && !isAnyInFlight;
 
   if (isLoading || !project) {
     return (
@@ -781,9 +811,9 @@ export default function ProjectDetailPage() {
                   <Button
                     data-testid="project-header-action"
                     onClick={startGeneration}
-                    disabled={isGenerating}
+                    disabled={isAnyInFlight}
                   >
-                    {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
+                    {isAnyInFlight ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
                     Generate
                   </Button>
                 );
@@ -793,9 +823,9 @@ export default function ProjectDetailPage() {
                   data-testid="project-header-action"
                   variant="outline"
                   onClick={handleRegenerateAll}
-                  disabled={isGenerating}
+                  disabled={isAnyInFlight}
                 >
-                  {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                  {isAnyInFlight ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
                   Generate Remaining ({action.count})
                 </Button>
               );
@@ -807,19 +837,19 @@ export default function ProjectDetailPage() {
                 already exposes the same action). */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="icon" disabled={isGenerating || isDeleting}>
+                <Button variant="outline" size="icon" disabled={isAnyInFlight || isDeleting}>
                   <MoreHorizontal className="h-4 w-4" />
                   <span className="sr-only">More actions</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={handleAddRooms} disabled={isGenerating}>
+                <DropdownMenuItem onClick={handleAddRooms} disabled={isAnyInFlight}>
                   <Plus className="h-4 w-4 mr-2" />
                   Add more images
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => setShowSettingsSheet(true)}
-                  disabled={isGenerating}
+                  disabled={isAnyInFlight}
                   data-testid="overflow-menu-project-settings"
                 >
                   <Settings className="h-4 w-4 mr-2" />
@@ -829,7 +859,7 @@ export default function ProjectDetailPage() {
                 <DropdownMenuItem
                   className="text-destructive focus:text-destructive"
                   onClick={() => setShowDeleteConfirm(true)}
-                  disabled={isGenerating || isDeleting}
+                  disabled={isAnyInFlight || isDeleting}
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
                   Delete project
@@ -904,7 +934,7 @@ export default function ProjectDetailPage() {
       )}
 
       {/* Call-to-action for pending projects */}
-      {allPending && project.rooms.length > 0 && !isGenerating && (
+      {allPending && project.rooms.length > 0 && !isAnyInFlight && (
         <div className="flex flex-col items-center gap-4 py-8 px-6 bg-muted/30 border border-dashed border-muted-foreground/25 rounded-xl">
           <div className="text-center space-y-2">
             <h3 className="text-lg font-semibold">Ready to generate</h3>
@@ -921,7 +951,7 @@ export default function ProjectDetailPage() {
       )}
 
       {/* Generating progress */}
-      {isGenerating && (
+      {isAnyInFlight && (
         <div className="flex items-center gap-3 p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg">
           <Loader2 className="h-5 w-5 animate-spin text-blue-500 flex-shrink-0" />
           <div>
@@ -934,7 +964,58 @@ export default function ProjectDetailPage() {
       )}
 
       {/* Progress Tracker */}
-      <ProgressTracker project={project} isGenerating={isGenerating} />
+      <ProgressTracker project={project} isGenerating={isAnyInFlight} />
+
+      {/* Issue 007 of projects-page-improvements PRD: project-level
+          stream-lost banner. Renders when the watchdog fires on the
+          project-level stream. The user can Retry (replays via
+          startGeneration so the existing retryQueue.clear / toast /
+          activity-log side-effects all run as if the user clicked
+          Generate fresh) or Dismiss. The button is disabled if any
+          OTHER op is currently in flight (rubber-duck-flagged: lost-op
+          Retry must obey the same busy gates as the original click). */}
+      {fleet.lostOps
+        .filter((op): op is Extract<LostOp, { kind: 'project' }> => op.kind === 'project')
+        .map((op) => (
+          <div
+            key={op.id}
+            data-testid="stream-lost-banner-project"
+            className="flex items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg"
+          >
+            <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium">Stream lost — project generation stalled</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                No SSE events arrived for 2 minutes. Click Retry to start a fresh project generation.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => fleet.dismissLostOp(op.id)}
+              >
+                Dismiss
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="stream-lost-retry-project"
+                disabled={isAnyInFlight}
+                onClick={() => {
+                  // Dismiss the lost op, then route through the normal
+                  // page-level startGeneration path so retryQueue.clear,
+                  // activity-log, and toast side-effects all fire.
+                  fleet.dismissLostOp(op.id);
+                  startGeneration();
+                }}
+              >
+                <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                Retry
+              </Button>
+            </div>
+          </div>
+        ))}
 
       {/* Room Groups */}
       <div className="space-y-12">
@@ -952,21 +1033,121 @@ export default function ProjectDetailPage() {
             </div>
           </div>
         ) : (
-          project.rooms.map((room) => (
-            <RoomGroup
-              key={room.id}
-              room={room}
-              onVariationClick={handleVariationClick}
-              onRetryVariation={handleRetryVariation}
-              onRegenerateRoom={handleRegenerateRoom}
-              onRegenerateVariation={handleRegenerateVariation}
-              onEditPromptVariation={handleEditPromptVariation}
-              onUpdateAddendum={handleUpdateRoomAddendum}
-              regeneratingVariationId={regeneratingVariationId}
-              isGenerating={isGenerating}
-              queuedVariationIds={retryQueue.queuedIds}
-            />
-          ))
+          project.rooms.map((room) => {
+            // Issue 007: per-room derived state. The hook tracks each
+            // operation's scope; the page projects it down to the props
+            // RoomGroup (and its children) need.
+            const isRoomBusy = inFlightProject || inFlightRooms.has(room.id);
+            // At most one variation per room can be in flight (per the
+            // disabling rules — variation actions are gated on this).
+            const regeneratingVariationIdForRoom =
+              room.variations.find((v) => inFlightVariations.has(v.id))?.id ?? null;
+            // Lost ops scoped to this room (any kind that carries a roomId
+            // matching this room).
+            const roomLostOps = fleet.lostOps.filter(
+              (op): op is Extract<LostOp, { roomId: string }> =>
+                op.kind !== 'project' && op.roomId === room.id,
+            );
+            return (
+              <div key={room.id} className="space-y-3">
+                {roomLostOps.map((op) => {
+                  const scopeLabel =
+                    op.kind === 'room'
+                      ? 'room generation'
+                      : op.kind === 'variation'
+                        ? `variation regeneration (${op.strategy})`
+                        : 'edit-prompt generation';
+                  // Per-op busy gate (rubber-duck-flagged): a lost-op
+                  // Retry must obey the same disabling rules as the
+                  // original click. Project in flight blocks all kinds;
+                  // this room in flight blocks all room-scoped kinds;
+                  // this variation in flight blocks variation/edit-
+                  // prompt scoped kinds.
+                  const variationInFlight =
+                    op.kind === 'variation' || op.kind === 'edit-prompt'
+                      ? inFlightVariations.has(op.variationId)
+                      : false;
+                  const retryDisabled =
+                    inFlightProject || inFlightRooms.has(room.id) || variationInFlight;
+                  // Route through the same page-level handlers so
+                  // retryQueue.clear / toasts / activity-log entries
+                  // fire as if the user clicked Retry / Regenerate
+                  // through the normal UI affordance.
+                  const handleRetryClick = () => {
+                    fleet.dismissLostOp(op.id);
+                    if (op.kind === 'room') {
+                      handleRegenerateRoom(room);
+                    } else if (op.kind === 'variation') {
+                      const idx = room.variations.findIndex((v) => v.id === op.variationId);
+                      if (idx >= 0) {
+                        handleRegenerateVariation(room, idx, op.strategy);
+                      }
+                    } else {
+                      // edit-prompt: open the dialog with the original
+                      // prompt prefilled. The user must click Generate
+                      // again — replaying silently with the same prompt
+                      // would skip the user's chance to revise it given
+                      // the upstream just stalled.
+                      const idx = room.variations.findIndex((v) => v.id === op.variationId);
+                      if (idx >= 0) {
+                        setEditPromptTarget({ roomId: room.id, variationIndex: idx });
+                      }
+                    }
+                  };
+                  return (
+                    <div
+                      key={op.id}
+                      data-testid={`stream-lost-banner-${room.id}`}
+                      data-stream-lost-kind={op.kind}
+                      className="flex items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg"
+                    >
+                      <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium">
+                          Stream lost — {scopeLabel} stalled for {room.label}
+                        </p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          No SSE events arrived for 2 minutes. Click Retry to replay this exact operation.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => fleet.dismissLostOp(op.id)}
+                        >
+                          Dismiss
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          data-testid={`stream-lost-retry-${room.id}`}
+                          disabled={retryDisabled}
+                          onClick={handleRetryClick}
+                        >
+                          <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                          Retry
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+                <RoomGroup
+                  room={room}
+                  onVariationClick={handleVariationClick}
+                  onRetryVariation={handleRetryVariation}
+                  onRegenerateRoom={handleRegenerateRoom}
+                  onRegenerateVariation={handleRegenerateVariation}
+                  onEditPromptVariation={handleEditPromptVariation}
+                  onUpdateAddendum={handleUpdateRoomAddendum}
+                  regeneratingVariationId={regeneratingVariationIdForRoom}
+                  isRoomBusy={isRoomBusy}
+                  inFlightVariationIds={inFlightVariations}
+                  queuedVariationIds={retryQueue.queuedIds}
+                />
+              </div>
+            );
+          })
         )}
       </div>
 
@@ -1004,16 +1185,20 @@ export default function ProjectDetailPage() {
         onRegenerate={lightboxImage ? handleLightboxRegenerate : undefined}
         isRegenerating={
           lightboxImage
-            ? regeneratingVariationId ===
-              lightboxImage.variations[lightboxImage.variationIndex]?.id
+            ? inFlightVariations.has(
+                lightboxImage.variations[lightboxImage.variationIndex]?.id ?? '',
+              )
             : false
         }
-        // Issue 001 of failed-variation-retry-queue PRD: any in-flight
-        // generation (global stream OR a sibling-variation regen)
-        // blocks the lightbox's discretionary regen action. The
+        // Issue 001 of failed-variation-retry-queue PRD + issue 007 of
+        // projects-page-improvements PRD: any in-flight generation
+        // (project, room, OR variation) blocks the lightbox's
+        // discretionary regen action. ``isAnyInFlight`` collapses the
+        // prior (isGenerating || regeneratingVariationId !== null)
+        // expression into a single fleet-derived boolean. The
         // ImageLightbox suppresses the tooltip when isRegenerating
         // (this variation) is true so the existing spinner UI wins.
-        isBlocked={isGenerating || regeneratingVariationId !== null}
+        isBlocked={isAnyInFlight}
       />
 
       {/* Project Settings side sheet — issue 002 of projects-page-
@@ -1035,6 +1220,13 @@ export default function ProjectDetailPage() {
         const room = project.rooms.find((r) => r.id === editPromptTarget.roomId);
         const variation = room?.variations[editPromptTarget.variationIndex];
         const initialPrompt = variation?.generation_metadata?.adapted_prompt;
+        // Issue 007: per-variation gate, not global isAnyInFlight. Allows
+        // the user to draft Edit Prompt for room B's variation while room
+        // A streams concurrently.
+        const editPromptBlocked =
+          inFlightProject ||
+          (room ? inFlightRooms.has(room.id) : false) ||
+          (variation ? inFlightVariations.has(variation.id) : false);
         return (
           <EditPromptDialog
             open
@@ -1044,7 +1236,7 @@ export default function ProjectDetailPage() {
             initialPrompt={initialPrompt}
             fallbackPrompt={project.prompt}
             variationLabel={`Variation ${editPromptTarget.variationIndex + 1}`}
-            isBlocked={isGenerating || regeneratingVariationId !== null}
+            isBlocked={editPromptBlocked}
             onSubmit={handleEditPromptSubmit}
           />
         );
