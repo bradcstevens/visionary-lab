@@ -252,6 +252,51 @@ test.describe('Image Lightbox', () => {
     await expect(dialogTitle).toContainText('Variation 1');
   });
 
+  test('lightbox has accessible description (silences Radix warning)', async ({ page }) => {
+    // Issue 001 of radix-dialog-body-lock-fix PRD: Radix DialogContent
+    // emits a "Missing Description for DialogContent" warning on every
+    // mount when no DialogDescription is rendered. We capture console
+    // warnings during the open flow and assert none of them match the
+    // missing-description pattern, AND assert the visually-hidden
+    // description element itself is in the DOM with non-empty text.
+    const consoleWarnings: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'warning' || msg.type() === 'error') {
+        consoleWarnings.push(msg.text());
+      }
+    });
+
+    await setupRoutes(page);
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Open lightbox
+    const completedImage = page.locator('.group.cursor-pointer').first();
+    await completedImage.click();
+
+    // The dialog should have an accessible description (sr-only)
+    const dialogDescription = page.locator('[data-slot="dialog-description"]');
+    await expect(dialogDescription).toBeAttached();
+    // Non-empty text — proves it's a real description, not an empty stub
+    const descText = (await dialogDescription.textContent()) ?? '';
+    expect(descText.trim().length).toBeGreaterThan(0);
+    // The description must be visually hidden (sr-only) so the lightbox
+    // visual layout is unchanged.
+    await expect(dialogDescription).toHaveClass(/sr-only/);
+
+    // Give Radix a beat to fire any aria warnings it would have fired
+    // on mount (the warning is emitted synchronously inside DialogContent's
+    // render path, so a microtask drain is enough).
+    await page.waitForTimeout(100);
+
+    const missingDescWarnings = consoleWarnings.filter((w) =>
+      /Missing\s+`?Description`?\s+(?:or\s+`?aria-describedby={undefined}`?\s+)?for\s+(?:\{?DialogContent\}?|DialogContent)/i.test(
+        w,
+      ),
+    );
+    expect(missingDescWarnings, missingDescWarnings.join('\n---\n')).toEqual([]);
+  });
+
   test('lightbox shows navigation arrows and navigates between variations', async ({ page }) => {
     await setupRoutes(page);
     await page.goto(`/projects/${PROJECT_ID}`);

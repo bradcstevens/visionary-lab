@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useCallback, useMemo } from "react";
-import { Dialog, DialogPortal, DialogOverlay, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogPortal, DialogOverlay, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X, ExternalLink, RefreshCw, RotateCcw, Sparkles, Loader2, ChevronLeft, ChevronRight, ImageOff } from "lucide-react";
 import {
@@ -105,6 +105,20 @@ export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRege
           <DialogTitle className="sr-only">
             {image ? `${image.roomLabel} — Variation ${image.variationIndex + 1}` : "Image preview"}
           </DialogTitle>
+          {/*
+           * Issue 001 of radix-dialog-body-lock-fix PRD: Radix's
+           * DialogContent emits a "Missing Description for DialogContent"
+           * warning on every mount when no Description is provided. The
+           * description is rendered visually hidden so the lightbox's
+           * visual layout is unchanged, but assistive technology now
+           * announces a coherent context for the dialog (image preview
+           * with keyboard navigation between completed variations).
+           */}
+          <DialogDescription className="sr-only">
+            {image
+              ? `Image preview for ${image.roomLabel} variation ${image.variationIndex + 1}. Use the left and right arrow keys to navigate between completed variations. Press Escape to close.`
+              : "Image preview. Use the left and right arrow keys to navigate between completed variations. Press Escape to close."}
+          </DialogDescription>
 
           {/* ── Toolbar — anchored at top ── */}
           <div className={cn(
