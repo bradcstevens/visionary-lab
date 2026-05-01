@@ -23,6 +23,7 @@ import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
 import { getHeaderAction } from "@/utils/staging-header";
 import { useActivityLog } from "@/context/activity-log-context";
+import { useRetryQueue } from "@/hooks/useRetryQueue";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -407,12 +408,58 @@ export default function ProjectDetailPage() {
     handleRegenerateVariation(room, lightboxImage.variationIndex, strategy);
   }, [lightboxImage, project, handleRegenerateVariation]);
 
+  // Issue 002 of failed-variation-retry-queue PRD: per-page in-memory
+  // retry queue. Failed-variation Retry clicks during in-flight
+  // generation are routed through this hook's `enqueue`. Queued retries
+  // drain serially via `handleRegenerateVariation` once both
+  // `isGenerating` and `regeneratingVariationId` go idle.
+  const onDropQueuedRetry = useCallback(
+    (variationId: string) => {
+      // Drop rule: the variation no longer exists in the current
+      // project OR its status is no longer 'failed' at drain time.
+      // No toast — silent UX per PRD; activity log entry only.
+      activityLog.log({
+        level: 'info',
+        icon: 'ℹ',
+        message: 'Queued retry skipped',
+        detail: `Variation ${variationId.slice(0, 8)} was no longer in a failed state when the queue drained.`,
+      });
+    },
+    [activityLog],
+  );
+  const retryQueue = useRetryQueue({
+    project,
+    isGenerating,
+    regeneratingVariationId,
+    onDispatch: handleRegenerateVariation,
+    onDrop: onDropQueuedRetry,
+  });
+
   const handleRetryVariation = (room: Room, variationIndex: number) => {
     // Failed-variation Retry regenerates ONLY that variation, leaving sibling
     // completed variations untouched. The room-header "Regenerate" button
     // remains available for users who explicitly want a full-room redo.
     // See PRD: prds/2026-04-29-single-variation-regeneration-prd.md (Frontend → RoomGroup).
-    handleRegenerateVariation(room, variationIndex, 'fresh');
+    //
+    // Issue 002 of failed-variation-retry-queue PRD: route through the
+    // retry queue so clicks during in-flight generation are visibly
+    // queued (toast + thumbnail indicator + activity log) instead of
+    // silently no-op'ing.
+    const variation = room.variations[variationIndex];
+    if (!variation) return;
+    const outcome = retryQueue.enqueue(variation.id);
+    if (outcome === 'queued') {
+      toast.info('Retry queued — will run when generation completes');
+      activityLog.log({
+        level: 'info',
+        icon: 'ℹ',
+        message: `Variation ${variationIndex + 1} retry queued`,
+        detail: 'Will run when generation completes.',
+      });
+    }
+    // 'dispatched' and 'deduped' outcomes are silent — the existing flow
+    // (handleRegenerateVariation) takes over for 'dispatched', and the
+    // user is intentionally given no feedback on duplicate clicks.
   };
 
   const handleAddRooms = () => {
@@ -680,6 +727,7 @@ export default function ProjectDetailPage() {
               onRegenerateVariation={handleRegenerateVariation}
               regeneratingVariationId={regeneratingVariationId}
               isGenerating={isGenerating}
+              queuedVariationIds={retryQueue.queuedIds}
             />
           ))
         )}

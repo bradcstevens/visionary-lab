@@ -15,9 +15,10 @@ interface RoomGroupProps {
   onRegenerateVariation?: (room: Room, variationIndex: number, strategy: 'retry' | 'fresh') => void;
   regeneratingVariationId?: string | null;
   isGenerating?: boolean;
+  queuedVariationIds?: ReadonlySet<string>;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, regeneratingVariationId, isGenerating }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, regeneratingVariationId, isGenerating, queuedVariationIds }: RoomGroupProps) {
   const getStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
     switch (status) {
       case 'completed':
@@ -145,6 +146,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
                 : undefined
             }
             isRegenerating={regeneratingVariationId === variation.id}
+            isQueued={queuedVariationIds?.has(variation.id) ?? false}
           />
         ))}
       </div>

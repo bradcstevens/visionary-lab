@@ -1,6 +1,6 @@
 "use client"
 
-import { AlertCircle, RefreshCw, Loader2, RotateCcw, Sparkles } from "lucide-react";
+import { AlertCircle, RefreshCw, Loader2, RotateCcw, Sparkles, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -22,6 +22,7 @@ interface VariationThumbnailProps {
   onRetry?: () => void;
   onRegenerate?: (strategy: 'retry' | 'fresh') => void;
   isRegenerating?: boolean;
+  isQueued?: boolean;
 }
 
 export function VariationThumbnail({ 
@@ -33,6 +34,7 @@ export function VariationThumbnail({
   onRetry,
   onRegenerate,
   isRegenerating,
+  isQueued,
 }: VariationThumbnailProps) {
   const renderContent = () => {
     switch (status) {
@@ -113,8 +115,35 @@ export function VariationThumbnail({
           ? error.length > 60 ? error.slice(0, 57) + "…" : error
           : "Generation failed";
 
+        const queuedIndicator = isQueued ? (
+          <div
+            data-testid={`variation-${index + 1}-queued`}
+            className="flex flex-col items-center gap-1 shrink-0 mt-1"
+          >
+            <div className="flex items-center gap-1">
+              <Loader2
+                aria-hidden="true"
+                className="h-3 w-3 animate-spin text-amber-600 dark:text-amber-400"
+              />
+              <Badge
+                variant="outline"
+                className="h-5 px-1.5 py-0 text-[10px] border-amber-500 text-amber-700 dark:text-amber-300 bg-amber-500/10"
+              >
+                <Clock aria-hidden="true" className="h-2.5 w-2.5 mr-0.5" />
+                Queued
+              </Badge>
+            </div>
+            <span className="text-[9px] text-amber-700 dark:text-amber-300 text-center leading-tight px-1">
+              Will retry when generation finishes
+            </span>
+          </div>
+        ) : null;
+
         const thumbnail = (
-          <div className="w-full h-full bg-destructive/10 rounded-lg border-2 border-destructive/20 flex flex-col items-center justify-center overflow-hidden p-2 gap-1">
+          <div
+            aria-busy={!!isQueued}
+            className="w-full h-full bg-destructive/10 rounded-lg border-2 border-destructive/20 flex flex-col items-center justify-center overflow-hidden p-2 gap-1"
+          >
             <AlertCircle className="h-5 w-5 text-destructive shrink-0" />
             <Badge variant="destructive" className="text-xs shrink-0">
               {index + 1}
@@ -122,20 +151,22 @@ export function VariationThumbnail({
             <span className="text-[10px] text-destructive/80 text-center leading-tight line-clamp-2 break-words w-full px-1">
               {shortError}
             </span>
-            {onRetry && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 px-2 text-[10px] hover:bg-destructive/20 shrink-0"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRetry();
-                }}
-              >
-                <RefreshCw className="h-3 w-3 mr-1" />
-                Retry
-              </Button>
-            )}
+            {isQueued
+              ? queuedIndicator
+              : onRetry && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 px-2 text-[10px] hover:bg-destructive/20 shrink-0"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRetry();
+                    }}
+                  >
+                    <RefreshCw className="h-3 w-3 mr-1" />
+                    Retry
+                  </Button>
+                )}
           </div>
         );
 
