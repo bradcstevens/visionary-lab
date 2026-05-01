@@ -37,11 +37,6 @@ export function ActivityLogProvider({ children }: { children: ReactNode }) {
     };
     entriesRef.current = [...entriesRef.current, newEntry].slice(-MAX_ENTRIES);
 
-    // Auto-open on first entry
-    if (entriesRef.current.length === 1) {
-      setIsOpen(true);
-    }
-
     setRevision((r) => r + 1);
   }, []);
 

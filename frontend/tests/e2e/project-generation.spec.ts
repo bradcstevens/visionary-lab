@@ -285,8 +285,21 @@ test.describe('Project Generation', () => {
     // Start generation
     await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
 
-    // Activity log panel should auto-open (first log entry triggers it)
-    const activityPanel = page.locator('text=Activity').first();
+    // After issue 006 the activity log no longer auto-opens on the first
+    // log entry — open it manually via the toggle to assert content.
+    const activityToggle = page.locator(
+      'button[title="Show activity log"], button[title="Hide activity log"]',
+    );
+    await expect(activityToggle).toBeVisible({ timeout: 8000 });
+    // Wait for at least one log entry to register (entry-count badge appears).
+    await expect(activityToggle.locator('span.tabular-nums')).toBeVisible({ timeout: 8000 });
+    // The panel is still closed at this point (the new no-auto-open contract).
+    await expect(activityToggle).toHaveAttribute('title', 'Show activity log');
+    // Open the panel.
+    await activityToggle.click();
+    await expect(activityToggle).toHaveAttribute('title', 'Hide activity log');
+
+    const activityPanel = page.getByRole('heading', { name: 'Activity' });
     await expect(activityPanel).toBeVisible({ timeout: 8000 });
 
     // Log entries should contain generation messages
