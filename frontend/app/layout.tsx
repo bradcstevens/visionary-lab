@@ -13,6 +13,7 @@ import { FolderProvider } from "@/context/folder-context";
 import { ActivityLogProvider } from "@/context/activity-log-context";
 import { ActivityLogToggle } from "@/components/activity-log/ActivityLogToggle";
 import { ActivityLogPanel } from "@/components/activity-log/ActivityLogPanel";
+import { BodyLockGuard } from "@/components/BodyLockGuard";
 import { VideoQueueClient } from "@/components/video-queue-client";
 import { RefreshJobsButton } from "@/components/refresh-jobs-button";
 import { Toaster } from "@/components/ui/sonner";
@@ -71,6 +72,15 @@ export default async function RootLayout({ children }: RootLayoutProps) {
         <meta name="format-detection" content="telephone=no" />
       </head>
       <body className="overflow-hidden">
+          {/*
+            Defense-in-depth body-lock guard — issue 002 of the
+            radix-dialog-body-lock-fix PRD. Mounted exactly once as
+            the first child of <body> so it owns body-lock health
+            for the whole app. See the component's source-file
+            doc-comment for the bug family it defends against and
+            the selector contract it depends on.
+          */}
+          <BodyLockGuard />
           <ThemeProvider
             attribute="class"
             defaultTheme="system"
