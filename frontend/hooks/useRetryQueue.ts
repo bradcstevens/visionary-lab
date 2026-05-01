@@ -19,7 +19,7 @@ export interface UseRetryQueueParams {
 
 export interface UseRetryQueueResult {
   enqueue: (variationId: string) => EnqueueOutcome;
-  clear: () => void;
+  clear: () => number;
   queuedIds: ReadonlySet<string>;
 }
 
@@ -126,9 +126,15 @@ export function useRetryQueue(params: UseRetryQueueParams): UseRetryQueueResult 
     [isGenerating, regeneratingVariationId, dispatchSync, syncQueuedIds],
   );
 
-  const clear = useCallback(() => {
+  const clear = useCallback((): number => {
+    // Return the number of entries cleared so call sites (e.g. the
+    // page's drop-on-error path) can log a truthful count without
+    // racing against the rendered ``queuedIds`` Set, which is
+    // populated via setState and may be one render behind ``queueRef``.
+    const count = queueRef.current.length;
     queueRef.current = [];
     syncQueuedIds();
+    return count;
   }, [syncQueuedIds]);
 
   return { enqueue, clear, queuedIds };

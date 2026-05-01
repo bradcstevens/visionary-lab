@@ -16,7 +16,7 @@ import { test, expect, Page, Route } from '@playwright/test';
  *   2. Dedup on multi-click: three rapid Retry clicks land exactly one
  *      toast.info and exactly one variation-regen POST.
  *
- * Issue 003 (this slice) adds:
+ * Issue 003 adds:
  *
  *   3. Supersede on Regenerate Room: when a queued retry exists and the
  *      user triggers a larger regen action (Regenerate Room), the queue
@@ -24,8 +24,16 @@ import { test, expect, Page, Route } from '@playwright/test';
  *      bigger action completes. See PRD §"Page integration" (clear()
  *      paragraph) and Testing Decisions → scenario 2.
  *
- * The remaining PRD scenario (drop on global stream error) is tracked
- * separately under issue 004.
+ * Issue 004 (this slice — final slice of the PRD) adds:
+ *
+ *   4. Drop on global stream error: when the global generation SSE
+ *      stream itself terminates with an `'error'` event, the queue is
+ *      cleared so the system does not immediately fire N more requests
+ *      against the same broken upstream. The Retry button on the failed
+ *      variation is restored to clickable state for the user to re-
+ *      trigger manually after acknowledging the error. See PRD §"Page
+ *      integration" (last sentence about the `'error'` case) and
+ *      Testing Decisions → scenario 4.
  *
  * Mocking pattern follows
  * `frontend/tests/e2e/regen-failure-preserves-prior-image.spec.ts`.
@@ -834,5 +842,225 @@ test.describe('Retry queue during in-flight generation (issue 002)', () => {
       path: `${SCREENSHOT_DIR}/09-supersede-final.png`,
       fullPage: true,
     });
+  });
+
+  test('drop on global error: queued retry → global stream error → queue cleared, no per-variation regen POST fires (issue 004)', async ({
+    page,
+  }) => {
+    // SCENARIO DESIGN (rubber-duck-flagged BLOCKING):
+    //
+    // The realistic load-bearing differentiator between PRE-FIX and
+    // POST-FIX is "no /variations/r1-v2/regenerate POST fires", NOT
+    // the queued indicator visibility. Pre-fix, the drain effect
+    // pops the queued id off `queueRef` and calls `syncQueuedIds()`
+    // BEFORE invoking `onDispatch`, so the queued indicator
+    // disappears for the WRONG reason — the drain ran. Then the
+    // dispatched regen POST fires. POST-FIX, `clear()` empties the
+    // queue BEFORE the drain effect runs (which uses isGenerating
+    // and regeneratingVariationId as gates, both go false right
+    // after the error event sets isGenerating=false), so no
+    // dispatch happens and no POST is fired.
+    //
+    // To make the false-negative impossible, we HOLD the
+    // /variations/r1-v2/regenerate route unresolved if it ever
+    // fires. Pre-fix it WILL fire — counter goes to 1 and the
+    // route hangs forever, blowing the test on the post-error
+    // assertion `expect(v2RegenCount).toBe(0)`. Post-fix it does
+    // NOT fire — counter stays at 0 and the test passes.
+    //
+    // CORROBORATING ASSERTIONS (kept for AC coverage but NOT load-
+    // bearing on their own):
+    //   - "Queued retries cleared (1)" activity-log entry visible.
+    //   - Queued indicator gone, Retry button restored.
+    //   - Existing error banner / toast unchanged.
+
+    const project = makeBaseProject();
+    await setupSasMock(page);
+
+    let projectGetCount = 0;
+    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}`, (route: Route) => {
+      if (route.request().method() === 'GET') {
+        projectGetCount += 1;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ project }),
+        });
+      }
+      return route.continue();
+    });
+
+    // Hold the global generation stream open until we explicitly
+    // release it. Once released, it emits `variation_failed` then
+    // `error` (NO terminal `project_completed`), simulating the
+    // page-level error path the slice cares about.
+    let releaseGlobalStream!: () => void;
+    const globalStreamHeld = new Promise<void>((resolve) => {
+      releaseGlobalStream = resolve;
+    });
+
+    let globalStreamCount = 0;
+    await page.route(
+      `${API_BASE}/staging/projects/${PROJECT_ID}/generate`,
+      async (route: Route) => {
+        globalStreamCount += 1;
+        await globalStreamHeld;
+        return route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+          body:
+            sseEvent('variation_failed', {
+              type: 'variation_failed',
+              room_id: 'room-1',
+              variation_index: 2,
+              variation_id: 'r1-v2',
+              error: 'Simulated 429 from upstream',
+              elapsed_ms: 1500,
+              tokens_used: null,
+              model: 'gpt-image-2',
+            }) +
+            // No `project_completed` — fail with `error` instead.
+            // This is the failure mode the slice cares about: the
+            // global stream itself terminates with an error, so
+            // queued retries should be DROPPED rather than drained.
+            sseEvent('error', {
+              type: 'error',
+              error: 'Upstream gateway returned 502',
+            }),
+        });
+      },
+    );
+
+    // BLOCKING TEST GUARD: hold the variation-regen route unresolved
+    // if it ever fires. Pre-fix it WILL fire (the queue drains after
+    // isGenerating=false), counter goes to 1, route hangs forever
+    // → post-error assertion `expect(v2RegenCount).toBe(0)` fails
+    // with v2RegenCount=1. Post-fix the route never fires.
+    let v2RegenCount = 0;
+    await page.route(
+      `${API_BASE}/staging/projects/${PROJECT_ID}/rooms/room-1/variations/r1-v2/regenerate**`,
+      () => {
+        v2RegenCount += 1;
+        return new Promise(() => {
+          /* never resolve — held to surface the false-negative case */
+        });
+      },
+    );
+
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Sanity: the failed variation's Retry button is visible.
+    const retryButton = page.getByRole('button', { name: /^Retry$/ });
+    await expect(retryButton).toBeVisible();
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/10-drop-on-error-before-retry.png`,
+      fullPage: true,
+    });
+
+    // BLOCKING per rubber-duck: require the project-header CTA path
+    // explicitly (no fallback). The slice is specifically about the
+    // global `/generate` stream error — falling back to a room-
+    // level button would test the wrong code path.
+    const headerCta = page.getByTestId('project-header-action');
+    await expect(headerCta).toBeVisible();
+    await headerCta.click();
+
+    // Wait for the global stream to be requested (proves
+    // isGenerating=true and the global SSE is the active stream).
+    await expect.poll(() => globalStreamCount, { timeout: 5000 }).toBe(1);
+
+    // No POST has fired yet.
+    expect(v2RegenCount).toBe(0);
+
+    // Click Retry on the failed variation while the global stream
+    // is in flight → enqueue → 'queued' outcome.
+    await retryButton.click();
+
+    // Toast + Queued indicator confirm enqueue succeeded.
+    const queuedToast = page.getByText(
+      /^Retry queued — will run when generation completes$/,
+    );
+    await expect(queuedToast).toBeVisible({ timeout: 3000 });
+
+    const queuedIndicator = page.getByTestId('variation-3-queued');
+    await expect(queuedIndicator).toBeVisible();
+    await expect(retryButton).toHaveCount(0);
+
+    // Sanity: still no regen POST (the queue is holding it).
+    expect(v2RegenCount).toBe(0);
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/11-drop-on-error-queued.png`,
+      fullPage: true,
+    });
+
+    // Release the global stream so the `variation_failed` and
+    // `error` events arrive at the page → `handleStreamEvent`'s
+    // 'error' case runs → setIsGenerating(false) + clear() (post-
+    // fix) + activity-log entry.
+    releaseGlobalStream();
+
+    // Existing error UI: error toast (unchanged by this slice). Scope
+    // to the toast notification region to avoid the activity-log copy.
+    const errorToast = page
+      .getByLabel('Notifications alt+T')
+      .getByText(/Upstream gateway returned 502/);
+    await expect(errorToast).toBeVisible({ timeout: 5000 });
+
+    // LOAD-BEARING ASSERTION (the unique pre-fix vs post-fix
+    // differentiator): no /variations/r1-v2/regenerate POST fires.
+    //
+    // Pre-fix path: error event → setIsGenerating(false) → drain
+    // effect runs (isGenerating=false, regeneratingVariationId=null)
+    // → drain pops r1-v2 → invokes onDispatch →
+    // handleRegenerateVariation → streamVariationRegeneration POST.
+    // The held route catches it: v2RegenCount becomes 1.
+    //
+    // Post-fix path: error event → clear() empties the queue →
+    // setIsGenerating(false) → drain effect runs but queueRef is
+    // empty → nothing dispatched. v2RegenCount stays at 0.
+    //
+    // The `waitForTimeout(800)` hold is the same pattern scenarios
+    // 2/3 use to give any errant late dispatch a chance to land.
+    await page.waitForTimeout(800);
+    expect(v2RegenCount).toBe(0);
+
+    // CORROBORATING: activity-log entry confirms the drop ran.
+    // Per PRD: "info-level activity-log entry … when the queue is
+    // non-empty at the moment of the drop". The queue had exactly
+    // 1 entry (r1-v2), so the message is "Queued retries cleared (1)".
+    const droppedActivityEntry = page.getByText(
+      /Queued retries cleared \(1\)/i,
+    );
+    await expect(droppedActivityEntry).toBeVisible({ timeout: 3000 });
+
+    // CORROBORATING: queued indicator gone + Retry button restored.
+    // (Pre-fix this also goes true because the drain pops the id
+    // off queueRef before dispatching — see scenario design comment.
+    // Load-bearing assertion is the v2RegenCount==0 check above.)
+    //
+    // After the error event, two Retry buttons are visible: the
+    // variation thumbnail's restored Retry AND the existing error
+    // banner's Retry (which is unrelated to this slice — it's been
+    // there before and exists to re-trigger the WHOLE generation
+    // via handleRegenerateAll). toHaveCount(2) confirms both
+    // surfaces are present without strict-mode ambiguity.
+    await expect(queuedIndicator).toHaveCount(0);
+    await expect(retryButton).toHaveCount(2);
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/12-drop-on-error-after.png`,
+      fullPage: true,
+    });
+
+    // Sanity: no extra global stream POSTs were fired (the error
+    // path doesn't auto-restart).
+    expect(globalStreamCount).toBe(1);
+    // Project was reloaded after the error event for the page to
+    // settle into a consistent post-error state.
+    expect(projectGetCount).toBeGreaterThan(1);
   });
 });

@@ -149,94 +149,17 @@ export default function ProjectDetailPage() {
   const totalVariations = project?.rooms.reduce((sum, r) => sum + r.variations.length, 0) ?? 0;
   const completedVariations = project?.rooms.reduce((sum, r) => sum + r.variations.filter(v => v.status === 'completed').length, 0) ?? 0;
 
-  const handleStreamEvent = useCallback((event: StagingStreamEvent) => {
-    switch (event.type) {
-      case 'room_started':
-        activityLog.log({
-          level: 'info',
-          icon: '▶',
-          message: `Starting generation for "${(event as any).label ?? 'room'}"`,
-          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
-        });
-        debouncedReload();
-        break;
-      case 'variation_completed':
-        activityLog.log({
-          level: 'success',
-          icon: '✓',
-          message: `Variation ${((event as any).variation_index ?? 0) + 1} saved`,
-          detail: [
-            (event as any).model,
-            (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
-            (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
-          ].filter(Boolean).join(' · ') || undefined,
-        });
-        debouncedReload();
-        break;
-      case 'variation_failed':
-        activityLog.log({
-          level: 'error',
-          icon: '✕',
-          message: `Variation ${((event as any).variation_index ?? 0) + 1} failed`,
-          detail: (event as any).error || 'Unknown error',
-        });
-        debouncedReload();
-        break;
-      case 'room_uploaded':
-        debouncedReload();
-        break;
-      case 'room_completed':
-        activityLog.log({
-          level: 'success',
-          icon: '✓',
-          message: 'Room complete',
-          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
-        });
-        debouncedReload();
-        break;
-      case 'room_failed':
-        activityLog.log({
-          level: 'error',
-          icon: '✕',
-          message: 'Room failed',
-          detail: (event as any).error || 'Unknown error',
-        });
-        debouncedReload();
-        break;
-      case 'project_completed':
-        // Cancel any pending debounced reload
-        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
-        activityLog.log({
-          level: 'success',
-          icon: '🎉',
-          message: 'Generation complete!',
-        });
-        setIsGenerating(false);
-        setGenerationError(null);
-        toast.success('Generation completed!');
-        loadProject();
-        break;
-      case 'stream_ended':
-        // Fallback: stream closed without a terminal event — reconcile state
-        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
-        setIsGenerating(false);
-        loadProject();
-        break;
-      case 'error':
-        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
-        activityLog.log({
-          level: 'error',
-          icon: '✕',
-          message: 'Generation error',
-          detail: event.error || 'Unknown error',
-        });
-        setIsGenerating(false);
-        setGenerationError(event.error || 'Generation failed');
-        toast.error(event.error || 'Generation failed');
-        loadProject();
-        break;
-    }
-  }, [activityLog, debouncedReload, loadProject]);
+  // ``handleStreamEvent`` is defined AFTER ``useRetryQueue`` so its
+  // ``'error'`` case can call ``retryQueue.clear()`` directly. The
+  // prior placement (above ``handleVariationClick``) was historical.
+  // Issue 004 of failed-variation-retry-queue PRD: when the global
+  // generation SSE stream itself terminates with an ``'error'`` event,
+  // the queued retries are dropped so we don't immediately fire N
+  // requests against the same broken upstream after the banner
+  // appears. The Retry button on the failed variation is restored so
+  // the user can re-trigger manually after acknowledging the error.
+  // See PRD §"Page integration" (last sentence about the ``'error'``
+  // case) and §"Testing Decisions" → scenario 4.
 
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
@@ -405,6 +328,115 @@ export default function ProjectDetailPage() {
     onDispatch: handleRegenerateVariation,
     onDrop: onDropQueuedRetry,
   });
+
+  const handleStreamEvent = useCallback((event: StagingStreamEvent) => {
+    switch (event.type) {
+      case 'room_started':
+        activityLog.log({
+          level: 'info',
+          icon: '▶',
+          message: `Starting generation for "${(event as any).label ?? 'room'}"`,
+          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
+        });
+        debouncedReload();
+        break;
+      case 'variation_completed':
+        activityLog.log({
+          level: 'success',
+          icon: '✓',
+          message: `Variation ${((event as any).variation_index ?? 0) + 1} saved`,
+          detail: [
+            (event as any).model,
+            (event as any).tokens_used ? `${Number((event as any).tokens_used).toLocaleString()} tokens` : null,
+            (event as any).elapsed_ms ? `${((event as any).elapsed_ms / 1000).toFixed(1)}s` : null,
+          ].filter(Boolean).join(' · ') || undefined,
+        });
+        debouncedReload();
+        break;
+      case 'variation_failed':
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: `Variation ${((event as any).variation_index ?? 0) + 1} failed`,
+          detail: (event as any).error || 'Unknown error',
+        });
+        debouncedReload();
+        break;
+      case 'room_uploaded':
+        debouncedReload();
+        break;
+      case 'room_completed':
+        activityLog.log({
+          level: 'success',
+          icon: '✓',
+          message: 'Room complete',
+          detail: `Room ${(event as any).room_id?.slice(0, 8) ?? ''}`,
+        });
+        debouncedReload();
+        break;
+      case 'room_failed':
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: 'Room failed',
+          detail: (event as any).error || 'Unknown error',
+        });
+        debouncedReload();
+        break;
+      case 'project_completed':
+        // Cancel any pending debounced reload
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        activityLog.log({
+          level: 'success',
+          icon: '🎉',
+          message: 'Generation complete!',
+        });
+        setIsGenerating(false);
+        setGenerationError(null);
+        toast.success('Generation completed!');
+        loadProject();
+        break;
+      case 'stream_ended':
+        // Fallback: stream closed without a terminal event — reconcile state
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        setIsGenerating(false);
+        loadProject();
+        break;
+      case 'error':
+        if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
+        activityLog.log({
+          level: 'error',
+          icon: '✕',
+          message: 'Generation error',
+          detail: event.error || 'Unknown error',
+        });
+        setIsGenerating(false);
+        setGenerationError(event.error || 'Generation failed');
+        toast.error(event.error || 'Generation failed');
+        loadProject();
+        // Issue 004 of failed-variation-retry-queue PRD: drop queued
+        // retries on global stream error so we don't immediately fire
+        // N more requests against the same broken upstream after the
+        // banner appears. ``clear()`` returns the count of dropped
+        // entries so the activity-log message is truthful without
+        // racing against the rendered ``queuedIds`` Set (which is
+        // populated via setState and may be one render behind
+        // ``queueRef``). When the queue was already empty the call
+        // is a no-op and no log entry fires (avoids noise on every
+        // unrelated error). See PRD §"Page integration" (last
+        // sentence about the ``'error'`` case).
+        const droppedCount = retryQueue.clear();
+        if (droppedCount > 0) {
+          activityLog.log({
+            level: 'info',
+            icon: 'ℹ',
+            message: `Queued retries cleared (${droppedCount})`,
+            detail: 'Generation stream errored; retry manually after acknowledging the error.',
+          });
+        }
+        break;
+    }
+  }, [retryQueue, activityLog, debouncedReload, loadProject]);
 
   // Issue 003 of failed-variation-retry-queue PRD: the three "larger
   // regen action" entry points — startGeneration (Generate Remaining

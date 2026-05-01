@@ -321,6 +321,60 @@ describe('useRetryQueue — clear()', () => {
     });
     expect(onDispatch).not.toHaveBeenCalled();
   });
+
+  it('returns the number of cleared entries (issue 004 of failed-variation-retry-queue PRD)', () => {
+    // The drop-on-error path needs a truthful count for its
+    // activity-log entry without racing against the rendered
+    // ``queuedIds`` Set (which is one render behind ``queueRef``).
+    const room: Room = {
+      id: 'r1',
+      label: 'Room',
+      original_image_url: 'https://x.test/o.png',
+      status: 'processing',
+      variations: [
+        { id: 'v0', status: 'failed', error: 'e', created_at: ISO, updated_at: ISO },
+        { id: 'v1', status: 'failed', error: 'e', created_at: ISO, updated_at: ISO },
+        { id: 'v2', status: 'failed', error: 'e', created_at: ISO, updated_at: ISO },
+      ],
+    };
+    const project = makeProject([room]);
+    const onDispatch = vi.fn();
+
+    const { result } = renderHook(() =>
+      useRetryQueue({
+        project,
+        isGenerating: true,
+        regeneratingVariationId: null,
+        onDispatch,
+      }),
+    );
+
+    // Empty queue → clear() returns 0, no log entry on the call site.
+    let count = 0;
+    act(() => {
+      count = result.current.clear();
+    });
+    expect(count).toBe(0);
+
+    // Three queued → clear() returns 3.
+    act(() => {
+      result.current.enqueue('v0');
+      result.current.enqueue('v1');
+      result.current.enqueue('v2');
+    });
+    expect(result.current.queuedIds.size).toBe(3);
+    act(() => {
+      count = result.current.clear();
+    });
+    expect(count).toBe(3);
+    expect(result.current.queuedIds.size).toBe(0);
+
+    // Subsequent clear() on an already-empty queue → 0 again.
+    act(() => {
+      count = result.current.clear();
+    });
+    expect(count).toBe(0);
+  });
 });
 
 describe('useRetryQueue — drop rule', () => {
