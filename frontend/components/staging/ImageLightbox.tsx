@@ -10,6 +10,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { StorageImage } from "./StorageImage";
 import { cn } from "@/utils/cn";
@@ -31,9 +36,27 @@ interface ImageLightboxProps {
   onNavigate: (variationIndex: number) => void;
   onRegenerate?: (strategy: 'retry' | 'fresh') => void;
   isRegenerating?: boolean;
+  /**
+   * Issue 001 of failed-variation-retry-queue PRD: when true, the
+   * Regenerate menu/button is rendered visibly disabled with a
+   * tooltip explaining why. The page sets this to
+   * `isGenerating || regeneratingVariationId !== null` so any
+   * in-flight generation (global stream OR sibling-variation
+   * regen) blocks the lightbox's discretionary regen action with
+   * an honest disabled-with-tooltip state instead of silently
+   * no-op'ing on click.
+   *
+   * `isRegenerating` (this variation actively regenerating) takes
+   * precedence: the user already knows about their own regen, so
+   * the existing spinner UI wins and the tooltip is suppressed.
+   */
+  isBlocked?: boolean;
 }
 
-export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRegenerating }: ImageLightboxProps) {
+const BLOCKED_TOOLTIP_COPY =
+  "Generating other variations… regenerate available when complete";
+
+export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRegenerating, isBlocked }: ImageLightboxProps) {
   // Completed variations for navigation
   const completedIndices = useMemo(() => {
     if (!image) return [];
@@ -105,33 +128,63 @@ export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRege
             {/* Right: actions */}
             <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
               {onRegenerate && (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="text-white/70 hover:text-white hover:bg-white/10 h-8 px-2"
-                      disabled={isRegenerating}
-                      aria-label="Regenerate this variation"
-                    >
-                      {isRegenerating ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <RefreshCw className="h-4 w-4" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-48">
-                    <DropdownMenuItem onClick={() => onRegenerate('retry')}>
-                      <RotateCcw className="h-4 w-4 mr-2" />
-                      Retry Same Prompt
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => onRegenerate('fresh')}>
-                      <Sparkles className="h-4 w-4 mr-2" />
-                      Try Something New
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
+                isBlocked && !isRegenerating ? (
+                  // Blocked branch — issue 001 of failed-variation-retry-queue
+                  // PRD. Disabled HTML buttons don't fire pointer events
+                  // (Button has `disabled:pointer-events-none`), so the
+                  // standard Radix workaround is to wrap the disabled trigger
+                  // in a span+tabIndex=0 so the span captures hover/focus and
+                  // forwards them to the TooltipTrigger asChild target. The
+                  // DropdownMenu wrapper is intentionally omitted in this
+                  // branch — the disabled Button cannot open a menu, and we
+                  // never want onRegenerate fired while blocked.
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span tabIndex={0} className="inline-flex">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="text-white/70 hover:text-white hover:bg-white/10 h-8 px-2"
+                          disabled
+                          aria-label="Regenerate this variation"
+                        >
+                          <RefreshCw className="h-4 w-4" />
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" sideOffset={4}>
+                      {BLOCKED_TOOLTIP_COPY}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-white/70 hover:text-white hover:bg-white/10 h-8 px-2"
+                        disabled={isRegenerating}
+                        aria-label="Regenerate this variation"
+                      >
+                        {isRegenerating ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-48">
+                      <DropdownMenuItem onClick={() => onRegenerate('retry')}>
+                        <RotateCcw className="h-4 w-4 mr-2" />
+                        Retry Same Prompt
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onRegenerate('fresh')}>
+                        <Sparkles className="h-4 w-4 mr-2" />
+                        Try Something New
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )
               )}
               {image?.url && (
                 <Button

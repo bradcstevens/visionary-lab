@@ -771,6 +771,12 @@ export default function ProjectDetailPage() {
               lightboxImage.variations[lightboxImage.variationIndex]?.id
             : false
         }
+        // Issue 001 of failed-variation-retry-queue PRD: any in-flight
+        // generation (global stream OR a sibling-variation regen)
+        // blocks the lightbox's discretionary regen action. The
+        // ImageLightbox suppresses the tooltip when isRegenerating
+        // (this variation) is true so the existing spinner UI wins.
+        isBlocked={isGenerating || regeneratingVariationId !== null}
       />
     </div>
   );
