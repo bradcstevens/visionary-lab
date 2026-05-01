@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useActivityLog } from "@/context/activity-log-context";
 import { LogEntryRow } from "./LogEntry";
+import { InFlightSection } from "./InFlightSection";
 import { cn } from "@/utils/utils";
 
 /** Summary counters by log level. */
@@ -20,7 +21,7 @@ function useLevelCounts(entries: { level: string }[]) {
 }
 
 export function ActivityLogPanel() {
-  const { entries, clear, isOpen, setOpen } = useActivityLog();
+  const { entries, inFlight, clear, isOpen, setOpen } = useActivityLog();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const prevLengthRef = useRef(entries.length);
@@ -126,6 +127,9 @@ export function ActivityLogPanel() {
             )}
           </div>
         )}
+
+        {/* ── In Flight section (issue 008) ─────────────────── */}
+        <InFlightSection inFlight={inFlight} />
 
         {/* ── Log body ──────────────────────────────────────── */}
         <div

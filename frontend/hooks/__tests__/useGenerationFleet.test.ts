@@ -814,3 +814,336 @@ describe('useGenerationFleet — finalize idempotency', () => {
     expect(captures[1].abort).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Issue 008 of the projects-page-improvements PRD: the In Flight panel
+ * inside the activity log derives its rows from the fleet hook via three
+ * lifecycle callbacks — onOpStart (synchronous on click), onOpProgress
+ * (first SSE event of any type), onOpEnd (every termination reason).
+ * The activity-feed context maintains the In Flight list using these
+ * callbacks; the page wires them to startOp/markOpStarted/endOp.
+ *
+ * The contract is one-shot per stream:
+ *   - onOpStart fires once per new stream (NOT on idempotent re-call).
+ *   - onOpProgress fires once on the first event (NOT on subsequent).
+ *   - onOpEnd fires exactly once per stream lifetime, for every reason
+ *     (terminal, watchdog, abort, supersede, unmount).
+ *
+ * Late stale events delivered after finalize must be no-ops on all
+ * three callbacks (the underlying stream record is gone from the map).
+ */
+describe('useGenerationFleet — onOpStart / onOpProgress / onOpEnd lifecycle (issue 008)', () => {
+  beforeEach(() => {
+    mockedStreamGeneration.mockReset();
+    mockedStreamRoomRegeneration.mockReset();
+    mockedStreamVariationRegeneration.mockReset();
+    mockedStreamVariationEditPrompt.mockReset();
+  });
+
+  it('fires onOpStart once per new stream with kind + descriptor fields', () => {
+    captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpStart = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    expect(onOpStart).toHaveBeenCalledTimes(1);
+    expect(onOpStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: expect.any(String),
+        kind: 'room',
+        projectId: 'p1',
+        roomId: 'roomA',
+      }),
+    );
+  });
+
+  it('does NOT fire onOpStart on the idempotent re-call path (same scope)', () => {
+    captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpStart = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    expect(onOpStart).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onOpStart for kind=project with the projectId field', () => {
+    captureStreamMock(mockedStreamGeneration);
+    const onOpStart = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart }),
+    );
+
+    act(() => {
+      result.current.startProject('p9', () => {});
+    });
+
+    expect(onOpStart).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'project', projectId: 'p9' }),
+    );
+    const arg = onOpStart.mock.calls[0][0];
+    expect(arg.roomId).toBeUndefined();
+    expect(arg.variationId).toBeUndefined();
+  });
+
+  it('fires onOpStart for kind=variation with roomId, variationId, and strategy fields', () => {
+    captureStreamMock(mockedStreamVariationRegeneration);
+    const onOpStart = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart }),
+    );
+
+    act(() => {
+      result.current.startVariation('p1', 'roomA', 'v3', 'fresh', () => {});
+    });
+
+    expect(onOpStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'variation',
+        projectId: 'p1',
+        roomId: 'roomA',
+        variationId: 'v3',
+      }),
+    );
+  });
+
+  it('fires onOpStart for kind=edit-prompt with the prompt body field', () => {
+    captureStreamMock(mockedStreamVariationEditPrompt);
+    const onOpStart = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart }),
+    );
+
+    act(() => {
+      result.current.editPrompt('p1', 'roomA', 'v3', 'a brand new sofa', () => {});
+    });
+
+    expect(onOpStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'edit-prompt',
+        projectId: 'p1',
+        roomId: 'roomA',
+        variationId: 'v3',
+      }),
+    );
+  });
+
+  it('fires onOpProgress exactly once on the FIRST SSE event of any type', () => {
+    const captures = captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpProgress = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpProgress }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+    expect(onOpProgress).not.toHaveBeenCalled();
+
+    act(() => {
+      captures[0].callback({ type: 'room_started' });
+    });
+    expect(onOpProgress).toHaveBeenCalledTimes(1);
+
+    // Subsequent events do not re-fire progress.
+    act(() => {
+      captures[0].callback({ type: 'variation_completed', room_id: 'roomA' });
+    });
+    expect(onOpProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onOpProgress AND onOpEnd cleanly when the very first SSE event is terminal', () => {
+    // E.g., the backend errors out before any progress event lands.
+    const captures = captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpProgress = vi.fn();
+    const onOpEnd = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpProgress, onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    act(() => {
+      captures[0].callback({ type: 'error', error: 'backend died' });
+    });
+
+    expect(onOpProgress).toHaveBeenCalledTimes(1);
+    expect(onOpEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onOpEnd on terminal SSE event', () => {
+    const captures = captureStreamMock(mockedStreamRoomRegeneration);
+    let opId: string | undefined;
+    const onOpStart = vi.fn((op: { id: string }) => {
+      opId = op.id;
+    });
+    const onOpEnd = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart, onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    act(() => {
+      captures[0].callback({ type: 'project_completed' });
+    });
+
+    expect(onOpEnd).toHaveBeenCalledTimes(1);
+    expect(onOpEnd).toHaveBeenCalledWith(opId);
+    expect(result.current.inFlightRooms.size).toBe(0);
+  });
+
+  it('fires onOpEnd for every superseded variation when startRoom aborts them', () => {
+    captureStreamMock(mockedStreamVariationRegeneration);
+    captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpStart = vi.fn();
+    const onOpEnd = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart, onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startVariation('p1', 'roomA', 'v1', 'retry', () => {});
+      result.current.startVariation('p1', 'roomA', 'v2', 'fresh', () => {});
+    });
+    expect(onOpStart).toHaveBeenCalledTimes(2);
+    const v1Id = onOpStart.mock.calls[0][0].id;
+    const v2Id = onOpStart.mock.calls[1][0].id;
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    // Both variations were superseded — onOpEnd fires for each.
+    expect(onOpEnd).toHaveBeenCalledTimes(2);
+    expect(onOpEnd).toHaveBeenCalledWith(v1Id);
+    expect(onOpEnd).toHaveBeenCalledWith(v2Id);
+  });
+
+  it('fires onOpEnd on watchdog fire (after SSE_SILENCE_TIMEOUT_MS of silence following first event)', () => {
+    vi.useFakeTimers();
+    const captures = captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpEnd = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    // First event STARTS the watchdog timer (per the start-on-first-event
+    // semantic that prevents queue-latency false-fires).
+    act(() => {
+      captures[0].callback({ type: 'room_started' });
+    });
+    expect(onOpEnd).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(SSE_SILENCE_TIMEOUT_MS + 100);
+    });
+
+    expect(onOpEnd).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('fires onOpEnd for every active stream on unmount (cleanup routes through finalize)', () => {
+    captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpEnd = vi.fn();
+    const { result, unmount } = renderHook(() =>
+      useGenerationFleet({ onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+      result.current.startRoom('p1', 'roomB', () => {});
+    });
+    expect(onOpEnd).not.toHaveBeenCalled();
+
+    unmount();
+
+    expect(onOpEnd).toHaveBeenCalledTimes(2);
+  });
+
+  it('LATE STALE event after finalize does not re-fire onOpProgress or onOpEnd', () => {
+    // Real-world race: the SSE library could deliver one more callback
+    // invocation after we finalize on a terminal event. The wrapper
+    // must look up the record + finalized flag and no-op.
+    const captures = captureStreamMock(mockedStreamRoomRegeneration);
+    const onOpProgress = vi.fn();
+    const onOpEnd = vi.fn();
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpProgress, onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    act(() => {
+      captures[0].callback({ type: 'room_started' });
+    });
+    expect(onOpProgress).toHaveBeenCalledTimes(1);
+
+    // Terminal — finalize runs.
+    act(() => {
+      captures[0].callback({ type: 'project_completed' });
+    });
+    expect(onOpEnd).toHaveBeenCalledTimes(1);
+
+    // Late stale event — must be a no-op for both callbacks.
+    act(() => {
+      captures[0].callback({ type: 'variation_completed', room_id: 'roomA' });
+    });
+    expect(onOpProgress).toHaveBeenCalledTimes(1);
+    expect(onOpEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the order: superseded onOpEnd calls fire BEFORE the new onOpStart', () => {
+    // The supersede cascade must happen before the new record is inserted
+    // so the activity feed sees the Set's count drop, then bump up — not
+    // the other way around. (Otherwise In Flight rows could briefly
+    // overlap in odd visual ways.)
+    captureStreamMock(mockedStreamVariationRegeneration);
+    captureStreamMock(mockedStreamRoomRegeneration);
+    const order: string[] = [];
+    const onOpStart = vi.fn((op: { id: string; kind: string }) => {
+      order.push(`start:${op.kind}:${op.id}`);
+    });
+    const onOpEnd = vi.fn((opId: string) => {
+      order.push(`end:${opId}`);
+    });
+    const { result } = renderHook(() =>
+      useGenerationFleet({ onOpStart, onOpEnd }),
+    );
+
+    act(() => {
+      result.current.startVariation('p1', 'roomA', 'v1', 'retry', () => {});
+    });
+    const variationStartIdx = order.length;
+
+    act(() => {
+      result.current.startRoom('p1', 'roomA', () => {});
+    });
+
+    // Last 2 entries must be: end:<variation-id>, then start:room:<room-id>.
+    expect(order[variationStartIdx]).toMatch(/^end:/);
+    expect(order[variationStartIdx + 1]).toMatch(/^start:room:/);
+  });
+});

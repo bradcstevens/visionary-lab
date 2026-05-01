@@ -77,6 +77,36 @@ export interface UseGenerationFleetParams {
    * with this callback).
    */
   onStreamLost?: (lostOp: LostOp) => void;
+
+  /**
+   * Issue 008 of the projects-page-improvements PRD: lifecycle callbacks
+   * the In Flight panel uses to mirror the fleet's per-stream state in
+   * the activity feed. The activity-feed context calls `startOp` /
+   * `markOpStarted` / `endOp` from these callbacks, so the panel and the
+   * per-op flags driving buttons cannot drift apart.
+   *
+   * Contract:
+   *   - `onOpStart` fires SYNCHRONOUSLY on click for each new stream
+   *     (NOT on the idempotent re-call path). Carries the descriptor
+   *     fields the page needs to derive a human-readable label.
+   *   - `onOpProgress` fires ONCE on the first SSE event of any type
+   *     for the stream. Used by the panel to flip the row's status
+   *     label from "Starting…" to "Running".
+   *   - `onOpEnd` fires EXACTLY ONCE per stream lifetime, for every
+   *     termination reason (terminal, watchdog, abort, supersede,
+   *     unmount). Late stale events delivered after finalize are
+   *     no-ops. Routed through `finalize()` so the one-shot guard
+   *     prevents double-firing.
+   */
+  onOpStart?: (op: {
+    id: string;
+    kind: StreamDescriptor['kind'];
+    projectId: string;
+    roomId?: string;
+    variationId?: string;
+  }) => void;
+  onOpProgress?: (opId: string) => void;
+  onOpEnd?: (opId: string) => void;
 }
 
 export interface UseGenerationFleetResult {
@@ -144,6 +174,13 @@ interface StreamRecord {
   finalized: boolean;
   startedAt: Date;
   /**
+   * Issue 008: flips on the first SSE event of any type. Used to fire
+   * ``onOpProgress`` exactly once per stream, even if the very first
+   * event is terminal. Late stale events after finalize see the record
+   * removed from the map and are no-ops.
+   */
+  firstEventReceived: boolean;
+  /**
    * Captured user event handler so finalize('watchdog') can surface a
    * synthetic terminal event to the caller. Without this, a watchdog-
    * aborted edit-prompt would leave the dialog's submit Promise pending
@@ -173,7 +210,7 @@ function isTerminalEvent(event: StagingStreamEvent): boolean {
 export function useGenerationFleet(
   params: UseGenerationFleetParams,
 ): UseGenerationFleetResult {
-  const { onStreamLost } = params;
+  const { onStreamLost, onOpStart, onOpProgress, onOpEnd } = params;
 
   // Refs for stable identity across renders. The state-shadow pattern (refs
   // for control flow + useState for re-renders) is the same shape useRetryQueue
@@ -181,9 +218,21 @@ export function useGenerationFleet(
   // see a stale "is in flight?" check before React re-renders.
   const streamsRef = useRef<Map<string, StreamRecord>>(new Map());
   const onStreamLostRef = useRef(onStreamLost);
+  const onOpStartRef = useRef(onOpStart);
+  const onOpProgressRef = useRef(onOpProgress);
+  const onOpEndRef = useRef(onOpEnd);
   useEffect(() => {
     onStreamLostRef.current = onStreamLost;
   }, [onStreamLost]);
+  useEffect(() => {
+    onOpStartRef.current = onOpStart;
+  }, [onOpStart]);
+  useEffect(() => {
+    onOpProgressRef.current = onOpProgress;
+  }, [onOpProgress]);
+  useEffect(() => {
+    onOpEndRef.current = onOpEnd;
+  }, [onOpEnd]);
 
   // State shadows for re-rendering consumers. Recomputed by syncShadows()
   // whenever streamsRef changes.
@@ -230,6 +279,10 @@ export function useGenerationFleet(
    * guarded by the record's ``finalized`` flag so a late timer fire after
    * a terminal event does not double-record a lost op or double-call the
    * user handler. (Rubber-duck blocking finding #4.)
+   *
+   * Issue 008: also fires ``onOpEnd`` exactly once per stream lifetime via
+   * the same one-shot guard. Late stale events delivered after finalize
+   * see the record gone from the map and are no-ops.
    */
   const finalize = useCallback(
     (streamId: string, reason: FinalizeReason): void => {
@@ -312,6 +365,16 @@ export function useGenerationFleet(
         onStreamLostRef.current?.(lostOp);
       }
 
+      // Issue 008: fire onOpEnd for every termination reason. The activity-
+      // feed context's endOp is idempotent on a missing id, so a double-
+      // call here would be safe — but the record.finalized one-shot guard
+      // above already ensures this branch runs at most once per stream.
+      try {
+        onOpEndRef.current?.(streamId);
+      } catch {
+        // Subscriber threw — ignore (we still want to sync shadow state).
+      }
+
       syncShadows();
     },
     [syncShadows],
@@ -325,6 +388,21 @@ export function useGenerationFleet(
       return (event) => {
         const record = streamsRef.current.get(streamId);
         if (record && !record.finalized) {
+          // Issue 008: fire onOpProgress exactly once on the FIRST SSE
+          // event of any type. Used by the activity feed's panel to flip
+          // the row's status label from "Starting…" to "Running". The
+          // very-first-event-is-terminal case still triggers progress
+          // BEFORE finalize (so the panel briefly sees "Running" then
+          // the row is removed by onOpEnd — symmetric with normal flow).
+          if (!record.firstEventReceived) {
+            record.firstEventReceived = true;
+            try {
+              onOpProgressRef.current?.(streamId);
+            } catch {
+              // Subscriber threw — ignore.
+            }
+          }
+
           // Reset / start the watchdog on EVERY SSE event of any type.
           // The first event implicitly STARTS the timer (timer was null);
           // subsequent events RESET it. This is the rubber-duck-flagged
@@ -414,9 +492,41 @@ export function useGenerationFleet(
         watchdogTimer: null,
         finalized: false,
         startedAt: new Date(),
+        firstEventReceived: false,
         userHandler,
       };
       streamsRef.current.set(streamId, record);
+
+      // Issue 008: fire onOpStart synchronously so the activity-feed's
+      // In Flight section gains the row BEFORE the SSE stream opens.
+      // AC #4: "Operations appear in In Flight on click (before the
+      // first SSE event), so the panel acknowledges intent immediately."
+      // The supersede cascades above already finalized superseded streams
+      // (firing their onOpEnd), so the order user sees in the activity
+      // feed is: end:<superseded-ids> THEN start:<new-id>.
+      try {
+        const d = descriptor;
+        if (d.kind === 'project') {
+          onOpStartRef.current?.({ id: streamId, kind: 'project', projectId: d.projectId });
+        } else if (d.kind === 'room') {
+          onOpStartRef.current?.({
+            id: streamId,
+            kind: 'room',
+            projectId: d.projectId,
+            roomId: d.roomId,
+          });
+        } else {
+          onOpStartRef.current?.({
+            id: streamId,
+            kind: d.kind,
+            projectId: d.projectId,
+            roomId: d.roomId,
+            variationId: d.variationId,
+          });
+        }
+      } catch {
+        // Subscriber threw — ignore.
+      }
 
       const wrappedHandler = wrapEventHandler(streamId, userHandler);
 
@@ -548,28 +658,30 @@ export function useGenerationFleet(
   }, [finalize]);
 
   // Cleanup all streams on unmount. Per useEffect's setup/teardown contract,
-  // the function returned here runs exactly once at unmount. Capture the
-  // ref into a local at effect-setup time so the cleanup uses the same
-  // Map identity even if React swaps the ref's contents during a remount
-  // (defensive — the ref stays stable in practice; the lint rule is
-  // structural).
+  // the function returned here runs exactly once at unmount.
+  //
+  // Issue 008: route per-stream cleanup through ``finalize(id, 'unmount')``
+  // so onOpEnd fires for each active stream. Pre-issue-008 this loop
+  // manually flipped ``record.finalized`` and called abort, bypassing
+  // finalize and leaking In Flight rows in the (provider-still-mounted)
+  // activity feed when the page navigated away. Capture finalize via a
+  // ref so the unmount effect's empty deps array stays valid AND the
+  // cleanup uses the latest finalize (which depends on syncShadows, which
+  // changes identity once at mount).
+  const finalizeRef = useRef(finalize);
+  useEffect(() => {
+    finalizeRef.current = finalize;
+  }, [finalize]);
   useEffect(() => {
     const streams = streamsRef.current;
     return () => {
-      for (const record of streams.values()) {
-        if (record.finalized) continue;
-        record.finalized = true;
-        if (record.watchdogTimer !== null) {
-          clearTimeout(record.watchdogTimer);
-          record.watchdogTimer = null;
-        }
-        try {
-          record.abort();
-        } catch {
-          // ignore
-        }
+      // Snapshot ids first — finalize mutates the Map by deleting entries,
+      // so iterating the live Map.values() while finalize runs would skip
+      // entries.
+      const ids = Array.from(streams.keys());
+      for (const id of ids) {
+        finalizeRef.current(id, 'unmount');
       }
-      streams.clear();
     };
   }, []);
 

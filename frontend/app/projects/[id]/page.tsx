@@ -185,6 +185,48 @@ export default function ProjectDetailPage() {
   // ``onStreamLost`` is called when the watchdog fires; the hook also
   // exposes ``lostOps`` so the page can render a per-room (or per-project)
   // banner with a Retry action that replays the EXACT lost operation.
+  //
+  // Issue 008: ``onOpStart`` / ``onOpProgress`` / ``onOpEnd`` mirror the
+  // fleet's per-stream lifecycle into the activity-feed context's In Flight
+  // surface so the panel and the buttons cannot drift apart. Labels are
+  // derived from the latest ``project`` via a ref (the callback identity
+  // stays stable; the ref read picks up the freshest project state at
+  // call time, which is the click moment for ``onOpStart``).
+  const projectRef = useRef<StagingProject | null>(null);
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+
+  const deriveOpLabel = useCallback(
+    (op: {
+      kind: 'project' | 'room' | 'variation' | 'edit-prompt';
+      projectId: string;
+      roomId?: string;
+      variationId?: string;
+    }): string => {
+      const proj = projectRef.current;
+      if (op.kind === 'project') {
+        return proj?.name ? `Project: ${proj.name}` : 'Project generation';
+      }
+      const room = op.roomId
+        ? proj?.rooms.find((r) => r.id === op.roomId) ?? null
+        : null;
+      const roomLabel = room?.label ?? (op.roomId ? `Room ${op.roomId.slice(0, 6)}` : 'Room');
+      if (op.kind === 'room') {
+        return roomLabel;
+      }
+      const variationIndex = room && op.variationId
+        ? room.variations.findIndex((v) => v.id === op.variationId)
+        : -1;
+      const variationNumber = variationIndex >= 0 ? variationIndex + 1 : '?';
+      if (op.kind === 'variation') {
+        return `Variation ${variationNumber} in ${roomLabel}`;
+      }
+      return `Edit prompt: variation ${variationNumber} in ${roomLabel}`;
+    },
+    [],
+  );
+
   const fleet = useGenerationFleet({
     onStreamLost: useCallback(
       (lostOp: LostOp) => {
@@ -206,6 +248,30 @@ export default function ProjectDetailPage() {
         });
         toast.warning(toastBody);
       },
+      [activityLog],
+    ),
+    onOpStart: useCallback(
+      (op: {
+        id: string;
+        kind: 'project' | 'room' | 'variation' | 'edit-prompt';
+        projectId: string;
+        roomId?: string;
+        variationId?: string;
+      }) => {
+        activityLog.startOp({
+          id: op.id,
+          kind: op.kind,
+          label: deriveOpLabel(op),
+        });
+      },
+      [activityLog, deriveOpLabel],
+    ),
+    onOpProgress: useCallback(
+      (opId: string) => activityLog.markOpStarted(opId),
+      [activityLog],
+    ),
+    onOpEnd: useCallback(
+      (opId: string) => activityLog.endOp(opId),
       [activityLog],
     ),
   });
