@@ -49,6 +49,24 @@ import type {
  * so a follow-up can wire the editor without backend churn. The
  * existing AI Design Session step in the wizard remains the path for
  * brief edits today.
+ *
+ * Issue 002 of the project-settings-completeness PRD: the displayed
+ * "prompt" is now derived from the design brief's `global_instructions`
+ * when one exists (with the same `_is_nonempty_str` gate the backend
+ * mirror uses), falling back to the legacy `project.prompt` field
+ * otherwise. The save path itself does NOT change — we always send the
+ * top-level `prompt` field on edit, and the backend mirror in
+ * `_mirror_prompt_and_brief_in_place` (`backend/api/endpoints/staging.py`)
+ * propagates the value into `design_brief.global_instructions` when a
+ * brief exists. This keeps the client's payload small, dodges the
+ * stale-brief clobber risk that "send a full design_brief on every
+ * prompt edit" would create, and means Settings, the page header, the
+ * Brief tab, the gallery's per-image edit dialog (via
+ * `EditPromptDialog.fallbackPrompt`), and any future snapshot/restore
+ * path all see one coherent "prompt" with a single source of truth on
+ * the server. When no brief exists yet, a small hint below the prompt
+ * textarea explains that future edits will be stored on the brief once
+ * one is created.
  */
 
 const MODEL_OPTIONS: { value: string; label: string }[] = [
@@ -76,6 +94,49 @@ export interface ProjectSettingsSheetProps {
   onOpenChange: (open: boolean) => void;
   project: StagingProject;
   onSave: (updates: UpdateProjectBody) => Promise<void>;
+}
+
+/**
+ * Mirror of the backend's `_is_nonempty_str` gate
+ * (`backend/api/endpoints/staging.py:436-442`): a value is "real" only
+ * when it's a string AND has at least one non-whitespace character.
+ * Used to decide whether `design_brief.global_instructions` is the
+ * canonical prompt or whether to fall back to `project.prompt`. Pure;
+ * exported only for direct testing.
+ */
+export function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Derive the prompt the Settings sheet should display for this project,
+ * matching the backend mirror's view of "the canonical prompt".
+ *
+ * Precedence (issue 002 of project-settings-completeness):
+ *   1. `project.design_brief.global_instructions` when it has real
+ *      (non-whitespace) content — the user's authored AI Design Session
+ *      output is canonical.
+ *   2. `project.prompt` otherwise — the legacy field, what the wizard
+ *      seeded with `"Draft — pending AI Design Session"` for new
+ *      projects.
+ *   3. `""` if neither is available.
+ *
+ * The whitespace-only fallback at step 1 mirrors the backend's
+ * `_is_nonempty_str` gate so a project with a brief that contains only
+ * whitespace `global_instructions` (which the backend mirror treats as
+ * "no real prompt yet") behaves identically on the client and server —
+ * the user sees the legacy `project.prompt` rather than visually-empty
+ * whitespace they would silently overwrite on first save.
+ *
+ * Pure; exported for vitest coverage in
+ * `__tests__/ProjectSettingsSheet.test.ts`.
+ */
+export function derivePromptForSettings(project: StagingProject): string {
+  const brief = project.design_brief;
+  if (brief && isNonEmptyString(brief.global_instructions)) {
+    return brief.global_instructions;
+  }
+  return project.prompt ?? "";
 }
 
 /**
@@ -230,6 +291,25 @@ export function ProjectSettingsSheet({
               rows={4}
               disabled={isSaving}
             />
+            {/* Issue 002 of project-settings-completeness: when no
+                design brief exists yet, the canonical prompt lives in
+                the legacy project.prompt field — explain that future
+                edits will be stored on the brief once one is created.
+                The hint matches the asymmetric derivation rule in
+                derivePromptForSettings: it is only shown when
+                `design_brief` is null/undefined (NOT when the brief
+                exists but has whitespace-only global_instructions —
+                that case still falls back to project.prompt for
+                display, but the user has already started a brief and
+                doesn't need the explainer). */}
+            {!project.design_brief && (
+              <p
+                className="text-xs text-muted-foreground"
+                data-testid="project-settings-prompt-brief-hint"
+              >
+                Once a design brief exists, your prompt is stored as part of it.
+              </p>
+            )}
           </div>
 
           <div className="space-y-2">
@@ -348,7 +428,11 @@ export function ProjectSettingsSheet({
 function snapshotFromProject(project: StagingProject) {
   return {
     name: project.name ?? "",
-    prompt: project.prompt ?? "",
+    // Issue 002 of project-settings-completeness: prefer the design
+    // brief's global_instructions when present (with the same
+    // _is_nonempty_str gate the backend mirror uses). Falls back to the
+    // legacy project.prompt for projects with no brief.
+    prompt: derivePromptForSettings(project),
     variations_per_room: project.settings?.variations_per_room ?? 5,
     model: project.settings?.model ?? "gpt-image-2",
     quality: project.settings?.quality ?? "high",
