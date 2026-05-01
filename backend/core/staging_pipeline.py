@@ -13,6 +13,7 @@ from backend.core.analyze import ImageAnalyzer
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.config import settings
 from backend.core.image_pipeline import ImagePipelineService
+from backend.core.project_status import ProjectStatusCalculator
 from backend.core.prompt_diversity import build_diversifying_prompt
 from backend.core.retry import call_with_retry
 from backend.core.staging_storage import StagingStorageService
@@ -751,7 +752,13 @@ class StagingPipeline:
             )
 
         if not pending_rooms:
-            project.status = ProjectStatus.COMPLETED
+            # Issue 001 (projects-page-improvements PRD): all final-status
+            # transitions go through ProjectStatusCalculator. The previous
+            # unconditional COMPLETED here was correct in the common case
+            # (all rooms already completed) but lost truth when a prior
+            # run left a room in the FAILED terminal state with no
+            # completed peer — that legitimately should yield FAILED.
+            project.status = ProjectStatusCalculator.compute_status(project.rooms)
             await self._persist_project_locked(project)
             yield {"type": "project_completed", "status": project.status}
             return
@@ -796,8 +803,14 @@ class StagingPipeline:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        any_room_completed = any(r.status == ItemStatus.COMPLETED for r in project.rooms)
-        project.status = ProjectStatus.COMPLETED if any_room_completed else ProjectStatus.FAILED
+        # Issue 001 (projects-page-improvements PRD): single source of
+        # truth for project status. Pre-fix this branch read
+        # ``COMPLETED if any_room_completed else FAILED`` which lied
+        # about projects whose room workers cancelled mid-flight (some
+        # rooms still PROCESSING/PENDING at the moment the workers
+        # drained). The calculator surfaces that outstanding work as
+        # PENDING so the badge stays truthful.
+        project.status = ProjectStatusCalculator.compute_status(project.rooms)
         await self._persist_project_locked(project)
         yield {"type": "project_completed", "status": project.status}
 

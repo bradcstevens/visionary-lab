@@ -1565,3 +1565,186 @@ def test_regen_logs_started_and_failed_when_pipeline_raises_unexpectedly(
     # from "field missing on a non-terminal log line").
     assert hasattr(failed, "tokens_used")
     assert failed.tokens_used is None
+
+
+# ============================================================================
+# Issue 001 (projects-page-improvements PRD) — endpoint-level finalizer
+# regression tests. The unit tests in
+# tests/test_project_status_calculator.py prove the calculator's correctness
+# in isolation; the test below in test_staging_pipeline.py
+# (TestProjectStatusDelegatesToCalculator) proves generate_project's early-
+# out branch delegates to it. These two tests pin the OTHER two call sites
+# — the regenerate_room and regenerate_variation finalizer blocks — to the
+# calculator. Without them the inline branches could regress without the
+# pipeline test catching it.
+#
+# The shape both tests target: a multi-room project where ONE room is
+# completed and another is still pending. After a regen finishes on the
+# completed room, the persisted project.status MUST be "pending" — the
+# truthful state — not "completed" (the pre-fix lie that survived because
+# the inline branch only updated status when ``not any_room_processing``).
+# ============================================================================
+
+
+def _two_room_project_one_completed_one_pending():
+    """Helper: 2-room project where room-1 has a completed variation and
+    room-2 is still untouched (pending). Persisted ``project.status`` is
+    deliberately stamped ``"completed"`` so the test can detect when the
+    finalizer fails to overwrite it (the pre-fix bug).
+    """
+    return {
+        "id": "proj-multi",
+        "name": "Multi Room Test",
+        "prompt": "Modern minimalist",
+        # Stale/lying status — pre-fix the finalizer left this in place
+        # because ``any_room_processing`` was True (room-2 is pending),
+        # so the inline branch's ``if not any_room_processing`` body
+        # never ran and the status stayed at this original value.
+        "status": "completed",
+        "rooms": [
+            {
+                "id": "room-1",
+                "label": "Living Room",
+                "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/lr.png",
+                "status": "completed",
+                "variations": [{
+                    "id": "var-1-1",
+                    "status": "completed",
+                    "image_url": "https://acct.blob.core.windows.net/images/staging/proj/variations/room-1/img.png",
+                    "generation_metadata": {
+                        "model": "gpt-image-2",
+                        "adapted_prompt": "A cozy reading nook",
+                        "generation_time_ms": 5000,
+                    },
+                }],
+            },
+            {
+                "id": "room-2",
+                "label": "Backyard",
+                "original_image_url": "https://acct.blob.core.windows.net/images/staging/proj/originals/by.png",
+                "status": "pending",
+                "variations": [{
+                    "id": "var-2-1",
+                    "status": "pending",
+                }],
+            },
+        ],
+        "settings": {"variations_per_room": 1, "model": "gpt-image-2", "quality": "high", "size": "auto"},
+    }
+
+
+def test_regenerate_variation_finalizer_persists_pending_when_sibling_room_outstanding(
+    client, mock_staging_deps
+):
+    """Issue 001 regression: the regenerate_variation finally block MUST
+    persist ``project.status = "pending"`` when a sibling room is still
+    pending — even though the regen itself completed cleanly on the
+    target variation.
+
+    Pre-fix the inline branch read::
+
+        any_room_processing = any(r.status in ("pending", "processing") ...)
+        if not any_room_processing:
+            ... fresh_project.status = ...
+
+    so ``fresh_project.status`` was never assigned when ANY peer room was
+    still outstanding. The finalizer then persisted whatever stale value
+    came back from the prior ``get_project`` call — in the test fixture,
+    that's ``"completed"``. The badge would lie.
+
+    Post-fix all paths run through ``ProjectStatusCalculator``, which
+    returns PENDING because room-2 is still ``pending``.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _two_room_project_one_completed_one_pending()
+    mock_container.read_item.return_value = project_data
+    # Echo every write back so update_project responses look real.
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    # Make the pipeline a no-op async generator so the endpoint flows
+    # cleanly through preflight → pipeline (does nothing) → finalizer.
+    # The exact pipeline behaviour is irrelevant to the contract under
+    # test; what matters is the finally block's status calc.
+    mock_pipeline = mock_staging_deps["pipeline"]
+
+    async def _empty_async_gen(*_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    mock_pipeline.process_single_variation = _empty_async_gen
+
+    with client.stream(
+        "POST",
+        "/api/v1/staging/projects/proj-multi/rooms/room-1/variations/var-1-1/regenerate?strategy=retry",
+    ) as response:
+        assert response.status_code == 200
+        for _ in response.iter_bytes():
+            pass
+
+    # Collect every replace_item call body. The LAST one is the finalizer's
+    # write — it carries the recomputed status. Pre-fix that field would
+    # still read "completed" (the value baked into the mocked persisted
+    # state). Post-fix it MUST be "pending" because room-2 is outstanding.
+    persisted_bodies = [
+        (call.kwargs.get("body") or call.args[1])
+        for call in mock_container.replace_item.call_args_list
+    ]
+    assert persisted_bodies, "Expected at least one replace_item write (preflight + finalizer)"
+    final_body = persisted_bodies[-1]
+
+    assert final_body["status"] == "pending", (
+        "Issue 001 regression: regenerate_variation finalizer must "
+        "persist project.status='pending' when a sibling room is still "
+        f"pending. Got status={final_body['status']!r}. "
+        "Pre-fix the inline ``if not any_room_processing`` branch never "
+        "fired in this scenario and left the stale 'completed' value "
+        "intact; the calculator now overwrites unconditionally."
+    )
+
+
+def test_regenerate_room_finalizer_persists_pending_when_sibling_room_outstanding(
+    client, mock_staging_deps
+):
+    """Issue 001 regression: same shape as the variation test above but
+    for the room-level regen path. After room-1 finishes regenerating,
+    project.status MUST read "pending" because room-2 is still pending.
+
+    Pre-fix this finalizer also gated its write on
+    ``if not any_processing``, so the persisted status remained the
+    stale "completed" value from the read_item mock.
+    """
+    mock_container = mock_staging_deps["container"]
+    project_data = _two_room_project_one_completed_one_pending()
+    mock_container.read_item.return_value = project_data
+    mock_container.replace_item.side_effect = lambda item, body: body
+
+    mock_pipeline = mock_staging_deps["pipeline"]
+
+    async def _empty_async_gen(*_args, **_kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    mock_pipeline.process_room = _empty_async_gen
+
+    with client.stream(
+        "POST",
+        "/api/v1/staging/projects/proj-multi/rooms/room-1/regenerate",
+    ) as response:
+        assert response.status_code == 200
+        for _ in response.iter_bytes():
+            pass
+
+    persisted_bodies = [
+        (call.kwargs.get("body") or call.args[1])
+        for call in mock_container.replace_item.call_args_list
+    ]
+    assert persisted_bodies, "Expected at least one replace_item write from the finalizer"
+    final_body = persisted_bodies[-1]
+
+    assert final_body["status"] == "pending", (
+        "Issue 001 regression: regenerate_room finalizer must persist "
+        "project.status='pending' when a sibling room is still pending. "
+        f"Got status={final_body['status']!r}. Pre-fix the inline "
+        "``if not any_processing`` branch never fired in this scenario "
+        "and left the stale 'completed' value intact."
+    )

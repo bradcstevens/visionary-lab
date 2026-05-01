@@ -946,3 +946,97 @@ class TestAdaptPromptWithRejectedPrompt:
         )
         sent = mock_llm.chat.completions.create.call_args.kwargs["messages"][0]["content"]
         assert "REJECTED_PRIOR_DIRECTION" not in sent
+
+
+# ----------------------------------------------------------------------
+# Issue 001 (projects-page-improvements PRD) — regression coverage
+# proving that ``StagingPipeline.generate_project`` delegates final-
+# status calculation to ``ProjectStatusCalculator`` and the inline
+# ``project.status = ProjectStatus.COMPLETED`` branch (early-out) is
+# gone. The clearest demonstration is the early-out path, which fires
+# when ``pending_rooms`` is empty: pre-fix that branch unconditionally
+# wrote COMPLETED, which lied about projects whose remaining rooms
+# were still PROCESSING (a state that legitimately occurs when a
+# stale-processing reconcile didn't fully reset rooms before a fresh
+# generate_project run).
+# ----------------------------------------------------------------------
+
+class TestProjectStatusDelegatesToCalculator:
+    """Asserts that ``generate_project`` no longer carries inline status
+    branches and instead delegates to ``ProjectStatusCalculator``. The
+    bug case the PRD names "Issue 1" (project-header badge flips to
+    `completed` while rooms remain outstanding) is the proof case.
+    """
+
+    @pytest.mark.asyncio
+    async def test_early_out_with_processing_room_returns_pending_not_completed(self):
+        """If ``pending_rooms`` is empty because every non-completed room
+        is in PROCESSING (e.g. a stale-processing reconcile left them
+        that way), the early-out branch must NOT mark the project as
+        COMPLETED. The calculator returns PENDING because work is
+        outstanding; the badge stays truthful.
+
+        Pre-fix:  ``project.status = ProjectStatus.COMPLETED`` (lie)
+        Post-fix: ``project.status = ProjectStatusCalculator.compute_status(...)``
+                  returns ProjectStatus.PENDING.
+        """
+        from backend.core.staging_pipeline import StagingPipeline
+        from backend.models.staging import (
+            ItemStatus, ProjectStatus, Room, StagingProject, StagingSettings,
+            Variation,
+        )
+
+        # Build a project whose rooms cannot enter pending_rooms:
+        # PROCESSING is neither PENDING nor FAILED, so the comprehension
+        # ``[r for r in project.rooms if r.status in (PENDING, FAILED)]``
+        # is empty and generate_project takes the early-out branch.
+        rooms = [
+            Room(
+                id="r-completed",
+                label="Completed Room",
+                original_image_url="https://acct.blob.core.windows.net/images/x.png",
+                status=ItemStatus.COMPLETED,
+                variations=[Variation(id="v-1", status=ItemStatus.COMPLETED, image_url="https://x")],
+            ),
+            Room(
+                id="r-processing",
+                label="Stuck Processing Room",
+                original_image_url="https://acct.blob.core.windows.net/images/y.png",
+                status=ItemStatus.PROCESSING,
+                variations=[Variation(id="v-2", status=ItemStatus.PROCESSING)],
+            ),
+        ]
+        project = StagingProject(
+            id="proj-issue-1-regression",
+            name="Issue 1 Regression",
+            prompt="Modern minimalist",
+            settings=StagingSettings(variations_per_room=1),
+            rooms=rooms,
+        )
+
+        # Wire enough mocks to construct the pipeline. None of these
+        # are exercised because the early-out branch returns before
+        # any room worker runs.
+        staging = StagingPipeline(
+            async_llm_client=AsyncMock(),
+            llm_deployment="gpt-4o",
+            image_analyzer=MagicMock(),
+            image_pipeline=MagicMock(),
+            storage_service=MagicMock(),
+            blob_service=MagicMock(),
+        )
+
+        events = []
+        async for event in staging.generate_project(project):
+            events.append(event)
+
+        # The calculator returns PENDING (any room PROCESSING).
+        # Pre-fix this assertion would FAIL with project.status == COMPLETED.
+        assert project.status == ProjectStatus.PENDING, (
+            "Early-out branch must use ProjectStatusCalculator. "
+            f"Got {project.status!r}; expected PENDING because the "
+            "Stuck Processing Room is outstanding."
+        )
+        # The terminal SSE event must carry the same truthful status —
+        # without this, the frontend optimistic state would stay stale.
+        assert events[-1] == {"type": "project_completed", "status": ProjectStatus.PENDING}

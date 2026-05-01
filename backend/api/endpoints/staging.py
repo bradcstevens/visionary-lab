@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
+from backend.core.project_status import ProjectStatusCalculator
+from backend.core.staging_pipeline import _get_project_lock
 from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
 from backend.models.design_brief import (
@@ -424,19 +426,35 @@ async def regenerate_room(
             async for event in pipeline.process_room(project, room, brief_prompts=brief_prompts):
                 yield _sse_event(event["type"], event)
         finally:
-            # Recalculate project-level status after room regeneration
-            fresh = storage.get_project(project_id)
-            if fresh:
-                clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
-                fresh_project = StagingProject(**clean_fresh)
-                any_processing = any(
-                    r.status in ("pending", "processing") for r in fresh_project.rooms
-                )
-                if not any_processing:
-                    any_completed = any(r.status == "completed" for r in fresh_project.rooms)
-                    fresh_project.status = "completed" if any_completed else "failed"
+            # Recalculate project-level status after room regeneration via
+            # the single ProjectStatusCalculator helper (issue 001 of the
+            # projects-page-improvements PRD). Pre-fix this block had its
+            # own inline any_processing/any_completed branch that drifted
+            # from the parallel branch in regenerate_variation; both now
+            # delegate to the calculator. We persist on every transition
+            # so the badge stays correct after a refresh, including the
+            # PENDING case (work outstanding) that the previous code
+            # silently skipped.
+            #
+            # Wrapped in the per-project lock to serialize with the
+            # pipeline's `_persist_project_locked` writes from any
+            # concurrent room workers (e.g. a regenerate_room finishing
+            # while a separate regenerate_variation worker is mid-write).
+            # Without this lock the read-modify-write race could clobber
+            # fresher per-room state because Cosmos writes are full-doc
+            # replacements.
+            final_status = project.status
+            async with _get_project_lock(project_id):
+                fresh = storage.get_project(project_id)
+                if fresh:
+                    clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+                    fresh_project = StagingProject(**clean_fresh)
+                    fresh_project.status = ProjectStatusCalculator.compute_status(fresh_project.rooms)
                     storage.update_project(project_id, json.loads(fresh_project.json()))
-        yield _sse_event("project_completed", {"status": project.status})
+                    final_status = fresh_project.status
+        # Emit the freshly-computed status, not the stale local
+        # `project.status` snapshot that pre-dates the worker's writes.
+        yield _sse_event("project_completed", {"status": final_status})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -665,27 +683,38 @@ async def regenerate_variation(
             raise
 
         finally:
-            # Recalculate room and project status
-            fresh = storage.get_project(project_id)
-            if fresh:
-                clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
-                fresh_project = StagingProject(**clean_fresh)
-                target_room = next((r for r in fresh_project.rooms if r.id == room_id), None)
-                if target_room:
-                    any_completed = any(v.status == "completed" for v in target_room.variations)
-                    any_pending = any(v.status in ("pending", "processing") for v in target_room.variations)
-                    if any_pending:
-                        target_room.status = "processing"
-                    elif any_completed:
-                        target_room.status = "completed"
-                    else:
-                        target_room.status = "failed"
-                any_room_processing = any(r.status in ("pending", "processing") for r in fresh_project.rooms)
-                if not any_room_processing:
-                    any_room_completed = any(r.status == "completed" for r in fresh_project.rooms)
-                    fresh_project.status = "completed" if any_room_completed else "failed"
-                storage.update_project(project_id, json.loads(fresh_project.json()))
-                final_status = fresh_project.status
+            # Recalculate room and project status. Wrapped in the per-
+            # project lock so this read-modify-write serializes with any
+            # concurrent room-worker `_persist_project_locked` writes —
+            # without the lock, two writers can interleave and the
+            # finalizer's full-doc replace would clobber fresher state.
+            async with _get_project_lock(project_id):
+                fresh = storage.get_project(project_id)
+                if fresh:
+                    clean_fresh = {k: v for k, v in fresh.items() if k != "doc_type" and not k.startswith("_")}
+                    fresh_project = StagingProject(**clean_fresh)
+                    target_room = next((r for r in fresh_project.rooms if r.id == room_id), None)
+                    if target_room:
+                        any_completed = any(v.status == "completed" for v in target_room.variations)
+                        any_pending = any(v.status in ("pending", "processing") for v in target_room.variations)
+                        if any_pending:
+                            target_room.status = "processing"
+                        elif any_completed:
+                            target_room.status = "completed"
+                        else:
+                            target_room.status = "failed"
+                    # Issue 001 (projects-page-improvements PRD): single
+                    # source of truth for project-level status via
+                    # ProjectStatusCalculator. Replaces an inline branch
+                    # that only updated project.status when ALL rooms were
+                    # terminal — meaning the persisted status was stale on
+                    # mixed projects (one room mid-regen with peers still
+                    # pending). The calculator unconditionally returns the
+                    # truthful status (PENDING when work is outstanding)
+                    # so the persisted value matches the badge after refresh.
+                    fresh_project.status = ProjectStatusCalculator.compute_status(fresh_project.rooms)
+                    storage.update_project(project_id, json.loads(fresh_project.json()))
+                    final_status = fresh_project.status
 
             # Issue 008: emit the terminal log line ONCE we've observed the
             # pipeline's terminal SSE event, OR the prompt-gen-failure path
