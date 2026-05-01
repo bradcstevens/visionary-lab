@@ -21,6 +21,7 @@ import { getProject, deleteProject, resetProject, streamGeneration, streamRoomRe
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
+import { getHeaderAction } from "@/utils/staging-header";
 import { useActivityLog } from "@/context/activity-log-context";
 
 export default function ProjectDetailPage() {
@@ -495,20 +496,41 @@ export default function ProjectDetailPage() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {/* Primary action — most common action gets the prominent button */}
-            {allPending && project.rooms.length > 0 ? (
-              <Button onClick={startGeneration} disabled={isGenerating}>
-                {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
-                Generate
-              </Button>
-            ) : !allPending ? (
-              <Button variant="outline" onClick={handleRegenerateAll} disabled={isGenerating}>
-                {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                Regenerate All
-              </Button>
-            ) : null}
+            {/* Primary action — derived from a pure 3-state helper so the
+                label tells the truth (issue 002 of per-room-generation-control).
+                See `frontend/utils/staging-header.ts` for the contract. */}
+            {(() => {
+              const action = getHeaderAction(project.rooms);
+              if (action.kind === 'hidden') return null;
+              if (action.kind === 'generate') {
+                return (
+                  <Button
+                    data-testid="project-header-action"
+                    onClick={startGeneration}
+                    disabled={isGenerating}
+                  >
+                    {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
+                    Generate
+                  </Button>
+                );
+              }
+              return (
+                <Button
+                  data-testid="project-header-action"
+                  variant="outline"
+                  onClick={handleRegenerateAll}
+                  disabled={isGenerating}
+                >
+                  {isGenerating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                  Generate Remaining ({action.count})
+                </Button>
+              );
+            })()}
 
-            {/* Overflow menu — secondary and destructive actions */}
+            {/* Overflow menu — secondary and destructive actions. The
+                duplicate `Regenerate all` item that used to appear here
+                in mixed-state was removed in issue 002 (the header CTA
+                already exposes the same action). */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="icon" disabled={isGenerating || isDeleting}>
@@ -521,12 +543,6 @@ export default function ProjectDetailPage() {
                   <Plus className="h-4 w-4 mr-2" />
                   Add more images
                 </DropdownMenuItem>
-                {!allPending && (
-                  <DropdownMenuItem onClick={handleRegenerateAll} disabled={isGenerating}>
-                    <RefreshCw className="h-4 w-4 mr-2" />
-                    Regenerate all
-                  </DropdownMenuItem>
-                )}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="text-destructive focus:text-destructive"
