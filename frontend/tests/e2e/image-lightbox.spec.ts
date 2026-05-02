@@ -354,6 +354,124 @@ test.describe('Image Lightbox', () => {
     await expect(page.locator('p').filter({ hasText: 'Living Room — Variation 1' })).toBeVisible();
   });
 
+  // -------------------------------------------------------------------------
+  // Issue 005 of radix-dialog-body-lock-fix PRD — close-then-interactive
+  // regression. Mirrors the assertion shape from the project-settings-sheet
+  // spec's Issue 004 block (commit a95576a). Pure e2e regression slice; no
+  // implementation change to ImageLightbox or its consumers — the layout-
+  // level body-lock-guard from issue 002 is what the assertion proves.
+  //
+  // Per close mechanism (✕ button, Escape key) we:
+  //   1. open the lightbox on the first completed variation,
+  //   2. navigate forward then back with the arrow keys (touches both
+  //      completed variations — the user-natural review flow the PRD
+  //      calls out),
+  //   3. close via the mechanism under test,
+  //   4. assert the page is interactive: no inline pointer-events:none
+  //      on <body>, no data-scroll-locked attribute on <body>, AND a
+  //      non-force click on a normal page element (the More-actions
+  //      overflow trigger) succeeds.
+  //
+  // Failure messages on each assertion name the specific lock-leak family
+  // being caught so a future CI failure points the next contributor at
+  // the right Radix / scroll-lock layer to debug.
+  // -------------------------------------------------------------------------
+
+  type LightboxCloseMechanism = 'x-button' | 'escape';
+
+  async function openLightboxAndReview(page: Page) {
+    const completedImage = page.locator('.group.cursor-pointer').first();
+    await completedImage.click();
+    const overlay = page.locator('[data-slot="dialog-overlay"]');
+    await expect(overlay).toBeVisible();
+
+    // Navigate through both completed variations with arrow keys — the
+    // "user-natural review flow" the PRD calls out. Two presses (right
+    // then left) exercises both navigation directions and confirms we
+    // touched both completed variations before closing.
+    await expect(page.locator('p').filter({ hasText: 'Living Room — Variation 1' })).toBeVisible();
+    await page.keyboard.press('ArrowRight');
+    await expect(page.locator('p').filter({ hasText: 'Living Room — Variation 2' })).toBeVisible();
+    await page.keyboard.press('ArrowLeft');
+    await expect(page.locator('p').filter({ hasText: 'Living Room — Variation 1' })).toBeVisible();
+  }
+
+  async function closeLightbox(page: Page, mechanism: LightboxCloseMechanism) {
+    const overlay = page.locator('[data-slot="dialog-overlay"]');
+    if (mechanism === 'x-button') {
+      await page.getByLabel('Close').click();
+    } else if (mechanism === 'escape') {
+      await page.keyboard.press('Escape');
+    }
+    await expect(overlay).not.toBeVisible();
+  }
+
+  /**
+   * Assert <body> has no stuck Radix/react-remove-scroll lock state and
+   * that a non-force click on a known page element below the closed
+   * lightbox succeeds. Failure messages name the specific lock-leak
+   * family being caught.
+   */
+  async function assertLightboxCloseThenInteractive(page: Page) {
+    // 1. Radix Dialog body-lock signature.
+    const inlinePointerEvents = await page.evaluate(
+      () => document.body.style.pointerEvents,
+    );
+    expect(
+      inlinePointerEvents,
+      `Expected <body> to NOT have inline pointer-events:none after lightbox ` +
+        `close; got "${inlinePointerEvents}". This is the Radix Dialog ` +
+        `body-lock leak the layout-level body-lock-guard from issue 002 is ` +
+        `supposed to clear.`,
+    ).not.toBe('none');
+
+    // 2. react-remove-scroll signature.
+    const hasScrollLocked = await page.evaluate(() =>
+      document.body.hasAttribute('data-scroll-locked'),
+    );
+    expect(
+      hasScrollLocked,
+      `Expected <body> to NOT carry data-scroll-locked attribute after ` +
+        `lightbox close; found it set. This is the react-remove-scroll lock ` +
+        `leak the issue-002 body-lock-guard is supposed to clear.`,
+    ).toBe(false);
+
+    // 3. Ground-truth interactivity check: a non-force click on the
+    //    More-actions overflow trigger surfaces its menu. Catches any
+    //    OTHER mechanism that could leave the page non-interactive
+    //    (stale focus-trap, orphan portal, scheduler bug) beyond the
+    //    two known signatures above.
+    const overflowTrigger = page.getByRole('button', { name: /more actions/i });
+    await overflowTrigger.click({ timeout: 3000 });
+    await expect(
+      page.getByTestId('overflow-menu-project-settings'),
+      'After closing the lightbox, a non-force click on the More-actions ' +
+        'overflow trigger must surface the menu. If this fails, the page is ' +
+        'non-interactive after lightbox close — see the failure message ' +
+        'above for the specific lock-leak family.',
+    ).toBeVisible();
+    // Dismiss the menu so this helper leaves no trailing UI state.
+    await page.keyboard.press('Escape');
+    await expect(
+      page.getByTestId('overflow-menu-project-settings'),
+    ).not.toBeVisible();
+  }
+
+  for (const mechanism of ['x-button', 'escape'] as LightboxCloseMechanism[]) {
+    test(`close via ${mechanism} (after arrow-key review of both variations) leaves the page interactive`, async ({
+      page,
+    }) => {
+      await setupRoutes(page);
+      await page.goto(`/projects/${PROJECT_ID}`);
+      await page.waitForLoadState('networkidle');
+
+      await openLightboxAndReview(page);
+      await closeLightbox(page, mechanism);
+
+      await assertLightboxCloseThenInteractive(page);
+    });
+  }
+
   test('lightbox has frosted glass toolbar styling', async ({ page }) => {
     await setupRoutes(page);
     await page.goto(`/projects/${PROJECT_ID}`);
