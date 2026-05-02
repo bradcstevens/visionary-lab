@@ -5,7 +5,9 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+import asyncio
+
+from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from backend.core.azure_storage import AzureBlobStorageService
@@ -13,8 +15,10 @@ from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
 from backend.core.job_queue import JobQueue
 from backend.core.job_store import JobStore, deterministic_job_id
+from backend.core.sse_hub import SSEHub, get_sse_hub
 from backend.core.project_status import ProjectStatusCalculator
 from backend.core.prompt_composer import PromptComposer
+from backend.core.prompt_summarizer import PromptSummarizer, truncate_to_summary
 from backend.core.staging_pipeline import _get_project_lock
 from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
@@ -80,10 +84,30 @@ def get_job_store() -> JobStore:
     return JobStore()
 
 
+def get_prompt_summarizer() -> PromptSummarizer:
+    """FastAPI dependency: ``PromptSummarizer`` for ``POST /projects``
+    and ``PATCH /projects/{id}`` (issue 013 of the image-pipeline PRD).
+    Patched in tests via ``app.dependency_overrides`` so the endpoint
+    flow can be exercised without an LLM round-trip."""
+    from backend.core import async_llm_client
+
+    return PromptSummarizer(
+        async_llm_client=async_llm_client,
+        llm_deployment=settings.LLM_DEPLOYMENT,
+    )
+
+
 def get_job_queue() -> JobQueue:
     """FastAPI dependency: ``JobQueue`` for the async-queue endpoints
     (issue 004 of the image-pipeline PRD). Patched in tests."""
     return JobQueue()
+
+
+async def get_sse_hub_dep() -> SSEHub:
+    """FastAPI dependency: per-replica ``SSEHub`` (issue 005). Patched
+    in tests via ``app.dependency_overrides`` so an in-memory feed can
+    be installed without booting Cosmos."""
+    return await get_sse_hub()
 
 
 def get_staging_pipeline():
@@ -115,11 +139,18 @@ def get_staging_pipeline():
 async def create_project(
     request: CreateProjectRequest,
     storage: StagingStorageService = Depends(get_staging_storage),
+    summarizer: PromptSummarizer = Depends(get_prompt_summarizer),
 ):
+    # Issue 013: seed ``prompt_summary`` at create time so the project
+    # page can render the collapsed-summary view from the very first
+    # read. Short prompts (≤240 chars — the common case) skip the LLM
+    # round-trip via the summarizer's pass-through optimization.
+    prompt_summary = await summarizer.summarize(request.prompt)
     project_data = {
         "id": str(uuid.uuid4()),
         "name": request.name,
         "prompt": request.prompt,
+        "prompt_summary": prompt_summary,
         "status": "uploading",
         "rooms": [],
         "settings": request.settings.dict(),
@@ -577,6 +608,7 @@ async def update_project(
     project_id: str,
     body: UpdateProjectRequest,
     storage: StagingStorageService = Depends(get_staging_storage),
+    summarizer: PromptSummarizer = Depends(get_prompt_summarizer),
 ):
     """Partial-update editable project-level fields (``name``,
     ``prompt``, ``settings``, ``design_brief``).
@@ -642,6 +674,32 @@ async def update_project(
         if "design_brief" in sent:
             # ``None`` is meaningful here — clears the brief.
             project_data["design_brief"] = body.design_brief
+
+        # Issue 013 — prompt_summary maintenance. Three cases:
+        #
+        #   1. Client sent prompt_summary explicitly: that wins. We
+        #      still pass it through ``truncate_to_summary`` so a
+        #      client overshoot (>240 chars) is normalized to the
+        #      same contract the rest of the system enforces, rather
+        #      than 422-ing the request the user can otherwise satisfy.
+        #
+        #   2. Client sent prompt but NOT prompt_summary: server
+        #      regenerates via PromptSummarizer (which itself short-
+        #      circuits short prompts and falls back to truncation
+        #      on LLM failure). This is the common UX path — the
+        #      collapsed-summary view stays accurate after a prompt
+        #      edit without the client having to know about it.
+        #
+        #   3. Neither sent: leave persisted summary untouched.
+        #
+        # Per the PRD's AC, none of these branches enqueues
+        # regeneration jobs — prompt edits explicitly do NOT trigger
+        # image regeneration. The user clicks a separate Regenerate
+        # button (issue 019) when they want that.
+        if "prompt_summary" in sent:
+            project_data["prompt_summary"] = truncate_to_summary(body.prompt_summary)
+        elif "prompt" in sent:
+            project_data["prompt_summary"] = await summarizer.summarize(body.prompt)
 
         # Issue 001 of project-settings-completeness PRD:
         # mirror ``project.prompt`` and
@@ -1922,3 +1980,197 @@ async def cancel_job(
     store.update_job(job_id, project_id, cancel_requested=True)
     logger.info("staging.jobs.cancel.requested job_id=%s", job_id)
     return {"status": "accepted", "job_id": job_id, "already_terminal": False}
+
+
+# ---------------------------------------------------------------------------
+# SSE stream (issue 005 — image-pipeline-and-project-ux-overhaul)
+# ---------------------------------------------------------------------------
+
+
+# Per-session soft cap on concurrent ``/jobs/stream`` connections. The
+# count is process-local — each replica enforces its own cap. Front Door
+# routes a session to a sticky replica via cookie affinity in the normal
+# case; if it doesn't, the limit becomes (cap × replicas) which is still
+# fine for runaway-script protection.
+_MAX_STREAMS_PER_SESSION = 10
+_session_stream_counts: dict[str, int] = {}
+_session_stream_lock = asyncio.Lock()
+
+_SSE_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_SSE_LOOP_POLL_SECONDS = 0.5
+
+
+def _extract_session_token(
+    session_cookie: Optional[str], access_token: Optional[str]
+) -> Optional[str]:
+    """Return the cap-key for a stream connection.
+
+    The codebase has no real auth system yet; both inputs are treated as
+    opaque strings. Cookie wins when both are present (matches a typical
+    browser EventSource flow where the cookie is auto-attached and the
+    query param is only a fallback for non-cookie transports).
+    """
+    if session_cookie:
+        return session_cookie
+    if access_token:
+        return access_token
+    return None
+
+
+async def _acquire_session_slot(token: str) -> bool:
+    """Reserve one stream slot for ``token``. Returns False over the cap."""
+    async with _session_stream_lock:
+        current = _session_stream_counts.get(token, 0)
+        if current >= _MAX_STREAMS_PER_SESSION:
+            return False
+        _session_stream_counts[token] = current + 1
+        return True
+
+
+async def _release_session_slot(token: str) -> None:
+    async with _session_stream_lock:
+        current = _session_stream_counts.get(token, 0)
+        if current <= 1:
+            _session_stream_counts.pop(token, None)
+        else:
+            _session_stream_counts[token] = current - 1
+
+
+def _format_sse(event: str, data: str) -> bytes:
+    """Encode one SSE message frame."""
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+
+async def _sse_event_stream(
+    *,
+    seed_jobs: list,
+    subscription,
+    is_disconnected,
+    heartbeat_interval: Optional[float] = None,
+    poll_interval: Optional[float] = None,
+):
+    """Inner generator for ``/jobs/stream``, factored out so it can be
+    tested directly without going through an ASGI HTTP client (httpx's
+    ``ASGITransport`` buffers responses to completion, which deadlocks
+    on infinite SSE generators).
+
+    Wire format:
+      - one ``event: seed`` carrying ``seed_jobs``
+      - one ``event: job`` per item delivered to ``subscription.queue``
+      - a ``:heartbeat`` SSE comment line every ``heartbeat_interval``
+        seconds while the queue is quiet
+    Exits the loop when ``is_disconnected()`` first returns True so
+    cleanup in the caller's ``finally`` block runs promptly.
+    """
+    hb = heartbeat_interval if heartbeat_interval is not None else _SSE_HEARTBEAT_INTERVAL_SECONDS
+    pi = poll_interval if poll_interval is not None else _SSE_LOOP_POLL_SECONDS
+
+    yield _format_sse("seed", json.dumps({"jobs": seed_jobs}))
+    loop = asyncio.get_running_loop()
+    last_heartbeat = loop.time()
+    while True:
+        if await is_disconnected():
+            return
+        try:
+            item = await asyncio.wait_for(subscription.queue.get(), timeout=pi)
+            yield _format_sse("job", json.dumps(_job_summary(item)))
+        except asyncio.TimeoutError:
+            now = loop.time()
+            if now - last_heartbeat >= hb:
+                yield b":heartbeat\n\n"
+                last_heartbeat = now
+
+
+@router.get("/projects/{project_id}/jobs/stream")
+async def stream_project_jobs(
+    project_id: str,
+    request: Request,
+    access_token: Optional[str] = Query(default=None),
+    session_id: Optional[str] = Cookie(default=None),
+    storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
+):
+    """Server-Sent Events stream of job state for a project.
+
+    Emits one ``event: seed`` carrying the current job list, then one
+    ``event: job`` per change-feed delivery for this ``project_id``,
+    plus a ``:heartbeat`` comment line every 15s to keep proxies from
+    closing the connection during quiet periods.
+
+    Auth: requires either a ``session_id`` cookie or an ``access_token``
+    query parameter (per PRD § Frontend transport — the EventSource API
+    cannot send custom headers, so the query param is the documented
+    escape hatch). The token is opaque to the server and only used as
+    the per-session cap key.
+
+    Per-session cap: 10 concurrent streams; the 11th returns 429.
+
+    Headers: ``Cache-Control: no-cache, no-transform`` and
+    ``X-Accel-Buffering: no`` so Front Door / nginx-style proxies do
+    not buffer the chunked response.
+
+    Note on dependency resolution: the SSE hub is resolved manually
+    AFTER the auth / 404 / 503 / 429 gates rather than via ``Depends``
+    so an unauthorized request never starts the per-replica change-feed
+    pump (the lazy singleton is constructed on first ``get_sse_hub()``
+    call, and we don't want to pay that cost on bot traffic).
+    """
+    _require_async_queue_enabled()
+
+    token = _extract_session_token(session_id, access_token)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing session cookie or access_token",
+        )
+
+    project = storage.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not await _acquire_session_slot(token):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Too many concurrent streams for this session "
+                f"(max {_MAX_STREAMS_PER_SESSION})"
+            ),
+        )
+
+    try:
+        hub = await get_sse_hub_dep()
+    except Exception:
+        # Hub failed to start — release the slot we just acquired so a
+        # transient failure doesn't permanently consume the per-session cap.
+        await _release_session_slot(token)
+        raise
+
+    subscription = await hub.subscribe(project_id)
+    seed = [_job_summary(d) for d in store.list_jobs_by_project(project_id)]
+
+    async def _gen():
+        try:
+            async for chunk in _sse_event_stream(
+                seed_jobs=seed,
+                subscription=subscription,
+                is_disconnected=request.is_disconnected,
+            ):
+                yield chunk
+        finally:
+            await subscription.aclose()
+            await _release_session_slot(token)
+            logger.info(
+                "staging.jobs.stream.closed project_id=%s token_hash=%d",
+                project_id, hash(token),
+            )
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers=headers,
+    )
