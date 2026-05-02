@@ -244,9 +244,7 @@ test.describe('Project Settings side sheet (issue 002)', () => {
       settings: { variations_per_room: 3 },
     });
 
-    // 5. Sheet closes after save. The overlay detaches; subsequent
-    //    clicks may need ``force`` because Radix's pointer-events lock
-    //    can outlive the visibility transition.
+    // 5. Sheet closes after save and the overlay detaches.
     await expect(sheet).not.toBeVisible();
     await expect(page.locator('[data-slot="sheet-overlay"]')).not.toBeAttached();
 
@@ -263,12 +261,10 @@ test.describe('Project Settings side sheet (issue 002)', () => {
     expect(generateRequests).toEqual([]);
 
     // 8. Reload the page and re-open the sheet — the variations value
-    //    is now the freshly-persisted 3, not 5. We reload (rather than
-    //    chain a click on the still-mounted Radix tree) to dodge the
-    //    well-known Radix Dialog ``pointer-events`` lock that can
-    //    persist briefly after close. The fresh page load guarantees a
-    //    clean tree; the assertion still proves "save persisted +
-    //    local state reflects it".
+    //    is now the freshly-persisted 3, not 5. Using a fresh page load
+    //    here is purely about asserting persistence end-to-end (the
+    //    saved value survives a fresh load), not about working around
+    //    any overlay-close behavior.
     await page.reload();
     await page.waitForLoadState('networkidle');
     await page.getByRole('button', { name: /more actions/i }).click();
@@ -2781,4 +2777,259 @@ test.describe('Issue 007 — disable rules during generation', () => {
     // Page redirected to /projects (success path).
     await expect.poll(() => redirected).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 004 of radix-dialog-body-lock-fix PRD —
+// close-then-interactive regression assertion.
+//
+// `ProjectSettingsSheet` already follows the always-mounted +
+// controlled-`open` shape required by the PRD; this slice ships NO
+// component implementation change. It is purely an e2e regression
+// guard that catches a future Radix / react-remove-scroll bump (or a
+// regression in the layout-level body-lock-guard from issue 002 of
+// the PRD) re-introducing the lock-leak family the user reported.
+//
+// After the sheet closes via each of Cancel, ✕, Esc, and click-outside
+// we assert THREE observable behaviors:
+//
+//   1. `<body>` does not have inline `pointer-events: none`
+//   2. `<body>` does not have a `data-scroll-locked` attribute
+//   3. A non-`force` Playwright click on a known page element below
+//      the closed sheet (the More-actions overflow trigger) succeeds
+//      and surfaces the menu
+//
+// Assertion (3) is the ground-truth user-facing check. If the page
+// is non-interactive for ANY reason (stuck Radix style, orphan portal,
+// stale focus-trap, a future scheduler bug), a non-force click against
+// a normal page element will time out — independent of which specific
+// stuck-attribute signature is at fault. Assertions (1) and (2) name
+// the two known signatures so a CI failure points the next contributor
+// at the right Radix/scroll-lock layer to debug.
+//
+// Two flavors:
+//   (a) sheet opened and immediately closed (no inner UI touched).
+//   (b) sheet opened, the Quality and Size dropdowns each opened and
+//       dismissed, then sheet closed — exercises the inner-portal
+//       interaction path the PRD calls out as a regression vector.
+//       (Note: per issue 003 of the project-settings-completeness
+//       PRD, the Model field is now a read-only label, not a Select,
+//       so it has no dropdown to exercise.)
+// ---------------------------------------------------------------------------
+
+const LOCK_REGRESSION_PROJECT_ID = 'test-lock-regression';
+
+function makeLockRegressionProject(): MockProject {
+  return makeProject({ id: LOCK_REGRESSION_PROJECT_ID });
+}
+
+async function setupLockRegressionRoutes(page: Page) {
+  await setupSasTokenMock(page);
+  let projectState = makeLockRegressionProject();
+  await page.route(
+    `${API_BASE}/staging/projects/${LOCK_REGRESSION_PROJECT_ID}`,
+    async (route: Route) => {
+      const method = route.request().method();
+      if (method === 'GET') {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ project: projectState }),
+        });
+      }
+      if (method === 'PATCH') {
+        const body = JSON.parse(route.request().postData() || '{}');
+        const next: MockProject = { ...projectState };
+        if ('name' in body) next.name = body.name as string;
+        if ('prompt' in body) next.prompt = body.prompt as string;
+        if ('settings' in body) {
+          next.settings = {
+            ...projectState.settings,
+            ...(body.settings as Record<string, unknown>),
+          };
+        }
+        projectState = next;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ project: projectState }),
+        });
+      }
+      return route.continue();
+    },
+  );
+}
+
+/**
+ * Opens the Project Settings sheet from the overflow menu and waits for it
+ * to be fully visible. Returns the sheet locator.
+ */
+async function openSettingsSheet(page: Page) {
+  await page.getByRole('button', { name: /more actions/i }).click();
+  await page.getByTestId('overflow-menu-project-settings').click();
+  const sheet = page.getByTestId('project-settings-sheet');
+  await expect(sheet).toBeVisible();
+  return sheet;
+}
+
+/**
+ * Open then dismiss each of the Quality + Size Radix Select dropdowns
+ * inside the sheet. Exercises the inner-portal interaction path that
+ * the parent PRD calls out as a known regression vector for the body
+ * lock. Re-clicking the trigger (rather than pressing Escape) is the
+ * deliberate dismissal mechanic so the Esc key is reserved for closing
+ * the SHEET in the close-path tests below.
+ */
+async function exerciseInnerDropdowns(page: Page) {
+  for (const testId of [
+    'project-settings-quality-select',
+    'project-settings-size-select',
+  ]) {
+    const trigger = page.getByTestId(testId);
+    await trigger.click();
+    await expect(page.locator('[role="listbox"]')).toHaveCount(1);
+    await trigger.click();
+    await expect(page.locator('[role="listbox"]')).toHaveCount(0);
+  }
+}
+
+/**
+ * Assert that <body> has no stuck Radix lock state and that a non-force
+ * click on a known page element below the closed sheet succeeds.
+ *
+ * Failure messages name the specific lock-leak family being caught so a
+ * future contributor reading a CI failure understands which layer to
+ * debug — the two known stuck-attribute signatures (Radix Dialog's
+ * inline `pointer-events: none`, react-remove-scroll's
+ * `data-scroll-locked` attribute), or the non-force click failing for
+ * any OTHER reason (stale focus-trap, orphan portal, scheduler bug).
+ *
+ * The non-force overflow-trigger click is the ground-truth user-facing
+ * assertion; assertions 1 and 2 are diagnostic name-tags for the two
+ * known signatures.
+ *
+ * Side effect: opens and dismisses the More-actions menu to prove
+ * interactivity. Callers that want to leave the menu untouched should
+ * call this helper LAST in their test.
+ */
+async function assertCloseThenInteractive(page: Page) {
+  // 1. <body> must not carry inline `pointer-events: none` — the Radix
+  //    Dialog body-lock signature that the issue-002 body-lock-guard
+  //    is supposed to clear.
+  const inlinePointerEvents = await page.evaluate(
+    () => document.body.style.pointerEvents,
+  );
+  expect(
+    inlinePointerEvents,
+    `Expected <body> to NOT have inline pointer-events:none after sheet close; ` +
+      `got "${inlinePointerEvents}". This is the Radix Dialog body-lock leak ` +
+      `the always-mounted controlled-\`open\` shape (and the layout-level ` +
+      `body-lock-guard from issue 002) is supposed to prevent.`,
+  ).not.toBe('none');
+
+  // 2. <body> must not carry the `data-scroll-locked` attribute —
+  //    react-remove-scroll's signature that the issue-002 body-lock-guard
+  //    is also supposed to clear.
+  const hasScrollLocked = await page.evaluate(() =>
+    document.body.hasAttribute('data-scroll-locked'),
+  );
+  expect(
+    hasScrollLocked,
+    `Expected <body> to NOT carry data-scroll-locked attribute after sheet ` +
+      `close; found it set. This is the react-remove-scroll lock leak the ` +
+      `issue-002 body-lock-guard is supposed to clear.`,
+  ).toBe(false);
+
+  // 3. Ground-truth user-facing check: a non-force click on a normal
+  //    page element below the closed sheet succeeds. Catches any OTHER
+  //    mechanism that could leave the page non-interactive (stale
+  //    focus-trap, orphan portal, scheduler bug) beyond the two known
+  //    signatures above. If this hangs and times out, the page is dead
+  //    in a way that may not register on assertions 1 or 2.
+  const overflowTrigger = page.getByRole('button', { name: /more actions/i });
+  await overflowTrigger.click({ timeout: 3000 });
+  await expect(
+    page.getByTestId('overflow-menu-project-settings'),
+    'After closing the Project Settings sheet, a non-force click on the ' +
+      'More-actions overflow trigger must surface the menu. If this fails, ' +
+      'the page is non-interactive after sheet close — see the failure ' +
+      'message above for the specific lock-leak family.',
+  ).toBeVisible();
+  // Dismiss the menu so this helper leaves no trailing UI state.
+  await page.keyboard.press('Escape');
+  await expect(
+    page.getByTestId('overflow-menu-project-settings'),
+  ).not.toBeVisible();
+}
+
+type CloseMechanism = 'cancel' | 'x-button' | 'escape' | 'click-outside';
+
+/**
+ * Closes a currently-open Project Settings sheet via the requested mechanism.
+ * Each branch exercises a different code path through Radix's
+ * `onOpenChange` handler, and each is a known regression vector for the
+ * body-lock leak in different ways.
+ */
+async function closeSheet(page: Page, mechanism: CloseMechanism) {
+  const sheet = page.getByTestId('project-settings-sheet');
+  if (mechanism === 'cancel') {
+    await page.getByTestId('project-settings-cancel').click();
+  } else if (mechanism === 'x-button') {
+    // The Sheet primitive renders an absolutely-positioned ✕ button with
+    // an `sr-only` "Close" label. Scope the lookup to the sheet content
+    // so it can't accidentally match other "Close" buttons on the page.
+    await sheet.getByRole('button', { name: 'Close' }).click();
+  } else if (mechanism === 'escape') {
+    // Make sure focus is inside the sheet before pressing Esc. After
+    // the sheet opens via the overflow-menu item click, .focus() in
+    // headless Chrome doesn't always synthesize the same focus state
+    // as a real user click, so click the first input to move focus
+    // unambiguously.
+    await page.getByTestId('project-settings-name-input').click();
+    await page.keyboard.press('Escape');
+  } else if (mechanism === 'click-outside') {
+    // Click the Radix sheet overlay (the dimmed backdrop). Radix routes
+    // this through `onPointerDownOutside`, which is a different
+    // close-path branch than Esc/Cancel/✕.
+    await page.locator('[data-slot="sheet-overlay"]').click({ force: true });
+    // Note: `force: true` here targets clicking THROUGH the overlay
+    // element itself (which intentionally captures pointer events while
+    // visible) — it is NOT a workaround for any post-close lock leak.
+    // The post-close `assertCloseThenInteractive` call will still
+    // perform a non-force click on the overflow trigger and is the
+    // load-bearing interactivity assertion.
+  }
+  await expect(sheet).not.toBeVisible();
+}
+
+test.describe('Issue 004 — close-then-interactive regression', () => {
+  // Two flavors × four close mechanisms = 8 tests. Each is a thin,
+  // independent slice so a future CI failure points cleanly at one
+  // close path × one inner-interaction path.
+  const flavors: Array<{
+    name: string;
+    exerciseInner: (page: Page) => Promise<void>;
+  }> = [
+    { name: 'no inner dropdowns opened', exerciseInner: async () => {} },
+    { name: 'after Quality + Size dropdowns opened and dismissed', exerciseInner: exerciseInnerDropdowns },
+  ];
+  const mechanisms: CloseMechanism[] = ['cancel', 'x-button', 'escape', 'click-outside'];
+
+  for (const flavor of flavors) {
+    for (const mechanism of mechanisms) {
+      test(`close via ${mechanism} (${flavor.name}) leaves the page interactive`, async ({
+        page,
+      }) => {
+        await setupLockRegressionRoutes(page);
+        await page.goto(`/projects/${LOCK_REGRESSION_PROJECT_ID}`);
+        await page.waitForLoadState('networkidle');
+
+        await openSettingsSheet(page);
+        await flavor.exerciseInner(page);
+        await closeSheet(page, mechanism);
+
+        await assertCloseThenInteractive(page);
+      });
+    }
+  }
 });
