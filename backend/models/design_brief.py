@@ -149,6 +149,30 @@ class DesignBrief(BaseModel):
     )
     preserve_elements: List[str] = Field(default_factory=list, description="Elements to keep unchanged")
     settings: StagingSettings = Field(default_factory=StagingSettings)
+    # Issue 015 of the image-pipeline-and-project-ux-overhaul PRD: the
+    # eight canonical sections from ``BriefSectionRegistry``. Sparse map
+    # of ``section_id`` → user-authored content. Empty / missing entries
+    # are rendered as absent sections by ``PromptComposer.compose_brief
+    # _markdown``. Defaulting to an empty dict keeps every existing brief
+    # construction (and every persisted Cosmos doc) backward-compatible
+    # — projects created before this feature shipped simply have no
+    # ``sections`` payload until the lazy backfill (issue 016) populates
+    # them on first read.
+    sections: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Eight canonical sections keyed by BriefSectionRegistry id.",
+    )
+    # Power-user escape hatch (PRD § BriefSectionRegistry, user story 35):
+    # when set to a non-empty string, ``PromptComposer.compose_brief
+    # _markdown`` returns ``raw_override`` verbatim and ignores
+    # ``sections`` entirely. The settings panel surfaces a banner + a
+    # one-click revert when this is non-None. ``None`` (NOT empty string)
+    # is the canonical "off" value so an empty-string raw override
+    # cannot accidentally blank out the composed prompt.
+    raw_override: Optional[str] = Field(
+        None,
+        description="Power-user override; when set, replaces composed prompt entirely.",
+    )
 
     @model_validator(mode="before")
     @classmethod
