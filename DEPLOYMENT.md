@@ -156,6 +156,109 @@ To remove all Azure resources:
 azd down
 ```
 
+## Persistent Image-Job Queue
+
+The deployment provisions a persistent image-job queue (Azure Storage
+Queue + KEDA-scaled worker Container App) so image regeneration jobs
+survive worker restarts and rolling deploys. See
+`prds/2026-05-01-image-pipeline-and-project-ux-overhaul-prd.md` for the
+full design.
+
+### What gets deployed
+
+- Two queues on the existing storage account: `imagejobs` (work) and
+  `imagejobs-poison` (max-dequeue overflow, poison TTL 7 days).
+- A second Container App `ca-worker-<env>` running the same image as
+  the backend with `ROLE=worker`. It has **no ingress** so the KEDA
+  `azure-queue` scale rule can legitimately scale it to **0 replicas**
+  at idle. Trigger: 1 replica per 5 pending messages, capped at 10.
+- `Storage Queue Data Contributor` granted to both the backend and
+  worker managed identities (no connection strings; managed identity
+  only).
+
+### Feature-flag toggle
+
+The pipeline path is gated by `FEATURE_ASYNC_QUEUE`:
+
+- `true` (default in dev/staging) — `staging_pipeline.py` enqueues
+  jobs onto `imagejobs`; the worker dispatches.
+- `false` — falls back to the in-process path that the backend used
+  before this feature shipped. Useful for one-release rollback.
+
+To flip it on a deployed environment without redeploying images:
+
+```bash
+# Inspect current value
+az containerapp show -n ca-backend-<env> -g <rg> \
+  --query "properties.template.containers[0].env[?name=='FEATURE_ASYNC_QUEUE']"
+
+# Flip OFF (forces in-process fallback)
+az containerapp update -n ca-backend-<env> -g <rg> \
+  --set-env-vars FEATURE_ASYNC_QUEUE=false
+az containerapp update -n ca-worker-<env> -g <rg> \
+  --set-env-vars FEATURE_ASYNC_QUEUE=false
+
+# Flip ON
+az containerapp update -n ca-backend-<env> -g <rg> \
+  --set-env-vars FEATURE_ASYNC_QUEUE=true
+az containerapp update -n ca-worker-<env> -g <rg> \
+  --set-env-vars FEATURE_ASYNC_QUEUE=true
+```
+
+The flag flips a single revision in place; the API replica is single-
+instance (see backend `maxReplicas: 1` rationale in `containerApp.bicep`)
+so there is no split-state window. Worker replicas pick up the new
+revision on next scale-out tick (≤ 30s).
+
+### Rolling-deploy drain window
+
+Worker replicas hold a Storage Queue message lease for **90 seconds**
+(JobQueue visibility timeout). On rolling deploy, Container Apps
+gracefully drains an old revision by:
+
+1. Stopping new dequeues on the old replica (revision marked Inactive).
+2. Letting the old replica finish any message currently being processed.
+3. If the worker process does not exit within the **default 30s
+   termination grace period**, the platform sends SIGKILL. The
+   abandoned message becomes visible again 90s after its dequeue
+   timestamp and any healthy replica re-leases it. The job is
+   idempotent — `JobStore` writes are partition-keyed by `project_id`
+   and the deterministic job id `{project_id}:{room_id}:{variation_id}:
+   {revision}` ensures the re-run is the same logical job.
+
+Recommended rolling-deploy procedure:
+
+```bash
+# 1. Drain proactively (optional but reduces re-runs):
+#    set worker minReplicas/maxReplicas to (current, current+0) so
+#    no new replicas spin up while the queue drains.
+az containerapp update -n ca-worker-<env> -g <rg> \
+  --min-replicas 0 --max-replicas 0
+# Wait until the queue depth reads 0:
+az storage queue stats --account-name <storage> --queue-name imagejobs \
+  --auth-mode login
+
+# 2. Deploy the new image:
+azd deploy --service worker
+
+# 3. Restore the scale envelope:
+az containerapp update -n ca-worker-<env> -g <rg> \
+  --min-replicas 0 --max-replicas 10
+```
+
+If the queue does not drain within ~10 minutes, abandon-and-redeploy
+is safe — every job message that was in flight will be re-leased by
+the new revision after its 90s visibility window. The user-visible
+effect is one duplicate progress event per in-flight job, never a
+lost or partially-applied generation.
+
+To verify the worker reached zero at idle after a fresh deploy:
+
+```bash
+az containerapp replica list -n ca-worker-<env> -g <rg> -o table
+# Empty result == scaled to zero (expected when imagejobs is empty).
+```
+
 ## Troubleshooting
 
 ### Common Issues

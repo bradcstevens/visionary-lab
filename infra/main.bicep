@@ -15,6 +15,8 @@ param containerAppEnvName string = 'cae-${environmentName}'
 @description('Name of the Container App')
 param containerAppNameBackend string = 'ca-backend-${environmentName}'
 param containerAppNameFrontend string = 'ca-frontend-${environmentName}'
+@description('Name of the worker Container App that consumes the persistent image-job queue (PRD § Infrastructure → KEDA worker).')
+param containerAppNameWorker string = 'ca-worker-${environmentName}'
 param logAnalyticsWorkspaceName string = 'log-${environmentName}'
 
 @description('Unique name for the Storage Account (3-24 lowercase letters and numbers)')
@@ -62,6 +64,8 @@ param soraModelVersion string = '2025-10-06'
 // Docker images for the backend and frontend container apps
 param DOCKER_IMAGE_BACKEND string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 param DOCKER_IMAGE_FRONTEND string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
+@description('Docker image for the queue-worker Container App. Defaults to the backend image — worker and backend share the same image and branch on the ROLE env var. azd populates this from SERVICE_WORKER_IMAGE_NAME when present.')
+param DOCKER_IMAGE_WORKER string = ''
 param API_PROTOCOL string = ''
 param API_HOSTNAME string = ''
 param API_PORT string = ''
@@ -95,6 +99,12 @@ param cosmosAccountName string = 'cosmos-${environmentName}'
 param cosmosDatabaseName string = 'VisionaryLabDB'
 param cosmosContainerName string = 'visionarylab'
 
+// ─── Local-dev IP allowlist ───
+@description('Comma-separated list of client IP addresses or CIDR ranges to allow through the Cosmos DB and Storage Account firewalls (e.g., for running the backend locally against Azure resources). Leave empty to keep services reachable only via private endpoint. Example: "203.0.113.7,198.51.100.0/24".')
+param allowedClientIpAddresses string = ''
+
+var allowedClientIpAddressList = empty(allowedClientIpAddresses) ? [] : split(replace(allowedClientIpAddresses, ' ', ''), ',')
+
 // ─── Azure Storage Account ───
 module storageAccountMod './modules/storageAccount.bicep' = {
   name: 'storageAccountMod'
@@ -102,6 +112,7 @@ module storageAccountMod './modules/storageAccount.bicep' = {
     location: location
     storageAccountName: storageAccountName
     deployNew: true
+    allowedIpAddresses: allowedClientIpAddressList
   }
 }
 
@@ -140,6 +151,7 @@ module cosmosDbMod './modules/cosmosDb.bicep' = {
     subnetId: ''
     deployNew: true
     publicNetworkAccess: 'Disabled'
+    allowedIpAddresses: allowedClientIpAddressList
   }
 }
 
@@ -350,6 +362,47 @@ module containerAppBackend './modules/containerApp.bicep' = {
   }
 }
 
+// ─── Container App: Worker (queue consumer) ───
+//
+// Second Container App configured as the persistent image-job queue
+// consumer described in
+// `prds/2026-05-01-image-pipeline-and-project-ux-overhaul-prd.md`
+// (Infrastructure → KEDA worker; user stories 19, 38–40). Same image
+// as the backend; differentiated at runtime via `ROLE=worker`. Scales
+// 0..10 on the `imagejobs` queue depth via KEDA, with no ingress so
+// scale-to-zero is honored at idle.
+module containerAppWorker './modules/containerAppWorker.bicep' = {
+  name: 'containerAppWorker'
+  params: {
+    location: location
+    containerAppName: containerAppNameWorker
+    containerAppEnvId: containerAppEnvMod.outputs.containerAppEnvId
+    deployNew: true
+    AZURE_BLOB_SERVICE_URL: storageAccountMod.outputs.storageAccountPrimaryEndpoint
+    AZURE_STORAGE_ACCOUNT_NAME: storageAccountName
+    AZURE_BLOB_IMAGE_CONTAINER: 'images'
+    AZURE_STORAGE_QUEUE_URL: storageAccountMod.outputs.storageAccountPrimaryQueueEndpoint
+    JOB_QUEUE_NAME: storageAccountMod.outputs.imageJobsQueueName
+    JOB_QUEUE_POISON_NAME: storageAccountMod.outputs.imageJobsPoisonQueueName
+    CDN_BLOB_URL: 'https://${frontDoorMod.outputs.frontDoorEndpointHostName}'
+    DOCKER_IMAGE: DOCKER_IMAGE_WORKER == '' ? DOCKER_IMAGE_BACKEND : DOCKER_IMAGE_WORKER
+    AZURE_CONTAINER_REGISTRY_ENDPOINT: containerRegistryMod.outputs.containerRegistryLoginServer
+    AZURE_CONTAINER_REGISTRY_USERNAME: containerRegistryMod.outputs.containerRegistryUsername
+    AZURE_CONTAINER_REGISTRY_PASSWORD: containerRegistryMod.outputs.containerRegistryPassword
+    AI_FOUNDRY_ENDPOINT: aiFoundryMod.outputs.aiFoundryEndpoint
+    LLM_DEPLOYMENT: LLM_DEPLOYMENT
+    IMAGEGEN_DEPLOYMENT: IMAGEGEN_DEPLOYMENT
+    IMAGEGEN_15_DEPLOYMENT: IMAGEGEN_15_DEPLOYMENT
+    IMAGEGEN_1_MINI_DEPLOYMENT: IMAGEGEN_1_MINI_DEPLOYMENT
+    SORA_DEPLOYMENT: SORA_DEPLOYMENT
+    FLUX_KONTEXT_DEPLOYMENT: FLUX_KONTEXT_DEPLOYMENT
+    COSMOS_ENDPOINT: cosmosDbMod.outputs.cosmosAccountEndpoint
+    COSMOS_DATABASE_NAME: cosmosDbMod.outputs.databaseName
+    COSMOS_CONTAINER_NAME: cosmosDbMod.outputs.containerName
+    azdServiceName: 'worker'
+  }
+}
+
 // ─── Container App: Frontend ───
 module containerAppFrontend './modules/containerApp.bicep' = {
   name: 'containerAppFrontend'
@@ -415,6 +468,35 @@ module storageRoleAssignmentMod './modules/storageRoleAssignment.bicep' = {
   }
 }
 
+// Worker Container App needs the same Cosmos / AI Foundry / Storage
+// (Blob + Queue) plane access as the backend so it can run the same
+// `ImagePipelineService` against the persistent JobQueue.
+module workerCosmosRoleAssignmentMod './modules/cosmosRoleAssignment.bicep' = {
+  name: 'workerCosmosRoleAssignmentMod'
+  params: {
+    cosmosAccountName: cosmosAccountNamePrefixed
+    containerAppPrincipalId: containerAppWorker.outputs.containerAppPrincipalId
+    dataContributorRoleId: cosmosDbMod.outputs.dataContributorRoleId
+  }
+}
+
+module workerAiFoundryRoleAssignmentMod './modules/aiFoundryRoleAssignment.bicep' = {
+  name: 'workerAiFoundryRoleAssignmentMod'
+  params: {
+    aiFoundryId: aiFoundryMod.outputs.aiFoundryId
+    aiFoundryName: aiFoundryName
+    containerAppPrincipalId: containerAppWorker.outputs.containerAppPrincipalId
+  }
+}
+
+module workerStorageRoleAssignmentMod './modules/storageRoleAssignment.bicep' = {
+  name: 'workerStorageRoleAssignmentMod'
+  params: {
+    storageAccountName: storageAccountName
+    containerAppPrincipalId: containerAppWorker.outputs.containerAppPrincipalId
+  }
+}
+
 // ─── Outputs ───
 output AZURE_LOCATION string = location
 output AZURE_CONTAINER_ENVIRONMENT_NAME string = containerAppEnvMod.outputs.containerAppEnvId
@@ -424,6 +506,10 @@ output BACKEND_INTERNAL_URI string = 'https://${containerAppBackend.outputs.cont
 output FRONTEND_URI string = 'https://${containerAppFrontend.outputs.containerAppFqdn}'
 output AZURE_STORAGE_ACCOUNT_NAME string = storageAccountName
 output AZURE_BLOB_SERVICE_URL string = storageAccountMod.outputs.storageAccountPrimaryEndpoint
+output AZURE_STORAGE_QUEUE_URL string = storageAccountMod.outputs.storageAccountPrimaryQueueEndpoint
+output JOB_QUEUE_NAME string = storageAccountMod.outputs.imageJobsQueueName
+output JOB_QUEUE_POISON_NAME string = storageAccountMod.outputs.imageJobsPoisonQueueName
+output WORKER_CONTAINER_APP_NAME string = containerAppWorker.outputs.containerAppName
 output AI_FOUNDRY_ENDPOINT string = aiFoundryMod.outputs.aiFoundryEndpoint
 output AI_FOUNDRY_NAME string = aiFoundryName
 output COSMOS_DB_ENDPOINT string = cosmosDbMod.outputs.cosmosAccountEndpoint

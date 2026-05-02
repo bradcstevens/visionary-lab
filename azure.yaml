@@ -11,6 +11,13 @@ services:
     docker:
       path: ./backend/Dockerfile
       context: .
+  worker:
+    project: .
+    language: python
+    host: containerapp
+    docker:
+      path: ./backend/Dockerfile
+      context: .
   frontend:
     project: ./frontend
     language: js
