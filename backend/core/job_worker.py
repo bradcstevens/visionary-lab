@@ -43,11 +43,15 @@ on a single replica is left as an issue-004+ concern.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
+from backend.core.config import settings
 from backend.core.job_queue import MAX_DEQUEUE_COUNT, JobMessage, JobQueue
 from backend.core.job_store import JobStore
+from backend.core.progress_estimator import ProgressEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +86,15 @@ class JobWorker:
         store: JobStore,
         dispatcher: Dispatcher,
         idle_sleep: float = 1.0,
+        estimator: Optional[ProgressEstimator] = None,
+        progress_interval: float = 2.0,
     ):
         self._queue = queue
         self._store = store
         self._dispatcher = dispatcher
         self._idle_sleep = idle_sleep
+        self._estimator = estimator
+        self._progress_interval = progress_interval
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -193,41 +201,70 @@ class JobWorker:
             current = self._store.get_job(job_id, project_id)
             return bool(current and current.get("cancel_requested"))
 
+        # 4a) Synthetic-progress heartbeat (issue 008). When an
+        # ``estimator`` is wired, spawn a background task that emits
+        # ``phase`` + ``progress`` updates every ``progress_interval``
+        # seconds while the dispatcher runs. Cancelled in finally so a
+        # crashed dispatcher cannot leak the task. Without an estimator
+        # the worker behaves exactly as before.
+        started_monotonic = time.monotonic()
+        model = (job.get("payload") or {}).get(
+            "model"
+        ) or getattr(settings, "DEFAULT_IMAGE_MODEL", "default")
+        kind = job.get("kind") or "unknown"
+        heartbeat: Optional[asyncio.Task[None]] = None
+        if self._estimator is not None:
+            heartbeat = asyncio.create_task(
+                self._emit_progress(
+                    job_id=job_id,
+                    project_id=project_id,
+                    model=model,
+                    kind=kind,
+                    started_monotonic=started_monotonic,
+                )
+            )
+
         try:
-            result = await self._dispatcher(running, is_cancelled)
-        except JobCancelled:
-            self._store.update_job(
-                job_id, project_id, status="cancelled"
-            )
-            logger.info(
-                "job.cancelled job_id=%s project_id=%s phase=mid-dispatch",
-                job_id,
-                project_id,
-            )
-            self._queue.complete(message)
-            return
-        except Exception as exc:  # noqa: BLE001 — convert to durable error
-            error_payload = {
-                "type": exc.__class__.__name__,
-                "message": str(exc),
-            }
-            terminal = is_final_attempt
-            self._store.update_job(
-                job_id,
-                project_id,
-                status=("failed" if terminal else "pending"),
-                error=error_payload,
-            )
-            logger.warning(
-                "job.failed job_id=%s project_id=%s attempt=%d terminal=%s error=%s",
-                job_id,
-                project_id,
-                attempts,
-                terminal,
-                error_payload,
-            )
-            self._queue.abandon(message)
-            return
+            try:
+                result = await self._dispatcher(running, is_cancelled)
+            except JobCancelled:
+                self._store.update_job(
+                    job_id, project_id, status="cancelled"
+                )
+                logger.info(
+                    "job.cancelled job_id=%s project_id=%s phase=mid-dispatch",
+                    job_id,
+                    project_id,
+                )
+                self._queue.complete(message)
+                return
+            except Exception as exc:  # noqa: BLE001 — convert to durable error
+                error_payload = {
+                    "type": exc.__class__.__name__,
+                    "message": str(exc),
+                }
+                terminal = is_final_attempt
+                self._store.update_job(
+                    job_id,
+                    project_id,
+                    status=("failed" if terminal else "pending"),
+                    error=error_payload,
+                )
+                logger.warning(
+                    "job.failed job_id=%s project_id=%s attempt=%d terminal=%s error=%s",
+                    job_id,
+                    project_id,
+                    attempts,
+                    terminal,
+                    error_payload,
+                )
+                self._queue.abandon(message)
+                return
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat
 
         # 5) Success.
         self._store.update_job(
@@ -238,6 +275,21 @@ class JobWorker:
             phase="finalizing",
             result=result,
         )
+        if self._estimator is not None:
+            elapsed = max(0.0, time.monotonic() - started_monotonic)
+            # Best-effort — record_completion swallows its own
+            # exceptions, but guard the call too in case the estimator
+            # reference is itself broken.
+            try:
+                self._estimator.record_completion(
+                    model=model, kind=kind, elapsed_seconds=elapsed
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "job_worker.record_completion failed job_id=%s",
+                    job_id,
+                    exc_info=True,
+                )
         logger.info(
             "job.succeeded job_id=%s project_id=%s attempt=%d",
             job_id,
@@ -245,3 +297,53 @@ class JobWorker:
             attempts,
         )
         self._queue.complete(message)
+
+    async def _emit_progress(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        model: str,
+        kind: str,
+        started_monotonic: float,
+    ) -> None:
+        """Periodically write ``phase`` + ``progress`` while a job runs.
+
+        Synthetic progress only — the estimator's curve approaches but
+        never crosses the finalizing floor (90%). The terminal
+        ``progress=100`` + ``phase=finalizing`` write happens in the
+        success branch of ``_handle`` after the dispatcher returns.
+
+        Best-effort: any exception from the estimator or the store is
+        logged and the heartbeat continues. A flapping cosmos call
+        must not derail an in-flight image-gen.
+        """
+        assert self._estimator is not None
+        prior = 0
+        while True:
+            try:
+                await asyncio.sleep(self._progress_interval)
+                elapsed = time.monotonic() - started_monotonic
+                phase, progress = self._estimator.estimate(
+                    model=model,
+                    kind=kind,
+                    elapsed_seconds=elapsed,
+                    prior_progress=prior,
+                )
+                if progress > prior:
+                    prior = progress
+                    self._store.update_job(
+                        job_id,
+                        project_id,
+                        status="running",
+                        phase=phase,
+                        progress=progress,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — cosmetic, never fatal
+                logger.warning(
+                    "job_worker._emit_progress tick failed job_id=%s",
+                    job_id,
+                    exc_info=True,
+                )
