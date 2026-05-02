@@ -1,0 +1,70 @@
+{
+  "domain": "landscaping",
+  "region": "castle-rock",
+  "display_name": "Castle Rock, Colorado — Landscaping",
+  "description": "Front Range / USDA Zone 5b / semi-arid. Drought-tolerant + deer-resistant species and xeriscape-friendly arrangements.",
+  "chips": {
+    "object_palette": [
+      "Baby Blue Eyes Spruce",
+      "Vanderwolf's Pyramid Limber Pine",
+      "Columnar Norway Spruce",
+      "Bristlecone Pine",
+      "Quaking Aspen",
+      "Russian Sage",
+      "Lavender (Lavandula angustifolia)",
+      "Karl Foerster Feather Reed Grass",
+      "Blue Avena Grass",
+      "Yarrow",
+      "Coneflower (Echinacea)",
+      "Catmint (Nepeta)",
+      "Blanket Flower (Gaillardia)",
+      "Sedum (Autumn Joy)",
+      "Yucca",
+      "Sumac (Tiger Eyes)"
+    ],
+    "regional_constraints": [
+      "USDA Hardiness Zone 5b",
+      "Semi-arid Front Range climate",
+      "Drought-tolerant species only",
+      "Deer-resistant preferred",
+      "Tolerates clay / decomposed granite soils",
+      "Wind-exposed exposure",
+      "Heavy spring snow load tolerance",
+      "Castle Rock municipal water-wise guidelines"
+    ],
+    "aesthetic_goal": [
+      "Formal symmetric evergreen anchor design",
+      "Naturalistic mixed-perennial meadow",
+      "Xeriscape-forward low-water palette",
+      "Cottage / pollinator garden",
+      "Modern minimalist with grasses",
+      "Rustic native-plant mountain style"
+    ],
+    "arrangement": [
+      "Anchor-and-rhythm: alternating focal trees with vertical punctuation",
+      "Mass plantings of a single species in odd-numbered groups",
+      "Tiered: tall back row, mid-height middle, low front edge",
+      "Foundation row hugging hardscape",
+      "Loose drifts mimicking native plant communities"
+    ],
+    "scale_fidelity": [
+      "Mature character — show plants at established size",
+      "Recently planted — compact, clearly young",
+      "Photorealistic — preserve original lighting and perspective",
+      "Mid-season summer growth state"
+    ],
+    "do_not_alter": [
+      "Existing hardscape (patio, pergola, fences)",
+      "Existing potted plants and planters",
+      "Camera angle, framing, and original composition",
+      "Lighting and time of day",
+      "HVAC and utility areas"
+    ],
+    "edit_zone": [
+      "In-ground beds along the back fence line",
+      "Side fence-line beds",
+      "Foundation strip along the house",
+      "Around hardscape edges (patio / pergola perimeter)"
+    ]
+  }
+}
