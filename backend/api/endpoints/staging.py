@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
+from backend.core.job_queue import JobQueue
+from backend.core.job_store import JobStore, deterministic_job_id
 from backend.core.project_status import ProjectStatusCalculator
 from backend.core.prompt_composer import PromptComposer
 from backend.core.staging_pipeline import _get_project_lock
@@ -70,6 +72,18 @@ def get_image_analyzer():
         model=settings.LLM_DEPLOYMENT,
         async_openai_client=async_llm_client,
     )
+
+
+def get_job_store() -> JobStore:
+    """FastAPI dependency: ``JobStore`` for the async-queue endpoints
+    (issue 004 of the image-pipeline PRD). Patched in tests."""
+    return JobStore()
+
+
+def get_job_queue() -> JobQueue:
+    """FastAPI dependency: ``JobQueue`` for the async-queue endpoints
+    (issue 004 of the image-pipeline PRD). Patched in tests."""
+    return JobQueue()
 
 
 def get_staging_pipeline():
@@ -1699,3 +1713,212 @@ async def update_brief(
         storage.update_project(project_id, updates)
 
     return {"brief": brief_dict}
+
+# ---------------------------------------------------------------------------
+# Async-queue REST surface (issue 004 — image-pipeline-and-project-ux-overhaul)
+# ---------------------------------------------------------------------------
+
+
+_TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def _require_async_queue_enabled() -> None:
+    """Gate the new endpoints behind ``FEATURE_ASYNC_QUEUE``.
+
+    Per PRD § Feature flags: the flag defaults true in dev/staging
+    (``Settings.FEATURE_ASYNC_QUEUE = True``); production flips it via
+    azd env var after a smoke test. When off, return 503 so a
+    misconfigured production deploy fails loud rather than silently
+    queueing into a worker that isn't running.
+    """
+    if not settings.FEATURE_ASYNC_QUEUE:
+        raise HTTPException(
+            status_code=503,
+            detail="Async image-job queue is disabled (FEATURE_ASYNC_QUEUE=false)",
+        )
+
+
+def _select_revision_for_idempotent_regen(
+    existing_jobs: list[dict],
+    *,
+    room_id: str,
+    variation_id: str,
+) -> int:
+    """Pick the deterministic revision for a regenerate request so a
+    rapid retry of the same call returns the same job ids.
+
+    Rule: among jobs already persisted for this (room, variation),
+    take the highest revision; if it is non-terminal (still in flight),
+    re-use it — that's the active regen and we want the second caller
+    to receive the SAME id (idempotent on retry). If the latest is
+    terminal, increment by 1 — that's a "do it again" request.
+
+    Returns 0 when no prior jobs exist.
+    """
+    matching = [
+        j for j in existing_jobs
+        if j.get("room_id") == room_id and j.get("variation_id") == variation_id
+    ]
+    if not matching:
+        return 0
+    latest = max(matching, key=lambda j: j.get("revision", 0))
+    if latest.get("status") in _TERMINAL_JOB_STATUSES:
+        return int(latest.get("revision", 0)) + 1
+    return int(latest.get("revision", 0))
+
+
+def _job_summary(doc: dict) -> dict:
+    """Project a JobStore doc to the shape the frontend reads.
+
+    Whitelists the operationally-meaningful fields so we never leak
+    payload internals or future-added private fields through the
+    public list endpoint.
+    """
+    return {
+        "id": doc.get("id"),
+        "project_id": doc.get("project_id"),
+        "room_id": doc.get("room_id"),
+        "variation_id": doc.get("variation_id"),
+        "revision": doc.get("revision"),
+        "kind": doc.get("kind"),
+        "status": doc.get("status"),
+        "progress": doc.get("progress"),
+        "phase": doc.get("phase"),
+        "attempts": doc.get("attempts"),
+        "error": doc.get("error"),
+        "result": doc.get("result"),
+        "cancel_requested": doc.get("cancel_requested", False),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@router.post("/projects/{project_id}/jobs/regenerate", status_code=202)
+async def enqueue_regenerate_jobs(
+    project_id: str,
+    body: Optional[dict] = None,
+    storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
+    queue: JobQueue = Depends(get_job_queue),
+):
+    """Enqueue one regenerate-variation job per matching variation.
+
+    Body shape (all fields optional):
+
+        {
+            "room_ids":      [str, ...],   # filter — only these rooms
+            "variation_ids": [str, ...],   # filter — only these variations
+        }
+
+    Empty body / no filter → enqueue for every variation in every room.
+
+    Returns ``{"job_ids": [...]}``. Deterministic + idempotent on retry
+    (see ``_select_revision_for_idempotent_regen``).
+    """
+    _require_async_queue_enabled()
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    body = body or {}
+    room_filter = set(body.get("room_ids") or [])
+    variation_filter = set(body.get("variation_ids") or [])
+
+    existing_jobs = store.list_jobs_by_project(project_id)
+
+    job_ids: list[str] = []
+    for room in project_data.get("rooms") or []:
+        room_id = room.get("id")
+        if room_filter and room_id not in room_filter:
+            continue
+        for variation in room.get("variations") or []:
+            variation_id = variation.get("id")
+            if variation_filter and variation_id not in variation_filter:
+                continue
+            revision = _select_revision_for_idempotent_regen(
+                existing_jobs, room_id=room_id, variation_id=variation_id
+            )
+            doc = store.create_job(
+                project_id=project_id,
+                room_id=room_id,
+                variation_id=variation_id,
+                revision=revision,
+                kind="regenerate_variation",
+                payload={
+                    "room_id": room_id,
+                    "variation_id": variation_id,
+                    "revision": revision,
+                },
+            )
+            job_id = doc["id"]
+            queue.enqueue(job_id=job_id, project_id=project_id)
+            job_ids.append(job_id)
+
+    logger.info(
+        "staging.jobs.regenerate.enqueued project_id=%s count=%d",
+        project_id, len(job_ids),
+    )
+    return {"job_ids": job_ids}
+
+
+@router.get("/projects/{project_id}/jobs")
+async def list_project_jobs(
+    project_id: str,
+    storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
+):
+    """List jobs for a project with status + progress + phase + kind.
+
+    Partition-scoped (single Cosmos partition by ``/project_id``).
+    """
+    _require_async_queue_enabled()
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    docs = store.list_jobs_by_project(project_id)
+    return {"jobs": [_job_summary(d) for d in docs]}
+
+
+@router.delete("/jobs/{job_id}", status_code=202)
+async def cancel_job(
+    job_id: str,
+    store: JobStore = Depends(get_job_store),
+):
+    """Flip ``cancel_requested=True`` on a job.
+
+    Per PRD AC: returns 202 even if the job has already reached a
+    terminal state (no-op in that case — the worker will never see the
+    flag, and the response is informational). 404 only when the id is
+    truly unknown.
+
+    Recovers ``project_id`` from the deterministic id format
+    ``{project_id}:{room_id}:{variation_id}:{revision}`` so we don't
+    have to fan-out across partitions.
+    """
+    _require_async_queue_enabled()
+
+    parts = job_id.split(":")
+    if len(parts) < 4:
+        raise HTTPException(status_code=400, detail="Malformed job_id")
+    project_id = parts[0]
+
+    doc = store.get_job(job_id, project_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if doc.get("status") in _TERMINAL_JOB_STATUSES:
+        # Already terminal — ack the request but do not modify state.
+        # Returning 202 (not 409) per PRD AC: the caller's intent
+        # ("please cancel") is honored either way.
+        logger.info(
+            "staging.jobs.cancel.noop_terminal job_id=%s status=%s",
+            job_id, doc.get("status"),
+        )
+        return {"status": "accepted", "job_id": job_id, "already_terminal": True}
+
+    store.update_job(job_id, project_id, cancel_requested=True)
+    logger.info("staging.jobs.cancel.requested job_id=%s", job_id)
+    return {"status": "accepted", "job_id": job_id, "already_terminal": False}

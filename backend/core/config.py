@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     # rate-limit bound. See parallel-processing PRD § Global image-call cap.
     IMAGE_GEN_MAX_CONCURRENT: int = 3
 
+    # Issue 004 of image-pipeline-and-project-ux-overhaul PRD: enables
+    # the persistent async-queue REST surface (``POST /jobs/regenerate``,
+    # ``GET /jobs``, ``DELETE /jobs/{id}``) and, in a future slice, the
+    # pipeline cutover from inline-await to enqueue. PRD § Feature flags:
+    # default true in dev/staging; production flips via azd env var
+    # after smoke test.
+    FEATURE_ASYNC_QUEUE: bool = True
+
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
 
