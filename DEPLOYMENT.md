@@ -259,6 +259,50 @@ az containerapp replica list -n ca-worker-<env> -g <rg> -o table
 # Empty result == scaled to zero (expected when imagejobs is empty).
 ```
 
+### Worker observability (KQL)
+
+The worker emits structured log events at every state transition.
+Events appear in the `ContainerAppConsoleLogs_CL` table in the
+Log Analytics workspace. Useful KQL queries:
+
+```kql
+// Job throughput by terminal state, last 24h.
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-worker-<env>"
+| where Log_s has_any ("job.succeeded", "job.failed", "job.cancelled")
+| extend kind = case(
+    Log_s has "job.succeeded", "succeeded",
+    Log_s has "job.failed",    "failed",
+    Log_s has "job.cancelled", "cancelled",
+    "other")
+| summarize count() by kind, bin(TimeGenerated, 1h)
+| render columnchart
+```
+
+```kql
+// Jobs that reached the final attempt and went to poison.
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-worker-<env>"
+| where Log_s has "job.failed" and Log_s has "terminal=True"
+| project TimeGenerated, Log_s
+| order by TimeGenerated desc
+```
+
+```kql
+// Per-job lifecycle trace by job_id (substitute the id you care about).
+ContainerAppConsoleLogs_CL
+| where ContainerAppName_s == "ca-worker-<env>"
+| where Log_s has "<project_id>:<room_id>:<variation_id>:<revision>"
+| project TimeGenerated, Log_s
+| order by TimeGenerated asc
+```
+
+The structured event names emitted by `JobWorker` are: `job.started`,
+`job.succeeded`, `job.failed`, `job.cancelled`, `job.missing` (stale
+queue pointer to a deleted doc). `JobQueue` adds `job.enqueued`,
+`job.abandoned`, and `job.poisoned`. `ProgressEstimator` (issue 008)
+will add `job.progress`.
+
 ## Troubleshooting
 
 ### Common Issues
