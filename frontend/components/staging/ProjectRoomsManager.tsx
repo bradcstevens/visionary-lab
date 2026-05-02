@@ -54,12 +54,22 @@ import {
  *   - An unchanged trimmed label also disables Save so a
  *     `" Living Room "` edit when the persisted label is
  *     `"Living Room"` is a no-op rather than a wasted round-trip.
- *   - The `disabled` prop is forwarded to the rename input, the
- *     pencil/save/cancel buttons, AND the trash button. Issue 007
- *     will set this from `project.status === 'processing'`; this
- *     slice forwards whatever value the parent passes (the sheet
- *     currently passes its own `isSaving` flag for visual consistency
- *     with the rest of the sheet's controls).
+ *   - The `disabled` prop semantics (issue 007 of project-settings-
+ *     completeness): `disabled` means "disable destructive /
+ *     input-changing room operations" — concretely the trash (delete)
+ *     button, the inline delete-confirm row's "Yes, delete" button,
+ *     and the "Add photos" button. The rename affordance (pencil +
+ *     input + save + cancel) is INTENTIONALLY NEVER disabled by this
+ *     prop, because rename is a small housekeeping operation that the
+ *     PRD allows mid-generation. The parent (`ProjectSettingsSheet`)
+ *     wires `disabled={isGenerating || isSaving}` so that during an
+ *     in-flight generation OR a project-level save, add+delete are
+ *     blocked but renames can still proceed via their own server-
+ *     confirmed path. (Pre-issue-007 the prop disabled rename too;
+ *     issue 007 narrows the semantics. Existing in-component mutual
+ *     exclusion via `someRowIsActive` and the per-row pending guards
+ *     still gate concurrent edits — the prop only handles the
+ *     "external" disable cases.)
  *
  * Mutual exclusion (issue 005, rubber-duck non-blocking finding):
  * only ONE row at a time can be in any active mode (rename-edit,
@@ -394,8 +404,10 @@ export function ProjectRoomsManager({
           const disabledByOtherRow = someRowIsActive && !isThisRowActive;
 
           const trimmedDraft = draftLabel.trim();
+          // Issue 007: external `disabled` no longer participates in
+          // rename gating — rename is allowed mid-generation. The
+          // remaining gates (in-flight, empty, no-op) still apply.
           const saveDisabled =
-            disabled ||
             isSaving ||
             trimmedDraft.length === 0 ||
             trimmedDraft === room.label;
@@ -425,7 +437,7 @@ export function ProjectRoomsManager({
                       autoFocus
                       value={draftLabel}
                       onChange={(e) => setDraftLabel(e.target.value)}
-                      disabled={disabled || isSaving}
+                      disabled={isSaving}
                       data-testid={`project-rooms-manager-input-${room.id}`}
                       className="flex-1"
                     />
@@ -446,7 +458,7 @@ export function ProjectRoomsManager({
                       size="sm"
                       variant="ghost"
                       onClick={handleCancel}
-                      disabled={disabled || isSaving}
+                      disabled={isSaving}
                       data-testid={`project-rooms-manager-cancel-${room.id}`}
                       aria-label={`Cancel rename of ${room.label}`}
                     >
@@ -503,7 +515,7 @@ export function ProjectRoomsManager({
                       variant="ghost"
                       className="h-7 w-7"
                       onClick={() => handleEditClick(room.id, room.label)}
-                      disabled={disabled || disabledByOtherRow}
+                      disabled={disabledByOtherRow}
                       data-testid={`project-rooms-manager-edit-${room.id}`}
                       aria-label={`Rename ${room.label}`}
                     >

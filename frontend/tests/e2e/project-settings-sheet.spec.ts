@@ -2492,3 +2492,293 @@ test.describe('Issue 006 — Rooms manager add photos', () => {
     await expect(newRowLabel).toHaveText('Analyzed extra.png');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue 007 — disable rules during in-flight generation + Danger Zone
+// regression guard.
+//
+// Pre-issue-007 the sheet's rooms manager applied `disabled={isSaving}`
+// uniformly to every room operation, including rename. Issue 007 narrows
+// that semantic: when a project is generating (`status === 'processing'`)
+// or saving, destructive room ops (delete + add-photos) are blocked but
+// rename remains reachable. The project-level "Save settings" button is
+// also disabled during generation, while the prompt textarea + dropdowns
+// stay editable so the user can build a draft they keep.
+//
+// The page-level overflow menu disables "Project settings" when the
+// fleet-derived `isAnyInFlight` is true, but `isAnyInFlight` is purely
+// fleet-derived, NOT based on `project.status`. A "stale-processing"
+// project (server reports `status='processing'` with no live SSE/fleet
+// activity — see line 839 of `app/projects/[id]/page.tsx`) WILL allow
+// the user to reach this sheet via the menu. So the disable rules
+// enforced INSIDE the sheet are the authoritative line of defense.
+// These tests use a stale-processing mock to exercise that path.
+//
+// Danger Zone regression: the PRD does NOT say to disable Danger Zone
+// during generation, and we do NOT add that here. The test pins the
+// existing flow continues to work — opens, prompts for confirm, deletes.
+// ---------------------------------------------------------------------------
+
+const PROCESSING_PROJECT_ID = 'test-rooms-processing';
+
+interface MockProcessingProject extends MockRoomsProject {
+  id: string;
+}
+
+function makeProcessingProject(): MockProcessingProject {
+  // Reuse the rooms-manager project shape so we get the same two
+  // rooms (Living Room + Kitchen) and the same deterministic ids,
+  // but flip status to "processing" and rebrand the id so the route
+  // mocks don't collide with the rename-flow specs above.
+  const base = makeRoomsProject();
+  return {
+    ...base,
+    id: PROCESSING_PROJECT_ID,
+    status: 'processing',
+    rooms: base.rooms.map((r) => ({
+      ...r,
+      original_image_url: r.original_image_url.replace(
+        ROOMS_PROJECT_ID,
+        PROCESSING_PROJECT_ID,
+      ),
+      original_thumbnail_url: r.original_thumbnail_url
+        ? r.original_thumbnail_url.replace(ROOMS_PROJECT_ID, PROCESSING_PROJECT_ID)
+        : null,
+    })),
+  };
+}
+
+test.describe('Issue 007 — disable rules during generation', () => {
+  test('processing project: Save disabled, Add+Delete disabled, rename remains enabled and persists; name/prompt/dropdowns still editable', async ({
+    page,
+  }) => {
+    let projectState = makeProcessingProject();
+    const patchProjectRequests: Array<Record<string, unknown>> = [];
+    const patchRoomRequests: Array<{ roomId: string; body: Record<string, unknown> }> = [];
+
+    await setupSasTokenMock(page);
+
+    // Generation tripwire: zero hits expected — typing in dropdowns
+    // and renaming a room must NOT trigger /generate or /regenerate.
+    const generateHits: string[] = [];
+    await page.route(
+      new RegExp(
+        `${API_BASE}/staging/projects/${PROCESSING_PROJECT_ID}/(generate|rooms/[^/]+/(?:regenerate|variations))`,
+      ),
+      (route: Route) => {
+        generateHits.push(route.request().url());
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ ok: true }),
+        });
+      },
+    );
+
+    // Mock the project GET (returns processing) AND the project-level
+    // PATCH so we can assert it is NEVER fired (Save is disabled).
+    await page.route(
+      `${API_BASE}/staging/projects/${PROCESSING_PROJECT_ID}`,
+      (route: Route) => {
+        const method = route.request().method();
+        if (method === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        if (method === 'PATCH') {
+          // Should never fire in this test. Recording proves the
+          // failure mode if it does.
+          const body = JSON.parse(route.request().postData() || '{}');
+          patchProjectRequests.push(body);
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    // Mock room PATCH so the rename round-trip succeeds.
+    await page.route(
+      new RegExp(`${API_BASE}/staging/projects/${PROCESSING_PROJECT_ID}/rooms/[^/]+$`),
+      (route: Route) => {
+        if (route.request().method() === 'PATCH') {
+          const url = route.request().url();
+          const match = url.match(/\/rooms\/([^/?]+)/);
+          const roomId = match ? match[1] : '';
+          const body = JSON.parse(route.request().postData() || '{}');
+          patchRoomRequests.push({ roomId, body });
+          projectState = applyRoomPatch(projectState, roomId, body) as MockProcessingProject;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${PROCESSING_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Open Settings sheet via the overflow menu. Because the fleet
+    // is idle (no SSE activity), `isAnyInFlight` is false and the
+    // menu item is reachable even though `project.status` is
+    // 'processing'.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    const settingsItem = page.getByTestId('overflow-menu-project-settings');
+    await expect(settingsItem).toBeEnabled();
+    await settingsItem.click();
+    await expect(page.getByTestId('project-settings-sheet')).toBeVisible();
+
+    // The "generating" notice is visible.
+    await expect(
+      page.getByTestId('project-settings-generating-notice'),
+    ).toBeVisible();
+
+    // Save button is disabled regardless of dirtiness.
+    const saveBtn = page.getByTestId('project-settings-save');
+    await expect(saveBtn).toBeDisabled();
+
+    // Type a change in the prompt + change a dropdown — local edits
+    // are STILL allowed; only Save is gated.
+    const promptTextarea = page.getByTestId('project-settings-prompt-textarea');
+    await expect(promptTextarea).toBeEnabled();
+    await promptTextarea.fill('an updated prompt while generating');
+
+    const nameInput = page.getByTestId('project-settings-name-input');
+    await expect(nameInput).toBeEnabled();
+
+    const variationsInput = page.getByTestId('project-settings-variations-input');
+    await expect(variationsInput).toBeEnabled();
+    await variationsInput.fill('3');
+
+    // Even with dirty state, Save remains disabled because of the
+    // generation gate.
+    await expect(saveBtn).toBeDisabled();
+
+    // Add photos button is disabled.
+    const addPhotosBtn = page.getByTestId('project-rooms-manager-add-photos');
+    await expect(addPhotosBtn).toBeDisabled();
+
+    // Per-row trash buttons are disabled.
+    await expect(
+      page.getByTestId(`project-rooms-manager-delete-${ROOM_A_ID}`),
+    ).toBeDisabled();
+    await expect(
+      page.getByTestId(`project-rooms-manager-delete-${ROOM_B_ID}`),
+    ).toBeDisabled();
+
+    // Per-row pencil buttons remain ENABLED (rename is allowed
+    // mid-generation per issue 007).
+    await expect(
+      page.getByTestId(`project-rooms-manager-edit-${ROOM_A_ID}`),
+    ).toBeEnabled();
+    await expect(
+      page.getByTestId(`project-rooms-manager-edit-${ROOM_B_ID}`),
+    ).toBeEnabled();
+
+    // Click pencil on room A and rename successfully — proves the
+    // rename pipeline works during generation.
+    await page.getByTestId(`project-rooms-manager-edit-${ROOM_A_ID}`).click();
+    const renameInput = page.getByTestId(`project-rooms-manager-input-${ROOM_A_ID}`);
+    await expect(renameInput).toBeEnabled();
+    await renameInput.fill('Den');
+    const saveRenameBtn = page.getByTestId(`project-rooms-manager-save-${ROOM_A_ID}`);
+    await expect(saveRenameBtn).toBeEnabled();
+    await saveRenameBtn.click();
+
+    // PATCH room fired with {label: "Den"}.
+    await expect.poll(() => patchRoomRequests.length).toBe(1);
+    expect(patchRoomRequests[0].roomId).toBe(ROOM_A_ID);
+    expect(patchRoomRequests[0].body).toEqual({ label: 'Den' });
+
+    // Row label reflects the rename without reload.
+    await expect(
+      page.getByTestId(`project-rooms-manager-label-${ROOM_A_ID}`),
+    ).toHaveText('Den');
+
+    // Project-level Save NEVER fired during this whole flow.
+    expect(patchProjectRequests).toEqual([]);
+
+    // Project-level Save button is STILL disabled (generation gate
+    // outranks the dirty state).
+    await expect(saveBtn).toBeDisabled();
+
+    // No generation routes were hit.
+    expect(generateHits).toEqual([]);
+  });
+
+  test('Danger Zone regression: project-level Delete still opens, confirms, and deletes — even during generation', async ({
+    page,
+  }) => {
+    // The PRD does NOT say to disable Danger Zone during generation,
+    // and this test pins that the existing flow continues to work
+    // unchanged. We use the same processing-status mock as the prior
+    // test to prove `project.status === 'processing'` does NOT block
+    // Danger Zone.
+    const projectState = makeProcessingProject();
+    const deleteHits: string[] = [];
+    let redirected = false;
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${PROCESSING_PROJECT_ID}`,
+      (route: Route) => {
+        const method = route.request().method();
+        if (method === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        if (method === 'DELETE') {
+          deleteHits.push(route.request().url());
+          return route.fulfill({ status: 204, body: '' });
+        }
+        return route.continue();
+      },
+    );
+
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame() && frame.url().endsWith('/projects')) {
+        redirected = true;
+      }
+    });
+
+    await page.goto(`/projects/${PROCESSING_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Open the overflow menu and click Delete project.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    const deleteItem = page.getByText('Delete project', { exact: false });
+    await expect(deleteItem).toBeVisible();
+    await expect(deleteItem).toBeEnabled();
+    await deleteItem.click();
+
+    // Confirm dialog is visible with the destructive copy.
+    await expect(page.getByText(/Delete project\?/)).toBeVisible();
+    await expect(
+      page.getByText(/This will permanently delete/),
+    ).toBeVisible();
+
+    // Click the destructive Delete Project confirm button.
+    const confirmBtn = page.getByRole('button', { name: /Delete Project/ });
+    await confirmBtn.click();
+
+    // DELETE call fired.
+    await expect.poll(() => deleteHits.length).toBe(1);
+    expect(deleteHits[0]).toContain(`/staging/projects/${PROCESSING_PROJECT_ID}`);
+
+    // Page redirected to /projects (success path).
+    await expect.poll(() => redirected).toBe(true);
+  });
+});

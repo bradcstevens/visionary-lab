@@ -97,6 +97,30 @@ import { ProjectRoomsManager } from "./ProjectRoomsManager";
  *      helper carried `model` only because the form state included it;
  *      now neither does.
  *
+ * Issue 007 of the project-settings-completeness PRD: "disable rules
+ * during in-flight generation". When `project.status === 'processing'`,
+ * the sheet:
+ *
+ *   - Disables the Save button regardless of `isDirty` (the user can
+ *     still type and build a draft, but cannot persist mid-flight).
+ *   - Forwards `disabled={isGenerating || isSaving}` to
+ *     `ProjectRoomsManager`, which interprets that as "block add and
+ *     delete; rename remains enabled" (see the manager's source-file
+ *     comment on the narrowed `disabled` semantics).
+ *   - Leaves the name input, prompt textarea, and quality / size
+ *     dropdowns interactively editable, since local-only edits don't
+ *     race the pipeline.
+ *   - Renders an inline notice explaining why Save is disabled, so
+ *     the user can tell the difference between "no changes" and
+ *     "blocked by generation".
+ *
+ * The page-level overflow menu already gates "Project settings" on
+ * the fleet-derived `isAnyInFlight`, but `project.status` is the
+ * canonical signal per the issue 007 contract — and a stale-processing
+ * project (status='processing' with no live fleet activity) can still
+ * reach this sheet via that path. Enforcing the rule HERE makes the
+ * gating authoritative regardless of how the sheet is reached.
+ *
  * The snapshot reset on open was also moved out of `handleOpenChange`
  * (which only runs for Radix-internal close events — Esc, click
  * outside, X — and the explicit Cancel button) and into a rising-edge
@@ -272,6 +296,21 @@ export function ProjectSettingsSheet({
   const [size, setSize] = useState(initialValues.size);
   const [isSaving, setIsSaving] = useState(false);
 
+  // Issue 007 of project-settings-completeness: when the project is
+  // actively generating, destructive / project-mutating Save actions
+  // are blocked but local editing (typing in name/prompt textarea,
+  // changing dropdowns, renaming a room) is allowed. The user can
+  // build a draft they keep but cannot persist mid-generation. The
+  // overflow menu on the page already gates "Project settings" on
+  // the fleet-derived `isAnyInFlight`, but a stale-processing project
+  // (status='processing' with no live fleet activity) can still reach
+  // this sheet — and a programmatic consumer that bypasses the menu
+  // could too. So we enforce the rule authoritatively HERE on the
+  // Save button + the rooms manager's destructive affordances rather
+  // than relying solely on the menu gate. `project.status` is the
+  // canonical signal per the issue 007 contract.
+  const isGenerating = project.status === "processing";
+
   // Rising-edge snapshot reset — issue 003 of project-settings-
   // completeness. Pre-issue-003 the reset lived in handleOpenChange,
   // which only ran on Radix-internal close events (Esc, click
@@ -323,7 +362,7 @@ export function ProjectSettingsSheet({
   })();
 
   const handleSave = async () => {
-    if (!hasChanges || validationError || isSaving) return;
+    if (!hasChanges || validationError || isSaving || isGenerating) return;
     setIsSaving(true);
     try {
       await onSave(diff);
@@ -419,17 +458,20 @@ export function ProjectSettingsSheet({
               "Project details" (name, prompt) and "Generation
               settings" (variations, model, quality, size) per the
               PRD's "mount the new rooms manager between Project
-              details and Generation settings" placement rule. The
-              `disabled` prop is wired to `isSaving` so a project-
-              level save in flight visually disables room edits too;
-              issue 007 will replace that with the project-status
-              -driven value. The `onProjectUpdate` is forwarded from
-              the parent page and resyncs local project state after
-              a server-confirmed room mutation. */}
+              details and Generation settings" placement rule.
+
+              Issue 007: `disabled` covers add+delete only — rename
+              is intentionally always reachable inside the manager.
+              We OR `isGenerating` (status === 'processing') with the
+              local `isSaving` so destructive room ops are blocked
+              both during a project-level save AND during in-flight
+              generation. The `onProjectUpdate` is forwarded from the
+              parent page and resyncs local project state after a
+              server-confirmed room mutation. */}
           <ProjectRoomsManager
             project={project}
             onProjectUpdate={onProjectUpdate ?? (() => {})}
-            disabled={isSaving}
+            disabled={isGenerating || isSaving}
           />
 
           <div className="space-y-2">
@@ -523,6 +565,20 @@ export function ProjectSettingsSheet({
               {validationError}
             </p>
           )}
+
+          {/* Issue 007 of project-settings-completeness: surface why
+              the Save button is disabled while a generation is in
+              flight. Local edits are still allowed; the user keeps
+              their draft. */}
+          {isGenerating && (
+            <p
+              className="text-xs text-muted-foreground"
+              data-testid="project-settings-generating-notice"
+            >
+              Save is disabled while this project is generating. Your
+              edits are kept as a draft until generation completes.
+            </p>
+          )}
         </div>
 
         <SheetFooter>
@@ -536,7 +592,7 @@ export function ProjectSettingsSheet({
           </Button>
           <Button
             onClick={handleSave}
-            disabled={!hasChanges || !!validationError || isSaving}
+            disabled={!hasChanges || !!validationError || isSaving || isGenerating}
             data-testid="project-settings-save"
           >
             {isSaving ? (

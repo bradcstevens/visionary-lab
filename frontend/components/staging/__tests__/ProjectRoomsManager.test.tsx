@@ -302,26 +302,59 @@ describe("ProjectRoomsManager — error path", () => {
   });
 });
 
-describe("ProjectRoomsManager — disabled prop", () => {
-  it("when disabled=true, every per-row pencil button is disabled", () => {
+describe("ProjectRoomsManager — disabled prop (issue 007 narrowed semantics)", () => {
+  // Issue 007 of project-settings-completeness narrowed the
+  // `disabled` prop's semantics: it now means "disable add and
+  // delete only — rename always remains reachable". The two tests
+  // below pin both halves of that contract.
+
+  it("when disabled=true, the rename pencil + rename input REMAIN enabled (issue 007: rename is allowed mid-generation)", () => {
+    const project = makeProject();
+    render(
+      <ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={true} />,
+    );
+
+    // Pencil is reachable.
+    expect(
+      (screen.getByTestId("project-rooms-manager-edit-room-A") as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(
+      (screen.getByTestId("project-rooms-manager-edit-room-B") as HTMLButtonElement).disabled,
+    ).toBe(false);
+
+    // Clicking pencil opens the edit input — which itself stays enabled.
+    fireEvent.click(screen.getByTestId("project-rooms-manager-edit-room-A"));
+    expect(
+      (screen.getByTestId("project-rooms-manager-input-room-A") as HTMLInputElement).disabled,
+    ).toBe(false);
+    // Cancel button stays enabled too so the user can back out.
+    expect(
+      (screen.getByTestId("project-rooms-manager-cancel-room-A") as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("when disabled=true, the trash and Add photos buttons ARE disabled (issue 007: destructive ops blocked)", () => {
     const project = makeProject();
     render(
       <ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={true} />,
     );
 
     expect(
-      (screen.getByTestId("project-rooms-manager-edit-room-A") as HTMLButtonElement).disabled,
+      (screen.getByTestId("project-rooms-manager-delete-room-A") as HTMLButtonElement).disabled,
     ).toBe(true);
     expect(
-      (screen.getByTestId("project-rooms-manager-edit-room-B") as HTMLButtonElement).disabled,
+      (screen.getByTestId("project-rooms-manager-delete-room-B") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByTestId("project-rooms-manager-add-photos") as HTMLButtonElement).disabled,
     ).toBe(true);
   });
 
-  it("when disabled=true and the user is somehow in edit mode, Save and the input are disabled", () => {
-    // Defense-in-depth: the edit affordance is disabled when
-    // `disabled=true`, but if the prop flips mid-edit (e.g., a
-    // generation kicks off after the user enters edit mode), the
-    // input + save controls must respect the new disabled value.
+  it("when disabled=true and the user is in edit mode, the input + Save + Cancel respect their OWN gating (not the prop)", () => {
+    // Issue 007: `disabled` no longer participates in rename gating.
+    // The input + Cancel are NOT disabled by the prop. Save is still
+    // gated by its own rules (no-op trim, empty, in-flight) — those
+    // are independent of the external `disabled` prop.
     const project = makeProject();
     const { rerender } = render(
       <ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />,
@@ -331,20 +364,23 @@ describe("ProjectRoomsManager — disabled prop", () => {
       target: { value: "Den" },
     });
 
-    // Simulate the parent flipping disabled to true mid-edit.
+    // Flip disabled to true mid-edit.
     rerender(
       <ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={true} />,
     );
 
+    // Input + Cancel remain enabled.
     expect(
       (screen.getByTestId("project-rooms-manager-input-room-A") as HTMLInputElement).disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByTestId("project-rooms-manager-save-room-A") as HTMLButtonElement).disabled,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       (screen.getByTestId("project-rooms-manager-cancel-room-A") as HTMLButtonElement).disabled,
-    ).toBe(true);
+    ).toBe(false);
+    // Save is enabled because the draft is non-empty AND differs from
+    // the original — its own gates are satisfied.
+    expect(
+      (screen.getByTestId("project-rooms-manager-save-room-A") as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 });
 
