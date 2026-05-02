@@ -28,6 +28,7 @@ import { getHeaderAction } from "@/utils/staging-header";
 import { useActivityLog } from "@/context/activity-log-context";
 import { useRetryQueue } from "@/hooks/useRetryQueue";
 import { useGenerationFleet, type LostOp } from "@/hooks/useGenerationFleet";
+import { useProjectJobs } from "@/context/jobs-context";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -277,6 +278,22 @@ export default function ProjectDetailPage() {
     ),
   });
   const { isAnyInFlight, inFlightProject, inFlightRooms, inFlightVariations } = fleet;
+
+  // Issue 009: live job state for the per-image overlay bars and the
+  // per-project header aggregate bar. Disabled until projectId is known.
+  const projectJobs = useProjectJobs(projectId, { enabled: !!projectId });
+  // Map each variation to its most-recent (highest-revision) job so the
+  // overlay reflects the active attempt rather than a stale prior one.
+  const jobsByVariationId = (() => {
+    const map = new Map<string, import("@/context/jobs-context").ProjectJob>();
+    for (const j of projectJobs.jobs) {
+      const prev = map.get(j.variation_id);
+      if (!prev || (j.revision ?? 0) >= (prev.revision ?? 0)) {
+        map.set(j.variation_id, j);
+      }
+    }
+    return map;
+  })();
 
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
@@ -1063,6 +1080,12 @@ export default function ProjectDetailPage() {
       {/* Progress Tracker */}
       <ProgressTracker project={project} isGenerating={isAnyInFlight} />
 
+      {/* Issue 009: per-project aggregate progress bar fed by useProjectJobs.
+          Hidden when no active jobs (component returns null). Coexists with
+          the legacy summary tracker above — one drives off project.rooms
+          variation status, the other off live job docs from SSE. */}
+      <ProgressTracker kind="per-project" jobs={projectJobs.jobs} />
+
       {/* Issue 007 of projects-page-improvements PRD: project-level
           stream-lost banner. Renders when the watchdog fires on the
           project-level stream. The user can Retry (replays via
@@ -1241,6 +1264,7 @@ export default function ProjectDetailPage() {
                   isRoomBusy={isRoomBusy}
                   inFlightVariationIds={inFlightVariations}
                   queuedVariationIds={retryQueue.queuedIds}
+                  jobsByVariationId={jobsByVariationId}
                   roomIndex={index + 1}
                   totalRooms={project.rooms.length}
                 />

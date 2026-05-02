@@ -11,6 +11,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { StorageImage } from "./StorageImage";
+import { ProgressTracker } from "./ProgressTracker";
+import type { ProjectJob } from "@/context/jobs-context";
 import { cn } from "@/utils/cn";
 
 interface VariationThumbnailProps {
@@ -33,6 +35,10 @@ interface VariationThumbnailProps {
   onEditPrompt?: () => void;
   isRegenerating?: boolean;
   isQueued?: boolean;
+  // Issue 009: live job for this variation, sourced from useProjectJobs.
+  // When non-terminal, drives the per-image progress overlay (queued vs
+  // running). Pass undefined / null to skip overlay rendering.
+  job?: ProjectJob | null;
 }
 
 export function VariationThumbnail({ 
@@ -47,19 +53,21 @@ export function VariationThumbnail({
   onEditPrompt,
   isRegenerating,
   isQueued,
+  job,
 }: VariationThumbnailProps) {
   const renderContent = () => {
     switch (status) {
       case 'completed':
         if (isRegenerating) {
           return (
-            <div className="w-full h-full bg-muted rounded-lg flex items-center justify-center">
+            <div className="relative w-full h-full bg-muted rounded-lg flex items-center justify-center">
               <div className="flex flex-col items-center gap-2">
                 <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
                 <Badge variant="secondary" className="text-xs">
                   {index + 1}
                 </Badge>
               </div>
+              <ProgressTracker kind="per-image" job={job} />
             </div>
           );
         }
@@ -126,13 +134,14 @@ export function VariationThumbnail({
 
       case 'processing':
         return (
-          <div className="w-full h-full bg-muted rounded-lg flex items-center justify-center">
+          <div className="relative w-full h-full bg-muted rounded-lg flex items-center justify-center">
             <div className="flex flex-col items-center gap-2">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
               <Badge variant="secondary" className="text-xs">
                 {index + 1}
               </Badge>
             </div>
+            <ProgressTracker kind="per-image" job={job} />
           </div>
         );
 

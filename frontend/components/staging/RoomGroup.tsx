@@ -41,6 +41,14 @@ interface RoomGroupProps {
   inFlightVariationIds?: ReadonlySet<string>;
   queuedVariationIds?: ReadonlySet<string>;
   /**
+   * Issue 009 of image-pipeline-and-project-ux-overhaul PRD: per-variation
+   * live job map (variation_id → most-recent ProjectJob), sourced from
+   * useProjectJobs. Drives the per-image progress overlay rendered inside
+   * VariationThumbnail. Optional so callers that haven't been updated keep
+   * rendering without overlays.
+   */
+  jobsByVariationId?: ReadonlyMap<string, import("@/context/jobs-context").ProjectJob>;
+  /**
    * Issue 005 of projects-page-improvements PRD: positional context.
    * 1-based index of this room within `project.rooms`. Combined with
    * `totalRooms` to render a small "Image N of M" label next to the
@@ -52,7 +60,7 @@ interface RoomGroupProps {
   totalRooms?: number;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds, roomIndex, totalRooms }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds, jobsByVariationId, roomIndex, totalRooms }: RoomGroupProps) {
   // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
   // the projects-page-improvements PRD). The draft is reset to the persisted
   // value every time the popover opens so a Cancel followed by another open
@@ -316,6 +324,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
               }
               isRegenerating={regeneratingVariationId === variation.id}
               isQueued={queuedVariationIds?.has(variation.id) ?? false}
+              job={jobsByVariationId?.get(variation.id) ?? null}
             />
           );
         })}
