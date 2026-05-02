@@ -216,18 +216,51 @@ class JobStore:
     # ------------------------------------------------------------------
 
     def subscribe_change_feed(
-        self, start_time: Optional[str] = None
+        self,
+        start_time: Optional[str] = None,
+        *,
+        continuation: Optional[str] = None,
     ) -> Iterator[tuple[list[dict[str, Any]], Optional[str]]]:
         """Yield ``(items, continuation_token)`` batches from the change
         feed across all partitions.
 
+        Exactly one of the mutually-exclusive Cosmos resume kwargs
+        (``continuation``, ``start_time``, or ``is_start_from_beginning``)
+        is forwarded to the SDK, in that priority order. Passing more
+        than one raises ``ValueError`` from the SDK
+        (``is_start_from_beginning and start_time are exclusive``) which
+        is the bug this method's contract exists to prevent.
+
         SSEHub uses the continuation token to resume after replica
         restarts so no events are missed across the gap.
         """
-        kwargs: dict[str, Any] = {"is_start_from_beginning": start_time is None}
-        if start_time:
-            kwargs["start_time"] = start_time
+        kwargs: dict[str, Any]
+        if continuation:
+            kwargs = {"continuation": continuation}
+        elif start_time:
+            kwargs = {"start_time": start_time}
+        else:
+            kwargs = {"is_start_from_beginning": True}
         iterator = self.container.query_items_change_feed(**kwargs)
         for page in iterator.by_page():
             items = list(page)
-            yield items, getattr(iterator, "continuation_token", None)
+            yield items, _extract_continuation_token(iterator)
+
+
+def _extract_continuation_token(iterator: Any) -> Optional[str]:
+    """Pull the continuation token from a Cosmos change-feed iterator.
+
+    The Cosmos SDK exposes the resume token via ``response_headers["etag"]``
+    after a ``by_page()`` step; older code paths and some mocks expose it
+    as ``iterator.continuation_token``. Prefer the header, fall back to
+    the attribute, then ``None``.
+    """
+    headers = getattr(iterator, "response_headers", None)
+    if headers:
+        try:
+            etag = headers.get("etag")
+        except AttributeError:
+            etag = None
+        if etag:
+            return etag
+    return getattr(iterator, "continuation_token", None)

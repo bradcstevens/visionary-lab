@@ -24,6 +24,7 @@ backed coverage lives under ``tests/integration/``.
 """
 from __future__ import annotations
 
+from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -212,16 +213,114 @@ def test_list_jobs_by_project_uses_partition_scoped_query():
 # ---------------------------------------------------------------------------
 
 
-def test_subscribe_change_feed_yields_items_and_continuation():
-    store, container = _make_store_with_mock_container()
+def _make_change_feed_iterator(
+    items: list[dict],
+    *,
+    etag: Optional[str] = None,
+    continuation_token: Optional[str] = None,
+) -> MagicMock:
+    """Build a mock change-feed iterator with controlled token sources.
+
+    ``response_headers`` and ``continuation_token`` are set explicitly so
+    the extraction-precedence rule can be pinned without MagicMock's
+    auto-attr behaviour leaking truthy sentinels.
+    """
     page = MagicMock()
-    page.__iter__ = lambda self: iter([{"id": "j1"}, {"id": "j2"}])
+    page.__iter__ = lambda self: iter(list(items))
     iterator = MagicMock()
     iterator.by_page.return_value = iter([page])
-    iterator.continuation_token = "abc"
+    iterator.response_headers = {"etag": etag} if etag is not None else {}
+    iterator.continuation_token = continuation_token
+    return iterator
+
+
+def test_subscribe_change_feed_yields_items_and_continuation():
+    store, container = _make_store_with_mock_container()
+    iterator = _make_change_feed_iterator(
+        [{"id": "j1"}, {"id": "j2"}], etag="abc"
+    )
     container.query_items_change_feed.return_value = iterator
 
     batches = list(store.subscribe_change_feed())
 
     assert batches == [([{"id": "j1"}, {"id": "j2"}], "abc")]
     container.query_items_change_feed.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# JobStore — change feed: resume-kwarg priority (issue 001)
+# ---------------------------------------------------------------------------
+
+
+def test_subscribe_change_feed_continuation_takes_priority():
+    """When ``continuation`` is provided, ONLY it is forwarded — no
+    ``start_time`` and no ``is_start_from_beginning``. Fixes the
+    once-per-second ``ValueError: is_start_from_beginning and start_time
+    are exclusive`` crash."""
+    store, container = _make_store_with_mock_container()
+    iterator = _make_change_feed_iterator([], etag="t1")
+    container.query_items_change_feed.return_value = iterator
+
+    list(store.subscribe_change_feed(start_time="2026-01-01T00:00:00Z", continuation="abc"))
+
+    kwargs = container.query_items_change_feed.call_args.kwargs
+    assert kwargs == {"continuation": "abc"}
+    assert "start_time" not in kwargs
+    assert "is_start_from_beginning" not in kwargs
+
+
+def test_subscribe_change_feed_start_time_when_no_continuation():
+    """``start_time`` only — never together with ``is_start_from_beginning``."""
+    store, container = _make_store_with_mock_container()
+    iterator = _make_change_feed_iterator([], etag="t2")
+    container.query_items_change_feed.return_value = iterator
+
+    list(store.subscribe_change_feed(start_time="2026-01-01T00:00:00Z"))
+
+    kwargs = container.query_items_change_feed.call_args.kwargs
+    assert kwargs == {"start_time": "2026-01-01T00:00:00Z"}
+    assert "continuation" not in kwargs
+    assert "is_start_from_beginning" not in kwargs
+
+
+def test_subscribe_change_feed_cold_start_uses_is_start_from_beginning():
+    """No resume marker → ``is_start_from_beginning=True`` alone."""
+    store, container = _make_store_with_mock_container()
+    iterator = _make_change_feed_iterator([], etag="t3")
+    container.query_items_change_feed.return_value = iterator
+
+    list(store.subscribe_change_feed())
+
+    kwargs = container.query_items_change_feed.call_args.kwargs
+    assert kwargs == {"is_start_from_beginning": True}
+    assert "continuation" not in kwargs
+    assert "start_time" not in kwargs
+
+
+def test_subscribe_change_feed_continuation_extraction_precedence():
+    """``response_headers['etag']`` wins; falls back to
+    ``iterator.continuation_token`` when only that is set; ``None``
+    when neither is available."""
+    store, container = _make_store_with_mock_container()
+
+    # 1. etag header present → wins over continuation_token attribute
+    iterator = _make_change_feed_iterator(
+        [{"id": "j1"}], etag="from-header", continuation_token="from-attr"
+    )
+    container.query_items_change_feed.return_value = iterator
+    batches = list(store.subscribe_change_feed())
+    assert batches == [([{"id": "j1"}], "from-header")]
+
+    # 2. no etag header → falls back to continuation_token attribute
+    iterator = _make_change_feed_iterator(
+        [{"id": "j2"}], etag=None, continuation_token="from-attr"
+    )
+    container.query_items_change_feed.return_value = iterator
+    batches = list(store.subscribe_change_feed())
+    assert batches == [([{"id": "j2"}], "from-attr")]
+
+    # 3. neither → None
+    iterator = _make_change_feed_iterator([{"id": "j3"}], etag=None, continuation_token=None)
+    container.query_items_change_feed.return_value = iterator
+    batches = list(store.subscribe_change_feed())
+    assert batches == [([{"id": "j3"}], None)]
