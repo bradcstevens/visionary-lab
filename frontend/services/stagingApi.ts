@@ -202,6 +202,23 @@ export interface DesignBrief {
     quality: string;
     size: string;
   };
+  // Issue 015/019 of the image-pipeline-and-project-ux-overhaul PRD:
+  // the eight canonical sections from BriefSectionRegistry. Sparse map
+  // of section_id -> user-authored content. Empty / missing entries
+  // are rendered as absent sections by composeBriefMarkdown. Defaulting
+  // to an empty object on the wire keeps every existing brief
+  // backward-compatible — projects created before this feature shipped
+  // simply have no `sections` payload until the lazy backfill (issue
+  // 016) populates them on first read.
+  sections?: Record<string, string>;
+  // Power-user escape hatch (PRD § BriefSectionRegistry, user story
+  // 35): when set to a non-empty string, composeBriefMarkdown returns
+  // raw_override verbatim and ignores sections entirely. The settings
+  // panel surfaces a banner + a one-click revert when this is non-null.
+  // null (NOT empty string) is the canonical "off" value so an empty-
+  // string raw override cannot accidentally blank out the composed
+  // prompt.
+  raw_override?: string | null;
 }
 
 export interface ImageAnalysisResult {
@@ -1035,4 +1052,34 @@ export async function updateProject(
   }
   const data = await response.json();
   return data.project;
+}
+
+/**
+ * Issue 019 of the image-pipeline-and-project-ux-overhaul PRD: the
+ * settings panel's "Regenerate affected images" button calls this
+ * helper after the user has saved a section change. Empty body =
+ * regenerate every variation in every room of the project.
+ *
+ * Returns the list of newly-enqueued job ids. The deterministic
+ * idempotent-regen path on the backend (slice 004) means a re-click
+ * against an already-running queue reuses existing job ids rather
+ * than minting fresh ones.
+ */
+export async function regenerateProjectJobs(
+  projectId: string,
+  filter?: { room_ids?: string[]; variation_ids?: string[] },
+): Promise<{ job_ids: string[] }> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/jobs/regenerate`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(filter ?? {}),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Failed to enqueue regeneration: ${response.status} ${errorText}`,
+    );
+  }
+  return (await response.json()) as { job_ids: string[] };
 }

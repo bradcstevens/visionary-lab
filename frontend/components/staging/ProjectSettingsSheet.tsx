@@ -26,6 +26,7 @@ import type {
   UpdateProjectBody,
 } from "@/services/stagingApi";
 import { ProjectRoomsManager } from "./ProjectRoomsManager";
+import { BriefSectionsEditor } from "./BriefSectionsEditor";
 
 /**
  * Project Settings side sheet — issue 002 of the projects-page-
@@ -184,6 +185,16 @@ export interface ProjectSettingsSheetProps {
   // succeed on the server and be invisible in the local UI until the
   // next reload.
   onProjectUpdate?: (project: StagingProject) => void | Promise<void>;
+  /**
+   * Issue 019 of the image-pipeline-and-project-ux-overhaul PRD: when
+   * the user clicks "Regenerate affected images" inside the brief
+   * sections editor, the parent calls `regenerateProjectJobs` and
+   * resolves once the queue has accepted the request. Optional so
+   * existing callers keep working without wiring on day one — when
+   * absent, the Regenerate button is rendered but its click is a
+   * no-op that just dismisses the affordance.
+   */
+  onRegenerate?: () => Promise<unknown>;
 }
 
 /**
@@ -272,6 +283,7 @@ export function ProjectSettingsSheet({
   project,
   onSave,
   onProjectUpdate,
+  onRegenerate,
 }: ProjectSettingsSheetProps) {
   // Snapshot the project values when the sheet opens. The "initial"
   // values stay frozen for the duration of the sheet's open lifecycle
@@ -472,6 +484,25 @@ export function ProjectSettingsSheet({
             project={project}
             onProjectUpdate={onProjectUpdate ?? (() => {})}
             disabled={isGenerating || isSaving}
+          />
+
+          {/*
+            Issue 019 of the image-pipeline-and-project-ux-overhaul
+            PRD: registry-driven sections editor + read-only preview
+            + raw_override toggle + post-save Regenerate button. The
+            sub-component owns its own draft state and Save/Regenerate
+            buttons; section saves here go through the same
+            `onSave` PATCH path (passing only `design_brief` in the
+            update body). No regeneration jobs are ever created on
+            save — Regenerate is a separate explicit affordance the
+            sub-component surfaces only after a save touched a
+            section.
+          */}
+          <BriefSectionsEditor
+            project={project}
+            onSave={onSave}
+            onRegenerate={onRegenerate ?? (async () => undefined)}
+            disabled={isGenerating}
           />
 
           <div className="space-y-2">

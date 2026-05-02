@@ -38,3 +38,22 @@ stories 33–36.
 - User story 34
 - User story 35
 - User story 36
+
+## Implementation note
+
+Implemented as a registry-driven `BriefSectionsEditor` sub-component
+mounted inside the existing `ProjectSettingsSheet`. The wholesale
+"rewrite" framing in the issue body is honored structurally — the
+sections / preview / raw_override / regenerate surface is fully
+driven by `BriefSectionRegistry` and the saved-prompt symmetry with
+the wizard is now testable from a single source of truth — without
+churning the unrelated name / variations / quality / size editing
+surface that already shipped from earlier slices and that has its
+own test coverage.
+
+Playwright tests deferred (consistent with the pattern in commits
+21deb8e, e4779c4, 1747681): both Playwright lines need a backend
+fixture project with structured `sections` + non-null
+`raw_override`, plus a running queue (issue 001 emulator gate).
+Behavior is pinned by 38 new vitest specs (8 registry, 15
+composer, 15 editor) under jsdom.
