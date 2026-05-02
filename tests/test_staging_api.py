@@ -253,6 +253,11 @@ def _migrated_brief_payload():
         "placement_guide": {"back_row": "Tall conifers"},
         "preserve_elements": ["patio"],
         "per_image_objects": {},
+        # Issue 016: a fully-modern brief carries the canonical sections
+        # dict so the lazy backfill short-circuits. Without this, the
+        # backfill would re-derive sections on every read and trigger a
+        # spurious writeback.
+        "sections": {"edit_task": "Add evergreens"},
     }
 
 

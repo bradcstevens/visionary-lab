@@ -11,6 +11,7 @@ from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from backend.core.azure_storage import AzureBlobStorageService
+from backend.core.brief_generator import backfill_legacy_brief_sections
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
 from backend.core.job_queue import JobQueue
@@ -22,6 +23,8 @@ from backend.core.prompt_summarizer import PromptSummarizer, truncate_to_summary
 from backend.core.staging_pipeline import _get_project_lock
 from backend.core.staging_reconcile import reconcile_project
 from backend.core.staging_storage import StagingStorageService
+from backend.core.thumbnail_backfill import backfill_project_thumbnails
+from backend.core.thumbnail_deriver import ThumbnailDeriver
 from backend.models.design_brief import (
     ChatRequest,
     ChatResponse,
@@ -82,6 +85,16 @@ def get_job_store() -> JobStore:
     """FastAPI dependency: ``JobStore`` for the async-queue endpoints
     (issue 004 of the image-pipeline PRD). Patched in tests."""
     return JobStore()
+
+
+def get_thumbnail_backfill_deps():
+    """FastAPI dependency: ``(thumbnail_deriver, blob_service)`` for the
+    lazy thumbnail backfill (issue 012). Patched in tests via
+    ``app.dependency_overrides`` so the read path can be exercised
+    without real blob I/O.
+    """
+    blob_service = AzureBlobStorageService()
+    return (ThumbnailDeriver(blob_service), blob_service)
 
 
 def get_prompt_summarizer() -> PromptSummarizer:
@@ -170,13 +183,14 @@ async def list_projects(
     total = storage.count_projects()
     projects = []
     for p in projects_raw:
-        # Combine reconcile + legacy-brief-migration into a single optional
-        # writeback. Either pass alone may mutate; if both pass mutate we
-        # only persist once. ``or`` short-circuits, but we want both calls
-        # to run, so we OR the results explicitly.
+        # Combine reconcile + legacy-brief-migration + section backfill
+        # into a single optional writeback. Each pass alone may mutate;
+        # if multiple mutate we only persist once. ``or`` short-circuits,
+        # but we want every call to run, so we OR the results explicitly.
         reconciled = reconcile_project(p)
         migrated = _migrate_design_brief_in_place(p)
-        if reconciled or migrated:
+        sections_backfilled = backfill_legacy_brief_sections(p)
+        if reconciled or migrated or sections_backfilled:
             try:
                 storage.update_project(p["id"], p)
             except Exception as e:
@@ -190,16 +204,37 @@ async def list_projects(
 async def get_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
+    backfill_deps: tuple = Depends(get_thumbnail_backfill_deps),
 ):
     project = storage.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Auto-heal stale processing states + opportunistically migrate legacy
-    # plant_palette → object_palette on read (single combined writeback).
+    # plant_palette → object_palette + lazy-backfill canonical brief
+    # sections (issue 016) on read (single combined writeback).
     reconciled = reconcile_project(project)
     migrated = _migrate_design_brief_in_place(project)
-    if reconciled or migrated:
+    sections_backfilled = backfill_legacy_brief_sections(project)
+    # Issue 012: lazy thumbnail backfill. Variations created before issue
+    # 010 wired the deriver into the pipeline have ``image_url`` but no
+    # ``thumb_url`` / ``md_url``. Derive them on first read so the grid
+    # renders proper thumbnails; subsequent reads short-circuit because
+    # the fields are now populated. Best-effort — per-variation failures
+    # log at WARNING and the read still returns the project.
+    deriver, blob_service = backfill_deps
+    try:
+        backfilled = await backfill_project_thumbnails(
+            project,
+            thumbnail_deriver=deriver,
+            blob_service=blob_service,
+            container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+        )
+    except Exception as e:
+        logger.warning("Thumbnail backfill raised for project %s: %s", project_id, e)
+        backfilled = False
+
+    if reconciled or migrated or backfilled or sections_backfilled:
         try:
             storage.update_project(project_id, project)
         except Exception as e:

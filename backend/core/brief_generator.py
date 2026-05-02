@@ -11,7 +11,9 @@ from backend.core.brief_resolver import (
     reconcile_overrides_by_name,
     resolve_objects_for_image,
 )
+from backend.core.brief_section_registry import section_ids
 from backend.core.config import settings
+from backend.core.prompt_composer import PromptComposer
 from backend.core.prompt_diversity import build_diversifying_prompt
 from backend.core.retry import call_with_retry
 from backend.models.design_brief import (
@@ -25,6 +27,172 @@ from backend.models.design_brief import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Canonical section ids cached at import time so the lazy-backfill guard
+# doesn't pay the registry tuple-build cost on every project read.
+_CANONICAL_SECTION_IDS = frozenset(section_ids())
+
+
+def derive_sections_from_legacy_brief(brief: Dict[str, Any]) -> Dict[str, str]:
+    """Pure helper: derive the eight canonical sections from a legacy brief.
+
+    Strategy (deterministic — same input dict produces byte-identical
+    output):
+
+    1. Try ``PromptComposer.extract_sections`` on ``global_instructions``
+       so any embedded ``## Heading`` blocks are honored verbatim.
+    2. For each canonical section without an extracted body, derive
+       from the structured legacy fields:
+         * ``edit_task`` → full ``global_instructions`` text.
+         * ``do_not_alter`` → bullet-list of ``preserve_elements``.
+         * ``object_palette`` → bullet-list of ``object_palette``
+           entries (``{qty}x {name} ({description})``).
+         * ``arrangement`` → labeled rows from ``placement_guide``.
+       Sections with no derivable source (``edit_zone``,
+       ``regional_constraints``, ``aesthetic_goal``,
+       ``scale_fidelity``) are populated ONLY when the user embedded
+       a matching ``## Heading``. They are omitted otherwise — the
+       composer drops absent sections cleanly, so callers don't get
+       empty headings.
+
+    Returns a sparse ``{section_id: content}`` dict whose keys are a
+    subset of the registry's canonical ids.
+
+    Pure: no I/O, no mutation of the input, no logging.
+
+    Per issue 016 of the image-pipeline-and-project-ux-overhaul PRD.
+    """
+    if not isinstance(brief, dict):
+        return {}
+
+    global_instructions = brief.get("global_instructions") or ""
+    if not isinstance(global_instructions, str):
+        global_instructions = ""
+
+    extracted = (
+        PromptComposer.extract_sections(global_instructions)
+        if global_instructions
+        else {}
+    )
+
+    sections: Dict[str, str] = {}
+
+    # edit_task: extracted ## Edit Task wins; otherwise fall back to the
+    # full free-form text so legacy briefs with no headings still seed
+    # at least one section the composer can render.
+    if extracted.get("edit_task"):
+        sections["edit_task"] = extracted["edit_task"]
+    elif global_instructions.strip():
+        sections["edit_task"] = global_instructions.strip()
+
+    # do_not_alter: prefer extracted ## Do Not Alter; else the legacy
+    # ``preserve_elements`` list rendered as markdown bullets so the
+    # round-trip back through ``compose_brief_markdown`` is stable.
+    if extracted.get("do_not_alter"):
+        sections["do_not_alter"] = extracted["do_not_alter"]
+    else:
+        preserve = brief.get("preserve_elements")
+        if isinstance(preserve, list):
+            bullets = [
+                f"- {p.strip()}"
+                for p in preserve
+                if isinstance(p, str) and p.strip()
+            ]
+            if bullets:
+                sections["do_not_alter"] = "\n".join(bullets)
+
+    # object_palette: prefer extracted; else flatten the legacy palette.
+    if extracted.get("object_palette"):
+        sections["object_palette"] = extracted["object_palette"]
+    else:
+        palette = brief.get("object_palette")
+        if isinstance(palette, list):
+            lines: List[str] = []
+            for entry in palette:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                qty = entry.get("default_quantity", 1)
+                desc = entry.get("description")
+                line = f"- {qty}x {name.strip()}"
+                if isinstance(desc, str) and desc.strip():
+                    line += f" ({desc.strip()})"
+                lines.append(line)
+            if lines:
+                sections["object_palette"] = "\n".join(lines)
+
+    # arrangement: prefer extracted; else label the placement_guide rows.
+    if extracted.get("arrangement"):
+        sections["arrangement"] = extracted["arrangement"]
+    else:
+        pg = brief.get("placement_guide")
+        if isinstance(pg, dict):
+            row_labels = (
+                ("back_row", "Back row"),
+                ("middle_row", "Middle row"),
+                ("front_row", "Front row"),
+                ("accent_areas", "Accent areas"),
+            )
+            parts = [
+                f"{label}: {pg[key].strip()}"
+                for key, label in row_labels
+                if isinstance(pg.get(key), str) and pg[key].strip()
+            ]
+            if parts:
+                sections["arrangement"] = "\n".join(parts)
+
+    # Sections with no structured legacy source: populated only when the
+    # user embedded a matching ## heading.
+    for key in ("edit_zone", "regional_constraints", "aesthetic_goal", "scale_fidelity"):
+        if extracted.get(key):
+            sections[key] = extracted[key]
+
+    return sections
+
+
+def backfill_legacy_brief_sections(project: Any) -> bool:
+    """Lazy backfill: populate ``project['design_brief']['sections']``.
+
+    Mutates ``project['design_brief']`` in-place. Returns ``True`` if
+    the brief was mutated (caller should ``storage.update_project`` to
+    persist), ``False`` otherwise.
+
+    Idempotent — short-circuits when ``sections`` already contains any
+    canonical section id. Non-canonical keys in an existing
+    ``sections`` dict do NOT block the backfill (the legacy entry is
+    preserved alongside the newly-derived canonical ones).
+
+    Best-effort: returns ``False`` cleanly for non-dict project / brief
+    / empty briefs / briefs with no derivable content. The caller's
+    read path stays functional in every malformed-input case.
+
+    Per issue 016 of the image-pipeline-and-project-ux-overhaul PRD.
+    No batch migration job — backfill happens on the read path.
+    """
+    if not isinstance(project, dict):
+        return False
+    brief = project.get("design_brief")
+    if not isinstance(brief, dict):
+        return False
+
+    existing = brief.get("sections")
+    if isinstance(existing, dict) and any(
+        k in _CANONICAL_SECTION_IDS for k in existing
+    ):
+        return False
+
+    derived = derive_sections_from_legacy_brief(brief)
+    if not derived:
+        return False
+
+    if isinstance(existing, dict):
+        merged = {**existing, **derived}
+    else:
+        merged = derived
+    brief["sections"] = merged
+    return True
 
 BRIEF_GENERATION_PROMPT = """You are a design assistant. Synthesize the conversation below into a structured Design Brief.
 
