@@ -134,25 +134,53 @@ class SSEHub:
         finally:
             self._task = None
 
-    async def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                items = await asyncio.to_thread(self._collect_once)
-                for item in items:
-                    self._dispatch(item)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("sse_hub.poll_failed: %s", exc)
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=self._poll_interval
-                )
-            except asyncio.TimeoutError:
-                pass
+    async def _sleep_or_stop(self, delay: float) -> None:
+        """Sleep for ``delay`` seconds or wake early if ``stop`` is set.
 
-    def _collect_once(self) -> list[dict]:
+        Extracted as an instance method so tests can monkeypatch a
+        recording variant to observe backoff durations without burning
+        real wall-clock time.
+        """
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _run(self) -> None:
+        consecutive_failures = 0
+        while not self._stop.is_set():
+            items, err = await asyncio.to_thread(self._collect_once)
+            # Dispatch BEFORE sleeping or logging — items collected
+            # before a mid-iteration error must still reach subscribers.
+            for item in items:
+                self._dispatch(item)
+            if err is None:
+                consecutive_failures = 0
+                delay = self._poll_interval
+            else:
+                consecutive_failures += 1
+                # ``exc_info=err`` produces the same full stack trace
+                # as ``logger.exception`` while letting us log the
+                # exception captured inside ``_collect_once`` (which
+                # already exited its except block).
+                logger.error(
+                    "sse_hub.poll_failed: %s", err, exc_info=err
+                )
+                delay = min(
+                    self._poll_interval * (2 ** (consecutive_failures - 1)),
+                    30.0,
+                )
+            await self._sleep_or_stop(delay)
+
+    def _collect_once(self) -> tuple[list[dict], Optional[Exception]]:
         """Run one poll: snapshot the resume state, drain the iterator
         returned by the feed source, and update resume state per the
         priority rules below.
+
+        Returns ``(items, err)``. ``items`` are the events drained
+        before any failure (so partial pages still get dispatched);
+        ``err`` is the captured exception or ``None``. This method
+        never raises — backoff/logging is the caller's job.
 
         State-update rules (applied once per poll):
 
@@ -168,15 +196,17 @@ class SSEHub:
           previously-stored resume marker is preserved so we don't
           silently advance past unseen events.
 
-        A failure inside the feed source is contained here so the
-        next poll cycle still runs. (Issue 003 will make the failure
-        path return ``(items, err)`` instead of swallowing.)
+        A mid-iteration error degrades naturally to one of the latter
+        two branches (depending on whether items / a token were
+        drained before the raise), so a failed poll still cannot
+        silently advance past unseen events.
         """
         poll_start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         state = {"continuation": self._continuation, "since": self._since}
         out: list[dict] = []
         latest_token: Optional[str] = None
         token_seen = False
+        err: Optional[Exception] = None
         try:
             for items, token in self._feed_source(state):
                 out.extend(items)
@@ -184,7 +214,7 @@ class SSEHub:
                     latest_token = token
                     token_seen = True
         except Exception as exc:  # noqa: BLE001
-            logger.exception("sse_hub.feed_iter_failed: %s", exc)
+            err = exc
 
         if token_seen:
             self._continuation = latest_token
@@ -193,7 +223,7 @@ class SSEHub:
             self._continuation = None
             self._since = poll_start_iso
         # else: state untouched
-        return out
+        return out, err
 
     def _dispatch(self, item: dict[str, Any]) -> None:
         pid = item.get("project_id")

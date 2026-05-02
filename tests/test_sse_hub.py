@@ -411,6 +411,144 @@ async def test_state_untouched_when_no_items_and_no_token():
 
 
 # ---------------------------------------------------------------------------
+# Backoff and partial dispatch — issue 003 PRD
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backoff_escalation_and_reset_on_recovery():
+    """The pump's sleep duration follows a geometric backoff capped at
+    30 s while the feed source keeps failing, and resets to
+    ``poll_interval`` on the first successful poll.
+
+    Schedule for poll_interval=1.0 with 3 leading failures:
+      fail #1 → sleep 1.0
+      fail #2 → sleep 2.0
+      fail #3 → sleep 4.0
+      success → sleep 1.0
+    """
+    cycles = {"n": 0}
+
+    def failing_then_ok(_state):
+        cycles["n"] += 1
+        if cycles["n"] <= 3:
+            raise RuntimeError(f"transient #{cycles['n']}")
+        yield [{"id": "j", "project_id": "proj-A", "status": "running"}], None
+
+    hub = SSEHub(feed_source=failing_then_ok, poll_interval=1.0)
+
+    sleeps: list[float] = []
+    done = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        # After we've seen the 4 sleeps we care about, signal completion
+        # and stop the pump from the inside so the test doesn't hang.
+        if len(sleeps) >= 4:
+            done.set()
+            hub._stop.set()
+        # Yield control without actually sleeping.
+        await asyncio.sleep(0)
+
+    hub._sleep_or_stop = fake_sleep  # type: ignore[assignment]
+
+    sub = await hub.subscribe("proj-A")
+    await hub.start()
+    try:
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+    finally:
+        await hub.stop()
+        await sub.aclose()
+
+    # First three failures escalate geometrically; the fourth poll
+    # succeeded so cadence resets.
+    assert sleeps[:4] == [1.0, 2.0, 4.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_backoff_caps_at_thirty_seconds():
+    """After enough consecutive failures the schedule saturates at the
+    30 s ceiling regardless of how many further failures stack up."""
+    def always_fail(_state):
+        if False:  # pragma: no cover — generator marker
+            yield [], None
+        raise RuntimeError("permanent")
+
+    hub = SSEHub(feed_source=always_fail, poll_interval=1.0)
+    sleeps: list[float] = []
+    done = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        # 1, 2, 4, 8, 16, 32→30, 64→30, 128→30 — collect 8 to confirm cap.
+        if len(sleeps) >= 8:
+            done.set()
+            hub._stop.set()
+        await asyncio.sleep(0)
+
+    hub._sleep_or_stop = fake_sleep  # type: ignore[assignment]
+
+    await hub.start()
+    try:
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+    finally:
+        await hub.stop()
+
+    assert sleeps[:8] == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_partial_dispatch_on_mid_iteration_error():
+    """A feed source that yields one batch and then raises must still
+    deliver that batch to subscribers — dispatch happens BEFORE the
+    backoff sleep on the failing poll."""
+    fired = {"once": False}
+
+    def partial_then_raise(_state):
+        if not fired["once"]:
+            fired["once"] = True
+            yield [{"id": "j-partial", "project_id": "proj-A", "status": "pending"}], None
+            raise RuntimeError("mid-iteration boom")
+        yield [], None
+
+    hub = SSEHub(feed_source=partial_then_raise, poll_interval=0.01)
+    sub = await hub.subscribe("proj-A")
+    await hub.start()
+    try:
+        out = await _drain(sub, count=1, timeout=2.0)
+    finally:
+        await hub.stop()
+        await sub.aclose()
+
+    assert out[0]["id"] == "j-partial"
+
+
+@pytest.mark.asyncio
+async def test_collect_once_returns_items_and_err_never_raises():
+    """Direct-call contract: ``_collect_once`` returns ``(items, err)``
+    and never raises, even when the feed source raises mid-iteration."""
+
+    def partial_then_raise(_state):
+        yield [{"id": "a", "project_id": "p"}, {"id": "b", "project_id": "p"}], None
+        raise ValueError("kaboom")
+
+    hub = SSEHub(feed_source=partial_then_raise, poll_interval=1.0)
+    items, err = hub._collect_once()
+    assert [i["id"] for i in items] == ["a", "b"]
+    assert isinstance(err, ValueError)
+    assert str(err) == "kaboom"
+
+
+@pytest.mark.asyncio
+async def test_collect_once_returns_none_err_on_clean_poll():
+    feed = FakeFeed([[{"id": "x", "project_id": "p"}]])
+    hub = SSEHub(feed_source=feed, poll_interval=1.0)
+    items, err = hub._collect_once()
+    assert [i["id"] for i in items] == ["x"]
+    assert err is None
+
+
+# ---------------------------------------------------------------------------
 # Items missing project_id are silently dropped (defensive)
 # ---------------------------------------------------------------------------
 
