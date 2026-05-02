@@ -365,6 +365,199 @@ async def update_room(
     return ProjectResponse(project=StagingProject(**clean))
 
 
+def _extract_blob_name_for_cleanup(blob_url: str) -> Optional[str]:
+    """Extract the blob name (everything after the container segment)
+    from a full Azure Blob Storage URL. Returns ``None`` if the URL
+    doesn't parse cleanly so the caller can skip a malformed entry
+    rather than crashing the whole cleanup pass.
+
+    Mirrors ``StagingPipeline._extract_blob_name`` (kept local to
+    avoid pulling in the pipeline module for an endpoint helper).
+    """
+    if not blob_url or not isinstance(blob_url, str):
+        return None
+    try:
+        parts = blob_url.split("/")
+        net_idx = next(i for i, p in enumerate(parts) if p.endswith(".net"))
+        return "/".join(parts[net_idx + 2:])  # skip container segment
+    except (StopIteration, IndexError):
+        for container in ("images", "videos"):
+            if f"/{container}/" in blob_url:
+                return blob_url.split(f"/{container}/")[1]
+        return None
+
+
+def _prune_room_metadata_in_place(project_data: dict, room_id: str) -> None:
+    """Remove all room-keyed metadata for ``room_id`` from a project
+    document, in-place.
+
+    Issue 005 of the project-settings-completeness PRD (rubber-duck
+    blocker): without pruning, deleting a room from ``project.rooms``
+    leaves stale references in:
+
+      - ``project.analyses[*]`` where ``room_id == room_id`` (used by
+        the brief generator and regenerate flows).
+      - ``project.design_brief.per_image_notes[room_id]`` (used by the
+        brief composer when rebuilding prompts).
+      - ``project.design_brief.per_image_objects[room_id]`` (used by
+        the per-image objects UI and the brief).
+
+    Those stale references would then leak into future brief / regen /
+    composer operations and silently re-introduce the deleted room's
+    state. Defensive: handles None / missing entries cleanly so legacy
+    or unmigrated projects don't crash.
+    """
+    analyses = project_data.get("analyses")
+    if isinstance(analyses, list):
+        project_data["analyses"] = [
+            entry for entry in analyses
+            if entry.get("room_id") != room_id
+        ]
+
+    brief = project_data.get("design_brief")
+    if isinstance(brief, dict):
+        notes = brief.get("per_image_notes")
+        if isinstance(notes, dict) and room_id in notes:
+            del notes[room_id]
+        objects = brief.get("per_image_objects")
+        if isinstance(objects, dict) and room_id in objects:
+            del objects[room_id]
+
+
+def _cleanup_room_blobs(project_id: str, room: dict) -> None:
+    """Best-effort blob cleanup for a deleted room. Runs OUTSIDE the
+    project lock (issue 005 rubber-duck non-blocking finding) so blob
+    I/O latency cannot block other room edits / regens on the project.
+
+    Cleans up:
+      - The room's ``original_image_url`` blob.
+      - The room's ``original_thumbnail_url`` blob (when present).
+      - All blobs under the ``staging/{project_id}/variations/{room_id}/``
+        prefix — covers all variations even if some have null
+        ``image_url`` (incomplete generation, edit-prompt artifacts,
+        regen artifacts).
+
+    Failures are LOGGED but do NOT bubble — the metadata delete already
+    succeeded by the time this runs. Mirrors ``delete_project``'s
+    try/except pattern.
+    """
+    try:
+        blob_service = AzureBlobStorageService()
+        container_client = blob_service.blob_service_client.get_container_client(
+            settings.AZURE_BLOB_IMAGE_CONTAINER
+        )
+
+        # Per-blob deletes for the originals (these live under
+        # ``staging/{project_id}/originals/`` which is shared across
+        # rooms — a prefix sweep would risk other rooms' originals).
+        for url_field in ("original_image_url", "original_thumbnail_url"):
+            blob_name = _extract_blob_name_for_cleanup(room.get(url_field))
+            if blob_name:
+                try:
+                    container_client.delete_blob(blob_name)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete blob {blob_name} for room {room.get('id')}: {e}"
+                    )
+
+        # Prefix sweep for variations (this prefix is room-scoped so
+        # it's safe to bulk-delete everything under it).
+        room_id = room.get("id")
+        if room_id:
+            variations_prefix = f"staging/{project_id}/variations/{room_id}/"
+            for blob in container_client.list_blobs(name_starts_with=variations_prefix):
+                try:
+                    container_client.delete_blob(blob.name)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete variation blob {blob.name}: {e}"
+                    )
+    except Exception as e:
+        logger.warning(
+            f"Blob cleanup failed for room {room.get('id')} of project {project_id}: {e}"
+        )
+
+
+@router.delete("/projects/{project_id}/rooms/{room_id}", response_model=ProjectResponse)
+async def remove_room(
+    project_id: str,
+    room_id: str,
+    storage: StagingStorageService = Depends(get_staging_storage),
+):
+    """Cascading delete of a room and its associated metadata.
+
+    Issue 005 of the project-settings-completeness PRD. Backs the
+    "Delete with confirm" affordance in ``ProjectRoomsManager`` on
+    the Project Settings sheet. The PRD/issue described this endpoint
+    as already existing on the worktree branch but it did not exist
+    on ``main`` — same adaptation pattern as 001/002/003/004.
+
+    Contract (asserted by ``tests/test_staging_endpoints_delete_room.py``):
+
+    - REJECTS with 409 Conflict when ``project.status == "processing"``.
+      Rubber-duck blocker: the project lock alone does not protect
+      against an in-flight pipeline worker that started BEFORE the
+      delete carrying a stale ``rooms`` snapshot in memory and
+      reintroducing the deleted room when it eventually writes its
+      accumulated state back. The frontend's issue 007 will also
+      disable the affordance during processing; this guard is the
+      authoritative protection against a programmatic / racing
+      client that bypasses the UI.
+
+    - INSIDE the project lock: validates project + room exist (404
+      otherwise), prunes ``project.rooms`` of the target room AND
+      prunes room-keyed metadata in ``analyses`` and
+      ``design_brief.per_image_notes`` / ``design_brief.per_image_objects``
+      via ``_prune_room_metadata_in_place``, then persists the result.
+
+    - OUTSIDE the lock: best-effort blob cleanup via
+      ``_cleanup_room_blobs``. Blob I/O latency does not block other
+      room edits / regens on the project (rubber-duck non-blocking
+      finding). Cleanup failures are logged but the response is still
+      200 — the metadata delete already succeeded.
+
+    The lock semantic mirrors ``update_room`` and ``update_project``.
+    """
+    async with _get_project_lock(project_id):
+        project_data = storage.get_project(project_id)
+        if not project_data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Reject delete during processing (rubber-duck blocker).
+        if project_data.get("status") == "processing":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot delete a room while the project is processing. "
+                    "Wait for generation to complete, then try again."
+                ),
+            )
+
+        rooms = project_data.get("rooms", [])
+        room = next((r for r in rooms if r.get("id") == room_id), None)
+        if not room:
+            raise HTTPException(status_code=404, detail="Room not found")
+
+        # Hold a reference for the post-lock blob cleanup pass.
+        deleted_room = room
+
+        # Mutate metadata IN-PLACE: remove the room from rooms and
+        # prune all room-keyed entries from analyses + design brief.
+        project_data["rooms"] = [r for r in rooms if r.get("id") != room_id]
+        _prune_room_metadata_in_place(project_data, room_id)
+
+        storage.update_project(project_id, project_data)
+
+    # Best-effort blob cleanup runs OUTSIDE the lock so blob I/O latency
+    # doesn't block other room operations on this project. The metadata
+    # delete is already persisted at this point; cleanup failures are
+    # logged but do not bubble.
+    _cleanup_room_blobs(project_id, deleted_room)
+
+    clean = {k: v for k, v in project_data.items() if k != "doc_type" and not k.startswith("_")}
+    return ProjectResponse(project=StagingProject(**clean))
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectResponse)
 async def update_project(
     project_id: str,

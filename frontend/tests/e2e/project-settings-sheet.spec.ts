@@ -1756,3 +1756,400 @@ test.describe('Issue 003 — generation settings dropdowns + read-only model', (
     await expect(modelReadonly).toHaveAttribute('aria-readonly', 'true');
   });
 });
+
+/**
+ * Issue 005 of the project-settings-completeness PRD.
+ *
+ * Inline delete-with-confirm in `ProjectRoomsManager`. The PRD/issue
+ * text describes the backend `removeRoom` endpoint as "existing", but
+ * on `main` no DELETE-room endpoint or API client function existed
+ * before this slice — same adaptation pattern as 001/002/003/004.
+ *
+ * The new endpoint AND the new UI ship together; these e2e tests
+ * exercise the full chain through the network boundary:
+ *
+ *   1. Happy path — open Settings → click Delete on a room → confirm
+ *      visible → click "Yes, delete" → DELETE fires with the correct
+ *      URL → row gone IMMEDIATELY (proves onProjectUpdate → setProject
+ *      wiring; rubber-duck guard against the false-positive "test
+ *      passes only after reopen/reload" failure mode) → no /generate
+ *      route hits → reopen sheet to confirm room still gone → hard
+ *      reload → Projects list page shows project card with the
+ *      decremented room count (the propagation regression guard from
+ *      AC bullet 4).
+ *
+ *   2. Cancel path — open Settings → click Delete → confirm visible →
+ *      click "Cancel" → DELETE counter is zero (rubber-duck guard
+ *      against the false-positive "Cancel test passes only because
+ *      no DELETE route was ever exercised" failure mode) → both rows
+ *      still visible.
+ *
+ *   3. Error path — backend returns 500 → confirm row stays visible
+ *      with INLINE error → row preserved on next reopen → tripwire:
+ *      no toast was used (the inline error is the design choice).
+ *
+ * The mock applies the same field-set semantics the backend's
+ * `_prune_room_metadata_in_place` does (rooms list pruned of the
+ * deleted room id) so reload assertions exercise the real chain
+ * rather than passing for the wrong reason.
+ */
+
+const DELETE_ROOMS_PROJECT_ID = 'test-rooms-delete';
+
+interface MockDeleteRoomsProject extends MockRoomsProject {
+  id: string;
+}
+
+function makeDeleteRoomsProject(): MockDeleteRoomsProject {
+  const base = makeRoomsProject();
+  return {
+    ...base,
+    id: DELETE_ROOMS_PROJECT_ID,
+    rooms: base.rooms.map((r) => ({
+      ...r,
+      original_image_url: r.original_image_url.replace(
+        ROOMS_PROJECT_ID,
+        DELETE_ROOMS_PROJECT_ID,
+      ),
+      original_thumbnail_url: r.original_thumbnail_url
+        ? r.original_thumbnail_url.replace(ROOMS_PROJECT_ID, DELETE_ROOMS_PROJECT_ID)
+        : null,
+    })),
+  };
+}
+
+/**
+ * Apply a DELETE-room mutation to the mock project state. Mirrors the
+ * backend's `remove_room` handler: filter the room out of `rooms`, no
+ * other field changes (the test fixtures don't carry `analyses` /
+ * `design_brief` payloads so the metadata-pruning paths are covered
+ * by the pytest layer).
+ */
+function applyRoomDelete(
+  state: MockDeleteRoomsProject,
+  roomId: string,
+): MockDeleteRoomsProject {
+  return {
+    ...state,
+    rooms: state.rooms.filter((r) => r.id !== roomId),
+    total_variations: state.rooms
+      .filter((r) => r.id !== roomId)
+      .reduce((acc, r) => acc + r.variations.length, 0),
+    completed_variations: state.rooms
+      .filter((r) => r.id !== roomId)
+      .reduce(
+        (acc, r) =>
+          acc + r.variations.filter((v) => v.status === 'completed').length,
+        0,
+      ),
+  };
+}
+
+async function setupGenerationTripwireForDeleteProject(
+  page: Page,
+  hits: string[],
+): Promise<void> {
+  await page.route(
+    new RegExp(
+      `${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}/(generate|rooms/[^/]+/(?:regenerate|variations))`,
+    ),
+    (route: Route) => {
+      hits.push(route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true }),
+      });
+    },
+  );
+}
+
+test.describe('Issue 005 — Rooms manager delete with confirm', () => {
+  test('happy path: open Settings, delete room A, row gone immediately, persists, project card count decremented', async ({
+    page,
+  }) => {
+    let projectState = makeDeleteRoomsProject();
+    const deleteRequests: Array<{ url: string; method: string }> = [];
+    const generateHits: string[] = [];
+
+    await setupSasTokenMock(page);
+    await setupGenerationTripwireForDeleteProject(page, generateHits);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.route(
+      new RegExp(`${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}/rooms/[^/]+$`),
+      (route: Route) => {
+        const url = route.request().url();
+        const method = route.request().method();
+        if (method === 'DELETE') {
+          const match = url.match(/\/rooms\/([^/?]+)/);
+          const roomId = match ? match[1] : '';
+          deleteRequests.push({ url, method });
+          projectState = applyRoomDelete(projectState, roomId);
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${DELETE_ROOMS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Open Settings sheet — both rooms visible.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(page.getByTestId('project-rooms-manager')).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-A'),
+    ).toHaveText('Living Room');
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-B'),
+    ).toHaveText('Kitchen');
+
+    // Click trash on room A — confirm row appears in same component.
+    await page.getByTestId('project-rooms-manager-delete-room-A').click();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-room-A'),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-yes-room-A'),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-cancel-room-A'),
+    ).toBeVisible();
+
+    // Click "Yes, delete".
+    await page.getByTestId('project-rooms-manager-confirm-yes-room-A').click();
+
+    // DELETE fired with the correct URL.
+    await expect.poll(() => deleteRequests.length).toBe(1);
+    expect(deleteRequests[0].method).toBe('DELETE');
+    expect(deleteRequests[0].url).toContain(`/rooms/${ROOM_A_ID}`);
+
+    // Row gone IMMEDIATELY (proves onProjectUpdate → setProject is
+    // wired; rubber-duck guard against the false-positive that would
+    // hide a broken wiring behind the reopen-after-reload step).
+    await expect(
+      page.getByTestId('project-rooms-manager-row-room-A'),
+    ).toHaveCount(0);
+    // Sibling room still present.
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-B'),
+    ).toHaveText('Kitchen');
+
+    // No generation routes were hit.
+    expect(generateHits).toEqual([]);
+
+    // Reopen the sheet — room A still gone (the post-delete project
+    // state is what the page now holds).
+    await expect(page.getByTestId('project-settings-sheet')).toBeVisible();
+    // Close + reopen (Cancel button + reopen flow).
+    await page.getByTestId('project-settings-cancel').click();
+    await expect(page.getByTestId('project-settings-sheet')).not.toBeVisible();
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(
+      page.getByTestId('project-rooms-manager-row-room-A'),
+    ).toHaveCount(0);
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-B'),
+    ).toHaveText('Kitchen');
+
+    // Hard reload — load the post-delete state and confirm
+    // persistence on the page itself.
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(
+      page.getByTestId('project-rooms-manager-row-room-A'),
+    ).toHaveCount(0);
+
+    // Project card propagation regression guard (AC bullet 4):
+    // navigate to /projects and confirm the card shows the
+    // decremented room count. Mock the list endpoint to return
+    // the (mutated) project state so the card reads from the
+    // post-delete document.
+    await page.route(`${API_BASE}/staging/projects`, (route: Route) => {
+      if (route.request().method() === 'GET') {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ projects: [projectState], total: 1 }),
+        });
+      }
+      return route.continue();
+    });
+    await page.goto('/projects');
+    await page.waitForLoadState('networkidle');
+    // Project card shows "1 image" (was 2 before delete). The card
+    // pluralization rule renders "1 image" / "N images".
+    await expect(page.getByText(/^1\s+image$/i).first()).toBeVisible();
+  });
+
+  test('cancel path: clicking Cancel collapses the confirm row and never fires DELETE', async ({
+    page,
+  }) => {
+    const projectState = makeDeleteRoomsProject();
+    let deleteAttempts = 0;
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    // DELETE-tripwire: any DELETE attempt to a /rooms/{rid} URL
+    // bumps the counter. Asserting `deleteAttempts === 0` after
+    // the Cancel click is the rubber-duck guard against the
+    // false-positive "test passes because no DELETE route was
+    // ever exercised" failure mode.
+    await page.route(
+      new RegExp(`${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}/rooms/[^/]+$`),
+      (route: Route) => {
+        if (route.request().method() === 'DELETE') {
+          deleteAttempts++;
+        }
+        return route.fulfill({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ detail: 'should never be called' }),
+        });
+      },
+    );
+
+    await page.goto(`/projects/${DELETE_ROOMS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    await page.getByTestId('project-rooms-manager-delete-room-A').click();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-room-A'),
+    ).toBeVisible();
+
+    await page.getByTestId('project-rooms-manager-confirm-cancel-room-A').click();
+
+    // Confirm row is gone.
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-room-A'),
+    ).toHaveCount(0);
+    // Both rows still present in view mode.
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-A'),
+    ).toHaveText('Living Room');
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-B'),
+    ).toHaveText('Kitchen');
+
+    // Tripwire: no DELETE was fired.
+    expect(deleteAttempts).toBe(0);
+  });
+
+  test('error path: DELETE returns 500 → confirm row stays visible with inline error, row preserved', async ({
+    page,
+  }) => {
+    const projectState = makeDeleteRoomsProject();
+    let deleteAttempts = 0;
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.route(
+      new RegExp(`${API_BASE}/staging/projects/${DELETE_ROOMS_PROJECT_ID}/rooms/[^/]+$`),
+      (route: Route) => {
+        if (route.request().method() === 'DELETE') {
+          deleteAttempts++;
+          return route.fulfill({
+            status: 500,
+            contentType: 'application/json',
+            body: JSON.stringify({ detail: 'cosmos write failed' }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${DELETE_ROOMS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    await page.getByTestId('project-rooms-manager-delete-room-A').click();
+    await page.getByTestId('project-rooms-manager-confirm-yes-room-A').click();
+
+    // DELETE was attempted.
+    await expect.poll(() => deleteAttempts).toBe(1);
+
+    // The confirm row STAYS visible with an INLINE error (PRD: "the
+    // confirm row stays visible with an inline error and the room
+    // row is preserved" — NOT a toast that auto-dismisses).
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-room-A'),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-error-room-A'),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-error-room-A'),
+    ).toContainText(/cosmos write failed|500/i);
+
+    // The Yes / Cancel buttons are still there for retry / abort.
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-yes-room-A'),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('project-rooms-manager-confirm-cancel-room-A'),
+    ).toBeVisible();
+
+    // Row preserved: re-close-and-reopen the sheet still shows both
+    // rooms.
+    await page.getByTestId('project-rooms-manager-confirm-cancel-room-A').click();
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-A'),
+    ).toHaveText('Living Room');
+    await expect(
+      page.getByTestId('project-rooms-manager-label-room-B'),
+    ).toHaveText('Kitchen');
+  });
+});

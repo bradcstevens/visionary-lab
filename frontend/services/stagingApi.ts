@@ -952,6 +952,47 @@ export async function updateRoom(
   return data.project;
 }
 
+// Issue 005 of project-settings-completeness PRD. DELETE the target
+// room from a project. The backend cascades the delete:
+//   - Removes the room from `project.rooms`.
+//   - Prunes room-keyed metadata in `analyses` and `design_brief.
+//     per_image_notes` / `per_image_objects` (rubber-duck blocker —
+//     without this, stale references leak into future brief/regen
+//     flows).
+//   - Best-effort blob cleanup for the originals + the
+//     `staging/{project_id}/variations/{room_id}/` prefix sweep.
+//   - Returns 409 Conflict if `project.status === 'processing'` —
+//     callers should prevent the click in that state, but the backend
+//     guards programmatic / racing clients.
+//
+// On success, the response body is `{project}` with the updated full
+// project (rooms minus the deleted one). Callers should pass it
+// through `onProjectUpdate(updated)` so the page's `setProject` runs
+// the existing `resolveImageUrls` pass first (preserves SAS tokens
+// on in-place URLs).
+//
+// On failure (network, 4xx, 5xx), throws an Error whose message
+// includes the response body — the rooms manager surfaces this as
+// an INLINE error on the confirm row (NOT a toast that auto-
+// dismisses) so the user sees the failure state and can retry or
+// cancel. This matches the PRD's "the confirm row stays visible
+// with an inline error and the room row is preserved" rule.
+export async function removeRoom(
+  projectId: string,
+  roomId: string,
+): Promise<StagingProject> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}`;
+  const response = await fetch(url, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to remove room: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.project;
+}
+
 // Issue 002 of the projects-page-improvements PRD. Each field is
 // optional — omit a field to leave it unchanged on the server. Sending
 // ``design_brief: null`` explicitly clears the brief; sending null for
