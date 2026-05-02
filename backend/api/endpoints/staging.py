@@ -213,12 +213,35 @@ async def get_project(
 async def delete_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
 ):
-    """Delete a project and all associated blob storage artifacts."""
+    """Delete a project and all associated blob storage artifacts.
+
+    Cascade (issue 007): before deleting the project document, mark
+    every non-terminal job for ``project_id`` with
+    ``cancel_requested=True``. The ``JobWorker`` (issue 003) observes
+    the flag at the next safe point and transitions each job to
+    ``cancelled``, preventing leaked Azure compute / blob writes for
+    a project that no longer exists.
+
+    Best-effort: ``JobStore`` failures (transient Cosmos errors,
+    individual ``update_job`` raises) are logged at WARNING and do
+    NOT block the project delete. The Cosmos document and blob
+    cleanup happen regardless — a stuck-pending job after a delete
+    is recoverable on the next deploy; a failed delete is a UX bug
+    the user has to retry.
+
+    Gated on ``FEATURE_ASYNC_QUEUE`` so the legacy in-process
+    pipeline (no JobStore container provisioned) is unaffected.
+    """
     # Get project first to find blob paths
     project_data = storage.get_project(project_id)
     if not project_data:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Cascade-cancel non-terminal jobs for this project. Best-effort.
+    if settings.FEATURE_ASYNC_QUEUE:
+        _cascade_cancel_project_jobs(project_id, store)
 
     # Delete all blobs under staging/{project_id}/
     deleted_blobs = 0
@@ -1778,6 +1801,49 @@ async def update_brief(
 
 
 _TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def _cascade_cancel_project_jobs(project_id: str, store: "JobStore") -> None:
+    """Mark every non-terminal job for ``project_id`` as
+    ``cancel_requested=True``.
+
+    Issue 007 cascade. Best-effort: any failure in
+    ``list_jobs_by_project`` aborts the cascade with a WARNING log
+    and the caller (``delete_project``) still completes the project
+    delete. A failure inside an individual ``update_job`` is logged
+    but does NOT abort the loop — partial cascade is strictly better
+    than no cascade.
+
+    The ``JobWorker`` (issue 003) re-reads the doc on its
+    ``is_cancelled`` probe each tick, so the flag is observed
+    regardless of which replica was holding the queue lease.
+    """
+    try:
+        jobs = store.list_jobs_by_project(project_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort cascade
+        logger.warning(
+            "staging.delete_project.cascade.list_failed project_id=%s error=%s",
+            project_id, exc,
+        )
+        return
+
+    cancelled = 0
+    for job in jobs:
+        if job.get("status") in _TERMINAL_JOB_STATUSES:
+            continue
+        job_id = job.get("id")
+        try:
+            store.update_job(job_id, project_id, cancel_requested=True)
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001 — best-effort cascade
+            logger.warning(
+                "staging.delete_project.cascade.update_failed job_id=%s error=%s",
+                job_id, exc,
+            )
+    logger.info(
+        "staging.delete_project.cascade.done project_id=%s cancelled=%d",
+        project_id, cancelled,
+    )
 
 
 def _require_async_queue_enabled() -> None:

@@ -123,5 +123,24 @@ def mock_staging_deps():
         # Mock pipeline
         mock_pipeline = MagicMock()
         mock_pipeline_fn.return_value = mock_pipeline
-        
-        yield {"container": mock_container, "pipeline": mock_pipeline}
+
+        # Issue 007 cascade: ``delete_project`` (and any future endpoint
+        # that takes ``Depends(get_job_store)``) constructs a real
+        # ``JobStore`` -> real ``CosmosClient`` -> real network call at
+        # request-dispatch time. Override the FastAPI dependency with an
+        # in-memory mock so legacy tests using only this fixture don't
+        # need to know about JobStore. Tests that need to assert against
+        # the JobStore (e.g. cascade tests) install their own override
+        # on top, which takes precedence per FastAPI semantics.
+        from backend.main import app as _app
+        from backend.api.endpoints import staging as staging_module
+
+        mock_job_store = MagicMock(name="JobStore")
+        mock_job_store.list_jobs_by_project.return_value = []
+        _app.dependency_overrides[staging_module.get_job_store] = lambda: mock_job_store
+
+        try:
+            yield {"container": mock_container, "pipeline": mock_pipeline,
+                   "job_store": mock_job_store}
+        finally:
+            _app.dependency_overrides.pop(staging_module.get_job_store, None)
