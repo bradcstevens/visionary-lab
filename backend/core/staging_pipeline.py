@@ -102,13 +102,20 @@ class StagingPipeline:
         image_pipeline: ImagePipelineService,
         storage_service: StagingStorageService,
         blob_service: AzureBlobStorageService,
+        thumbnail_deriver=None,
     ):
+        from backend.core.thumbnail_deriver import ThumbnailDeriver
+
         self.async_llm_client = async_llm_client
         self.llm_deployment = llm_deployment
         self.image_analyzer = image_analyzer
         self.image_pipeline = image_pipeline
         self.storage_service = storage_service
         self.blob_service = blob_service
+        # Issue 010: lazy-default so existing call sites (and tests) keep
+        # working unchanged. Deriver is a thin wrapper over blob_service so
+        # constructing one is free.
+        self.thumbnail_deriver = thumbnail_deriver or ThumbnailDeriver(blob_service)
         self.semaphore = asyncio.Semaphore(settings.STAGING_CONCURRENT_ROOMS)
         # Fire-and-forget cleanup tasks (e.g. prior-blob deletes after a
         # successful single-variation regen). We hold strong references here so
@@ -436,6 +443,15 @@ class StagingPipeline:
                         "adapted_prompt": adapted_prompt,
                         "generation_time_ms": elapsed_ms,
                     }
+                    variation.revision += 1
+                    # Issue 010: derive sibling thumb/md WebP variants in the
+                    # tail of the variation job. Best-effort: a derive failure
+                    # logs but does NOT fail the variation — the original
+                    # image_url is still good and the StorageImage skeleton
+                    # (issue 011) renders an acceptable fallback.
+                    await self._derive_variants_for_variation(
+                        saved_url=saved_url, variation=variation,
+                    )
                 else:
                     variation.status = ItemStatus.FAILED
                     variation.error = "Save succeeded but no image URL returned"
@@ -688,6 +704,12 @@ class StagingPipeline:
                 "adapted_prompt": adapted_prompt,
                 "generation_time_ms": elapsed_ms,
             }
+            variation.revision += 1
+            # Issue 010: derive sibling thumb/md variants. Best-effort —
+            # see _process_one_variation for rationale.
+            await self._derive_variants_for_variation(
+                saved_url=saved_url, variation=variation,
+            )
             await self._update_room_in_project(project, room)
 
             # Fire-and-forget delete of the prior blob (best-effort).
@@ -836,6 +858,42 @@ class StagingPipeline:
         project.status = ProjectStatusCalculator.compute_status(project.rooms)
         await self._persist_project_locked(project)
         yield {"type": "project_completed", "status": project.status}
+
+    async def _derive_variants_for_variation(
+        self, *, saved_url: str, variation: Variation,
+    ) -> None:
+        """Best-effort: derive ``thumb.webp`` + ``md.webp`` siblings for the
+        just-saved variation blob and persist their URLs onto ``variation``.
+
+        Issue 010 — runs synchronously at the tail of every variation job
+        before the job reports ``succeeded``. A failure here logs at WARNING
+        and leaves ``thumb_url`` / ``md_url`` unset; the StorageImage
+        skeleton (issue 011) renders an acceptable fallback in that case.
+        """
+        try:
+            blob_name = self._extract_blob_name(saved_url)
+            content, _ = await asyncio.to_thread(
+                self.blob_service.get_asset_content,
+                blob_name,
+                settings.AZURE_BLOB_IMAGE_CONTAINER,
+            )
+            if not content:
+                logger.warning(
+                    "Skipping thumbnail derive for %s: source blob unreadable",
+                    saved_url,
+                )
+                return
+            thumb_url, md_url = await self.thumbnail_deriver.derive_and_upload(
+                image_bytes=content,
+                original_blob_name=blob_name,
+                container_name=settings.AZURE_BLOB_IMAGE_CONTAINER,
+            )
+            variation.thumb_url = thumb_url
+            variation.md_url = md_url
+        except Exception as e:
+            logger.warning(
+                "Thumbnail derivation failed for %s: %s", saved_url, e,
+            )
 
     @staticmethod
     def _extract_blob_name(blob_url: str) -> str:

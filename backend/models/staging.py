@@ -45,6 +45,16 @@ class Variation(BaseModel):
     id: str
     image_url: Optional[str] = None
     thumbnail_url: Optional[str] = None
+    # Issue 010: sibling derived variants. ``thumb_url`` is the 512px-max-edge
+    # WebP (q70) used by grids; ``md_url`` is the 1024px-max-edge WebP (q80)
+    # used by lightboxes. Populated by ThumbnailDeriver at the tail of every
+    # variation job before the variation is marked COMPLETED. ``revision``
+    # tracks how many times this variation has been (re)generated — bumped on
+    # every successful generation; consumed by the SSE/jobs deterministic-id
+    # scheme (issue 004) so a stale-cached client can detect overlap.
+    thumb_url: Optional[str] = None
+    md_url: Optional[str] = None
+    revision: int = 0
     status: str = Field(ItemStatus.PENDING, description="Variation generation status")
     error: Optional[str] = None
     generation_metadata: Optional[GenerationMetadata] = None
