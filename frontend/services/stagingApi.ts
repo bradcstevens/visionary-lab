@@ -91,6 +91,12 @@ export interface StagingProject {
   // through the Project Settings sheet. Optional/null when the project
   // hasn't run an AI Design Session yet.
   design_brief?: DesignBrief | null;
+  // Issue 013/014 of image-pipeline-and-project-ux-overhaul PRD.
+  // Backend-derived <=240-char summary used for the collapsed prompt
+  // header; refreshed by the server on every PATCH that mutates
+  // ``prompt`` (PromptSummarizer, deterministic truncation fallback).
+  // Optional/null when the project predates the summarizer slice.
+  prompt_summary?: string | null;
   created_at?: string;
   updated_at?: string;
   total_variations?: number;

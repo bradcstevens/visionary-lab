@@ -19,6 +19,7 @@ import { ProgressTracker } from "@/components/staging/ProgressTracker";
 import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox";
 import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
 import { EditPromptDialog } from "@/components/staging/EditPromptDialog";
+import { CollapsiblePrompt } from "@/components/staging/CollapsiblePrompt";
 import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
@@ -873,9 +874,21 @@ export default function ProjectDetailPage() {
                 {project.status === 'pending' ? 'ready' : project.status}
               </Badge>
             </div>
-            <p className="text-muted-foreground leading-relaxed max-w-3xl">
-              {project.prompt}
-            </p>
+            {/* Issue 014 of image-pipeline-and-project-ux-overhaul PRD:
+                collapsed prompt header. Renders ``prompt_summary`` by
+                default; the in-place editor saves via the existing
+                PATCH endpoint and the backend regenerates the summary
+                (PromptSummarizer; issue 013). Editing the prompt does
+                NOT enqueue any regeneration job — the call only mutates
+                the project document. */}
+            <CollapsiblePrompt
+              prompt={project.prompt}
+              promptSummary={project.prompt_summary ?? null}
+              onSave={async (newPrompt) => {
+                await handleProjectSettingsSave({ prompt: newPrompt });
+              }}
+              disabled={isAnyInFlight}
+            />
             {totalVariations > 0 && (
               <p className="text-xs text-muted-foreground">
                 {completedVariations}/{totalVariations} variations complete across {project.rooms.length} images
