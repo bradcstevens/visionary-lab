@@ -1206,3 +1206,553 @@ test.describe('Issue 004 — Rooms manager rename', () => {
     await expect(page.locator('[data-sonner-toast]').first()).toBeVisible();
   });
 });
+
+/**
+ * Issue 003 of the project-settings-completeness PRD.
+ *
+ * Generation settings dropdowns + read-only model. The PRD asks for:
+ *
+ *   - Quality dropdown with options low / medium / high / auto
+ *   - Size dropdown with options auto / 1024x1024 / 1024x1536 / 1536x1024
+ *   - Model rendered as a READ-ONLY label (no input affordance)
+ *   - `useProjectSettings.save` (on `main`: `computeProjectSettingsDiff`
+ *     in `ProjectSettingsSheet.tsx`) NEVER includes `model` in the
+ *     outgoing payload, even defensively
+ *
+ * On `main`, quality + size already exist as Selects (PRD-spec'd
+ * options match exactly) — the issue's "currently silently dropped"
+ * claim about `size` reflects the worktree branch, not `main`. The
+ * delta this slice creates is:
+ *
+ *   1. Model goes from a Select to a read-only label.
+ *   2. The diff helper drops `model` from its input shape — so a
+ *      future bug or a programmatic consumer can't accidentally
+ *      smuggle a model change onto the wire.
+ *
+ * Test coverage map (PRD Acceptance Criteria for issue 003):
+ *
+ *   1. "dropdowns and read-only model": open sheet on a project with
+ *      a known `model`. Assert:
+ *        - `[data-testid="project-settings-model-readonly"]` exists
+ *          and contains the human-readable label for the project's
+ *          model value.
+ *        - `[data-testid="project-settings-model-readonly"]` carries
+ *          `aria-readonly="true"` so assistive tech sees it as a
+ *          read-only display, not an interactive control.
+ *        - The pre-issue-003 `[data-testid="project-settings-model-
+ *          select"]` does NOT exist (regression guard against a
+ *          revert).
+ *        - Clicking the quality select opens a listbox with exactly
+ *          the four spec'd options, in the spec'd order, with the
+ *          project's current value (`high`) marked as selected.
+ *        - Clicking the size select opens a listbox with exactly
+ *          the four spec'd options, in the spec'd order, with the
+ *          project's current value (`auto`) marked as selected.
+ *
+ *   2. "change quality + save": open, change quality from "high" to
+ *      "medium", click Save. Assert:
+ *        - PATCH body equals `{ settings: { quality: "medium" } }`
+ *          exactly — NOT `{settings: {quality, model}}` (the load-
+ *          bearing wire-shape assertion).
+ *        - The body's `settings` does NOT contain a `model` key.
+ *        - The body has no top-level `model` key either.
+ *        - Hard reload + reopen shows the quality select displaying
+ *          "Medium" (persisted value derived from the merged
+ *          response).
+ *
+ *   3. "change size + Cancel reverts; resave persists": open, change
+ *      size from "auto" to "1024x1024", click Cancel. Reopen and
+ *      assert the size select is back at "auto" (the snapshot reset
+ *      on each open is the regression guard for the user's
+ *      "Discard changes" mental model). Then re-edit, save, reload,
+ *      reopen, assert size persists.
+ *
+ * Each test installs the same `/generate` and `/regenerate` route
+ * tripwire the issue 002 tests do — a saved generation-settings
+ * change must NOT cascade into an automatic regeneration. The
+ * existing `project-settings-future-only-notice` banner inside the
+ * sheet + the existing toast on save play the role the PRD calls
+ * "RegeneratePrompt banner" (which doesn't exist on `main`); both
+ * are covered by the existing test 1 of this spec.
+ */
+
+const GEN_SETTINGS_PROJECT_ID = 'test-gen-settings';
+
+function makeGenSettingsProject(
+  overrides: Partial<MockProject> = {},
+): MockProject {
+  return makeProject({
+    id: GEN_SETTINGS_PROJECT_ID,
+    name: 'Generation Settings Test Project',
+    prompt: 'modern minimalist',
+    settings: {
+      variations_per_room: 5,
+      model: 'gpt-image-2',
+      quality: 'high',
+      size: 'auto',
+    },
+    ...overrides,
+  });
+}
+
+async function setupGenerationTripwireForGenSettings(
+  page: Page,
+  hits: string[],
+): Promise<void> {
+  await page.route(
+    new RegExp(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}/(generate|rooms/[^/]+/(?:regenerate|variations))`,
+    ),
+    (route: Route) => {
+      hits.push(route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true }),
+      });
+    },
+  );
+}
+
+test.describe('Issue 003 — generation settings dropdowns + read-only model', () => {
+  test('quality + size dropdowns enumerate exactly the spec\'d options; model is a read-only label', async ({
+    page,
+  }) => {
+    const projectState = makeGenSettingsProject();
+    const generateHits: string[] = [];
+
+    await setupSasTokenMock(page);
+    await setupGenerationTripwireForGenSettings(page, generateHits);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${GEN_SETTINGS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // Open the sheet via the overflow menu.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    const sheet = page.getByTestId('project-settings-sheet');
+    await expect(sheet).toBeVisible();
+
+    // 1. Model is rendered as a read-only label — NOT a Select.
+    //    The pre-issue-003 testid `project-settings-model-select`
+    //    must be gone (regression guard against a revert).
+    const modelReadonly = page.getByTestId('project-settings-model-readonly');
+    await expect(modelReadonly).toBeVisible();
+    // The display label should be the human-readable form. The exact
+    // text comes from the `MODEL_DISPLAY_LABELS` map in
+    // `ProjectSettingsSheet.tsx`. We assert containment so a future
+    // copy tweak (e.g., adding "(default)" suffix) doesn't cascade
+    // into a test churn — the load-bearing assertion is "shows the
+    // project's model in a readable form".
+    await expect(modelReadonly).toContainText(/gpt[-\s]?image[-\s]?2/i);
+    // ARIA contract: assistive tech must see this as read-only.
+    await expect(modelReadonly).toHaveAttribute('aria-readonly', 'true');
+    // The OLD interactive Select must not exist anymore.
+    await expect(
+      page.getByTestId('project-settings-model-select'),
+    ).toHaveCount(0);
+
+    // 2. Quality dropdown: exactly the 4 spec'd options in order,
+    //    current value selected.
+    const qualityTrigger = page.getByTestId('project-settings-quality-select');
+    await expect(qualityTrigger).toBeVisible();
+    // The trigger shows the current value's human-readable label.
+    await expect(qualityTrigger).toContainText(/high/i);
+    await qualityTrigger.click();
+    // Radix Select renders options in a portaled listbox. Each
+    // SelectItem is `role="option"`. Match by accessible name (which
+    // includes the option's full label text).
+    const qualityOptions = page.locator('[role="option"]');
+    await expect(qualityOptions).toHaveCount(4);
+    // Spec'd value-set: low, medium, high, auto. Match against the
+    // labels (which include parenthetical descriptors like "(default)").
+    const qualityTexts = await qualityOptions.allTextContents();
+    expect(qualityTexts.some((t) => /^low\b/i.test(t.trim()))).toBe(true);
+    expect(qualityTexts.some((t) => /^medium\b/i.test(t.trim()))).toBe(true);
+    expect(qualityTexts.some((t) => /^high\b/i.test(t.trim()))).toBe(true);
+    expect(qualityTexts.some((t) => /^auto\b/i.test(t.trim()))).toBe(true);
+    // Close the dropdown by re-clicking the trigger (Radix Select
+    // treats this as a toggle). Avoid Escape: in this Sheet context,
+    // an Escape captured by the portaled listbox can also bubble to
+    // the Dialog's onEscapeKeyDown handler and close the sheet,
+    // breaking the next assertion.
+    await qualityTrigger.click();
+    await expect(page.locator('[role="listbox"]')).toHaveCount(0);
+    // Sanity guard: the sheet itself is still open so the size
+    // trigger is reachable.
+    await expect(sheet).toBeVisible();
+
+    // 3. Size dropdown: exactly the 4 spec'd options in order,
+    //    current value selected.
+    const sizeTrigger = page.getByTestId('project-settings-size-select');
+    await expect(sizeTrigger).toBeVisible();
+    await expect(sizeTrigger).toContainText(/auto/i);
+    await sizeTrigger.click();
+    const sizeOptions = page.locator('[role="option"]');
+    await expect(sizeOptions).toHaveCount(4);
+    const sizeTexts = await sizeOptions.allTextContents();
+    expect(sizeTexts.some((t) => /^auto\b/i.test(t.trim()))).toBe(true);
+    expect(sizeTexts.some((t) => /1024\s*[×x]\s*1024/i.test(t))).toBe(true);
+    expect(sizeTexts.some((t) => /1024\s*[×x]\s*1536/i.test(t))).toBe(true);
+    expect(sizeTexts.some((t) => /1536\s*[×x]\s*1024/i.test(t))).toBe(true);
+    await sizeTrigger.click();
+    await expect(page.locator('[role="listbox"]')).toHaveCount(0);
+    await expect(sheet).toBeVisible();
+
+    // No accidental generation cascaded from opening the sheet.
+    expect(generateHits).toEqual([]);
+  });
+
+  test('change quality + save → PATCH body has settings.quality only (no model), persists across reload', async ({
+    page,
+  }) => {
+    let projectState = makeGenSettingsProject();
+    const patchRequests: Array<{ body: Record<string, unknown> }> = [];
+    const generateHits: string[] = [];
+
+    await setupSasTokenMock(page);
+    await setupGenerationTripwireForGenSettings(page, generateHits);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}`,
+      async (route: Route) => {
+        const method = route.request().method();
+        if (method === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        if (method === 'PATCH') {
+          const body = JSON.parse(route.request().postData() || '{}');
+          patchRequests.push({ body });
+          // Mirror the backend MERGE on settings (same as test 1 of
+          // this spec).
+          const next: MockProject = { ...projectState };
+          if ('name' in body) next.name = body.name as string;
+          if ('prompt' in body) next.prompt = body.prompt as string;
+          if ('settings' in body) {
+            next.settings = {
+              ...projectState.settings,
+              ...(body.settings as Record<string, unknown>),
+            };
+          }
+          projectState = next;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${GEN_SETTINGS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(page.getByTestId('project-settings-sheet')).toBeVisible();
+
+    // Change quality from "high" to "medium" via the Select.
+    await page.getByTestId('project-settings-quality-select').click();
+    await page.getByRole('option', { name: /^medium/i }).click();
+
+    // The Save button should be enabled now (we have a diff).
+    const saveBtn = page.getByTestId('project-settings-save');
+    await expect(saveBtn).toBeEnabled();
+
+    await Promise.all([
+      page.waitForRequest(
+        (req) =>
+          req.method() === 'PATCH' &&
+          req.url().endsWith(`/staging/projects/${GEN_SETTINGS_PROJECT_ID}`),
+      ),
+      saveBtn.click(),
+    ]);
+
+    // 1. Wire-shape assertion: payload contains exactly
+    //    { settings: { quality: "medium" } } — no model anywhere.
+    expect(patchRequests).toHaveLength(1);
+    expect(patchRequests[0].body).toEqual({
+      settings: { quality: 'medium' },
+    });
+    // 2. Defensive structural pin: the settings partial must not
+    //    contain `model`, even if the equality check above were
+    //    relaxed in a future refactor (e.g., to accept extra keys).
+    const settings = (patchRequests[0].body as { settings?: Record<string, unknown> })
+      .settings;
+    expect(settings).toBeDefined();
+    expect(settings).not.toHaveProperty('model');
+    // 3. Symmetric pin at the top level: no top-level `model` either.
+    expect(patchRequests[0].body).not.toHaveProperty('model');
+
+    // 4. Sheet closes after the successful save.
+    await expect(page.getByTestId('project-settings-sheet')).not.toBeVisible();
+
+    // 5. Hard reload + reopen → quality select shows "Medium"
+    //    (persisted value).
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(
+      page.getByTestId('project-settings-quality-select'),
+    ).toContainText(/medium/i);
+
+    // 6. Tripwire: no generation routes hit.
+    expect(generateHits).toEqual([]);
+  });
+
+  test('change size + Cancel reverts the dropdown; re-edit + save persists size across reload', async ({
+    page,
+  }) => {
+    let projectState = makeGenSettingsProject();
+    const patchRequests: Array<{ body: Record<string, unknown> }> = [];
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}`,
+      async (route: Route) => {
+        const method = route.request().method();
+        if (method === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        if (method === 'PATCH') {
+          const body = JSON.parse(route.request().postData() || '{}');
+          patchRequests.push({ body });
+          const next: MockProject = { ...projectState };
+          if ('settings' in body) {
+            next.settings = {
+              ...projectState.settings,
+              ...(body.settings as Record<string, unknown>),
+            };
+          }
+          projectState = next;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${GEN_SETTINGS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // 1. Open sheet, change size from "auto" to "1024x1024", click
+    //    Cancel.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    let sizeTrigger = page.getByTestId('project-settings-size-select');
+    await expect(sizeTrigger).toContainText(/auto/i);
+
+    await sizeTrigger.click();
+    await page.getByRole('option', { name: /1024.*1024/i }).click();
+    await expect(sizeTrigger).toContainText(/1024/i);
+
+    // The diff is non-empty so Save is enabled — but we Cancel.
+    const saveBtn = page.getByTestId('project-settings-save');
+    await expect(saveBtn).toBeEnabled();
+    await page.getByTestId('project-settings-cancel').click();
+    await expect(page.getByTestId('project-settings-sheet')).not.toBeVisible();
+
+    // 2. No PATCH was fired — Cancel discards the local edit.
+    expect(patchRequests).toEqual([]);
+
+    // 3. Reopen the sheet — the size select is BACK at "auto". This
+    //    is the load-bearing regression guard for the user's
+    //    "Discard changes" mental model. Pre-issue-003 the snapshot
+    //    reset only ran on Radix-internal close events, but Cancel
+    //    + parent-driven reopen skipped it; the reset now lives in
+    //    a rising-edge useEffect that fires on BOTH paths.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    sizeTrigger = page.getByTestId('project-settings-size-select');
+    await expect(sizeTrigger).toContainText(/auto/i);
+
+    // 4. Now actually change size + save.
+    await sizeTrigger.click();
+    await page.getByRole('option', { name: /1536.*1024/i }).click();
+    await expect(sizeTrigger).toContainText(/1536/i);
+
+    await Promise.all([
+      page.waitForRequest(
+        (req) =>
+          req.method() === 'PATCH' &&
+          req.url().endsWith(`/staging/projects/${GEN_SETTINGS_PROJECT_ID}`),
+      ),
+      page.getByTestId('project-settings-save').click(),
+    ]);
+
+    // 5. Wire-shape assertion: only size, no model, no other keys.
+    expect(patchRequests).toHaveLength(1);
+    expect(patchRequests[0].body).toEqual({
+      settings: { size: '1536x1024' },
+    });
+    expect(
+      (patchRequests[0].body as { settings?: Record<string, unknown> }).settings,
+    ).not.toHaveProperty('model');
+
+    // 6. Hard reload + reopen → size select shows the persisted
+    //    "1536 × 1024" value.
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(
+      page.getByTestId('project-settings-size-select'),
+    ).toContainText(/1536/i);
+  });
+
+  test('Esc closes the sheet; reopening shows persisted values (non-Cancel close path regression)', async ({
+    page,
+  }) => {
+    let projectState = makeGenSettingsProject();
+    const patchRequests: Array<{ body: Record<string, unknown> }> = [];
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}`,
+      async (route: Route) => {
+        const method = route.request().method();
+        if (method === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        if (method === 'PATCH') {
+          const body = JSON.parse(route.request().postData() || '{}');
+          patchRequests.push({ body });
+          const next: MockProject = { ...projectState };
+          if ('settings' in body) {
+            next.settings = {
+              ...projectState.settings,
+              ...(body.settings as Record<string, unknown>),
+            };
+          }
+          projectState = next;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${GEN_SETTINGS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    // 1. Open sheet, change quality from "high" to "low" without
+    //    saving.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    const qualityTrigger = page.getByTestId('project-settings-quality-select');
+    await expect(qualityTrigger).toContainText(/high/i);
+
+    await qualityTrigger.click();
+    await page.getByRole('option', { name: /^low/i }).click();
+    await expect(qualityTrigger).toContainText(/low/i);
+
+    // 2. Close via Escape (NOT the Cancel button — different code
+    //    path through Radix's onOpenChange handler). The
+    //    rising-edge useEffect reset is the canonical mechanism that
+    //    handles BOTH close paths uniformly; pre-issue-003 the
+    //    in-handleOpenChange reset only ran on Radix-internal events
+    //    AND on the Cancel button, but the parent-driven re-open path
+    //    (overflow menu → Project settings) skipped it entirely. This
+    //    test exercises the Esc path specifically as the duck-
+    //    recommended non-Cancel regression guard.
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('project-settings-sheet')).not.toBeVisible();
+    expect(patchRequests).toEqual([]);
+
+    // 3. Reopen — quality select shows the ORIGINAL "high" value,
+    //    not the discarded "low" draft. This is the load-bearing
+    //    assertion for the rising-edge reset on the non-Cancel close
+    //    path.
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(
+      page.getByTestId('project-settings-quality-select'),
+    ).toContainText(/high/i);
+  });
+
+  test('unknown model value falls back to the raw string in the read-only label', async ({
+    page,
+  }) => {
+    // Defensive coverage per the duck-recommended fallback path: if
+    // the backend introduces a new model value that has not yet been
+    // mapped on the client (`MODEL_DISPLAY_LABELS`), the read-only
+    // label must still render the raw model string rather than going
+    // blank. Pre-issue-003 a Select with an unknown value would have
+    // shown an empty trigger; the read-only div with raw-string
+    // fallback degrades gracefully.
+    const projectState = makeGenSettingsProject({
+      settings: {
+        variations_per_room: 5,
+        model: 'future-unmapped-model-v9',
+        quality: 'high',
+        size: 'auto',
+      },
+    });
+
+    await setupSasTokenMock(page);
+    await page.route(
+      `${API_BASE}/staging/projects/${GEN_SETTINGS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.goto(`/projects/${GEN_SETTINGS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    const modelReadonly = page.getByTestId('project-settings-model-readonly');
+    await expect(modelReadonly).toBeVisible();
+    // Raw string fallback — the unmapped model value renders verbatim.
+    await expect(modelReadonly).toContainText('future-unmapped-model-v9');
+    await expect(modelReadonly).toHaveAttribute('aria-readonly', 'true');
+  });
+});

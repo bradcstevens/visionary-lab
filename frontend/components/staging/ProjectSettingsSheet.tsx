@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Save, Info } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -77,13 +77,57 @@ import { ProjectRoomsManager } from "./ProjectRoomsManager";
  * action (rather than deferring to the project-level Save button) and
  * notify the parent via the new `onProjectUpdate` callback so the page
  * can resync local state — same pattern as `handleProjectSettingsSave`.
+ *
+ * Issue 003 of the project-settings-completeness PRD: two changes to
+ * the generation-settings half of the sheet.
+ *
+ *   1. The "Model" field is now rendered as a READ-ONLY label, not an
+ *      interactive Select. Users discover their project's model value
+ *      here but can't switch it from Settings (model selection lives
+ *      with the wizard's create-project step). The display label is
+ *      looked up in `MODEL_DISPLAY_LABELS` with the raw model value as
+ *      a fallback so a backend-side model addition that hasn't been
+ *      mapped on the client yet still renders something readable
+ *      instead of a blank field.
+ *
+ *   2. `computeProjectSettingsDiff` no longer accepts `model` in its
+ *      input shape — a STRUCTURAL guarantee (not just a runtime
+ *      branch) that the wire payload never carries `settings.model`,
+ *      even defensively against a future bug. The pre-issue-003 diff
+ *      helper carried `model` only because the form state included it;
+ *      now neither does.
+ *
+ * The snapshot reset on open was also moved out of `handleOpenChange`
+ * (which only runs for Radix-internal close events — Esc, click
+ * outside, X — and the explicit Cancel button) and into a rising-edge
+ * `useEffect` keyed on `open` going false → true. The pre-issue-003
+ * shape only reset when `next === true` AND Radix actually fired
+ * `onOpenChange`, but with a parent-driven open path
+ * (setShowSettingsSheet(true) flips the controlled `open` prop without
+ * an internal Radix event), the reset never ran on the user's typical
+ * "open via overflow menu" flow. Result: after Cancel, the next open
+ * showed the user's discarded draft, not the persisted values — the
+ * exact "Discard changes" behavior the issue 003 AC pins. The new
+ * effect mirrors the EditPromptDialog pattern from
+ * `radix-dialog-body-lock-fix` issue 003 (commit 0e75717): a
+ * `prevOpenRef` makes the false→true transition the only trigger, so
+ * mid-edit `project` refreshes (e.g., a regen completing in the
+ * background) cannot stomp the user's draft. The `react-hooks/
+ * set-state-in-effect` rule does NOT fire on this guarded shape —
+ * empirically verified, same as the EditPromptDialog conversion.
  */
 
-const MODEL_OPTIONS: { value: string; label: string }[] = [
-  { value: "gpt-image-2", label: "GPT Image 2 (default)" },
-  { value: "gpt-image-1-mini", label: "GPT Image 1 mini" },
-  { value: "flux-kontext-pro", label: "Flux Kontext Pro" },
-];
+/**
+ * Display labels for known model values, used by the read-only model
+ * label per issue 003. Unknown values fall back to the raw model
+ * string so a backend-side addition still renders something readable
+ * instead of a blank field.
+ */
+const MODEL_DISPLAY_LABELS: Record<string, string> = {
+  "gpt-image-2": "GPT Image 2 (default)",
+  "gpt-image-1-mini": "GPT Image 1 mini",
+  "flux-kontext-pro": "Flux Kontext Pro",
+};
 
 const QUALITY_OPTIONS: { value: string; label: string }[] = [
   { value: "low", label: "Low (fastest)" },
@@ -167,20 +211,29 @@ export function derivePromptForSettings(project: StagingProject): string {
  * decide whether the Save button is enabled and to build the PATCH
  * body so the request stays minimal.
  *
+ * Issue 003 of the project-settings-completeness PRD: the input shape
+ * deliberately OMITS `model`. This is the structural "never include
+ * model" guarantee — even if a future bug or programmatic consumer
+ * tries to pass a model value through here, it cannot reach the wire
+ * payload because the type signature won't accept it. The pre-issue-
+ * 003 shape carried `model` because the form state did; now both are
+ * read-only display surfaces. The vitest test
+ * `the helper's input shape does not accept a model field` uses
+ * `@ts-expect-error` to pin this guarantee at the type boundary.
+ *
  * Pure helper — exported only for testing.
  */
 export function computeProjectSettingsDiff(
-  initial: { name: string; prompt: string; variations_per_room: number; model: string; quality: string; size: string },
-  current: { name: string; prompt: string; variations_per_room: number; model: string; quality: string; size: string },
+  initial: { name: string; prompt: string; variations_per_room: number; quality: string; size: string },
+  current: { name: string; prompt: string; variations_per_room: number; quality: string; size: string },
 ): UpdateProjectBody {
   const diff: UpdateProjectBody = {};
   if (current.name.trim() !== initial.name) diff.name = current.name.trim();
   if (current.prompt.trim() !== initial.prompt) diff.prompt = current.prompt.trim();
-  const settingsDiff: Partial<{ variations_per_room: number; model: string; quality: string; size: string }> = {};
+  const settingsDiff: Partial<{ variations_per_room: number; quality: string; size: string }> = {};
   if (current.variations_per_room !== initial.variations_per_room) {
     settingsDiff.variations_per_room = current.variations_per_room;
   }
-  if (current.model !== initial.model) settingsDiff.model = current.model;
   if (current.quality !== initial.quality) settingsDiff.quality = current.quality;
   if (current.size !== initial.size) settingsDiff.size = current.size;
   if (Object.keys(settingsDiff).length > 0) {
@@ -200,25 +253,62 @@ export function ProjectSettingsSheet({
   // values stay frozen for the duration of the sheet's open lifecycle
   // so the diff comparison is stable even if the parent reloads
   // ``project`` mid-edit (e.g., a regen completed in the background).
+  // The model is read from this snapshot too (issue 003: it's
+  // displayed as a frozen-on-open read-only label, not live, so the
+  // sheet stays internally consistent if the project is refreshed
+  // mid-edit).
   const [initialValues, setInitialValues] = useState(() =>
     snapshotFromProject(project),
   );
 
-  // Form state.
+  // Form state — model is intentionally NOT in the form state per
+  // issue 003 (read-only display only, lives in initialValues).
   const [name, setName] = useState(initialValues.name);
   const [prompt, setPrompt] = useState(initialValues.prompt);
   const [variationsPerRoom, setVariationsPerRoom] = useState(
     initialValues.variations_per_room,
   );
-  const [model, setModel] = useState(initialValues.model);
   const [quality, setQuality] = useState(initialValues.quality);
   const [size, setSize] = useState(initialValues.size);
   const [isSaving, setIsSaving] = useState(false);
 
+  // Rising-edge snapshot reset — issue 003 of project-settings-
+  // completeness. Pre-issue-003 the reset lived in handleOpenChange,
+  // which only ran on Radix-internal close events (Esc, click
+  // outside, X) and the explicit Cancel button. Parent-driven opens
+  // (the user's typical "More actions" → "Project settings" flow,
+  // which flips the controlled `open` prop via setShowSettingsSheet)
+  // do NOT fire `onOpenChange` and so never re-ran the reset. Result:
+  // after Cancel, the next open showed the user's discarded draft,
+  // not the persisted values. This effect makes the false→true
+  // transition the canonical reset trigger so Cancel + reopen, Esc +
+  // reopen, X + reopen, and click-outside + reopen all behave the
+  // same. The `prevOpenRef` ensures subsequent renders while
+  // `open === true` do NOT stomp the user's in-progress draft (e.g.,
+  // a `project` refresh from a background regen). Mirrors the
+  // EditPromptDialog pattern from radix-dialog-body-lock-fix issue
+  // 003 (commit 0e75717); see that file for the empirical note that
+  // `react-hooks/set-state-in-effect` does NOT fire on this guarded
+  // shape.
+  const prevOpenRef = useRef(false);
+  useEffect(() => {
+    if (open && !prevOpenRef.current) {
+      const snap = snapshotFromProject(project);
+      setInitialValues(snap);
+      setName(snap.name);
+      setPrompt(snap.prompt);
+      setVariationsPerRoom(snap.variations_per_room);
+      setQuality(snap.quality);
+      setSize(snap.size);
+      setIsSaving(false);
+    }
+    prevOpenRef.current = open;
+  }, [open, project]);
+
   const diff = useMemo(() => {
-    const current = { name, prompt, variations_per_room: variationsPerRoom, model, quality, size };
+    const current = { name, prompt, variations_per_room: variationsPerRoom, quality, size };
     return computeProjectSettingsDiff(initialValues, current);
-  }, [initialValues, name, prompt, variationsPerRoom, model, quality, size]);
+  }, [initialValues, name, prompt, variationsPerRoom, quality, size]);
   const hasChanges = Object.keys(diff).length > 0;
   // Validate locally so we don't surface a 422 from the server for
   // obvious mistakes. Empty name/prompt or out-of-range
@@ -231,25 +321,6 @@ export function ProjectSettingsSheet({
     }
     return null;
   })();
-
-  // Re-snapshot the project values on each open so the form starts
-  // from the current persisted values, not whatever was left over
-  // from a previous open. Done in onOpenChange (NOT useEffect) to
-  // sidestep the ``react-hooks/set-state-in-effect`` lint rule and
-  // to make the trigger explicit.
-  const handleOpenChange = (next: boolean) => {
-    if (next) {
-      const snap = snapshotFromProject(project);
-      setInitialValues(snap);
-      setName(snap.name);
-      setPrompt(snap.prompt);
-      setVariationsPerRoom(snap.variations_per_room);
-      setModel(snap.model);
-      setQuality(snap.quality);
-      setSize(snap.size);
-    }
-    onOpenChange(next);
-  };
 
   const handleSave = async () => {
     if (!hasChanges || validationError || isSaving) return;
@@ -265,8 +336,16 @@ export function ProjectSettingsSheet({
     }
   };
 
+  // Display label for the read-only model field (issue 003). Looks
+  // up the human-readable string in MODEL_DISPLAY_LABELS, falling
+  // back to the raw model value so a backend-side addition that
+  // hasn't been mapped yet still renders something readable instead
+  // of a blank field.
+  const modelDisplayLabel =
+    MODEL_DISPLAY_LABELS[initialValues.model] ?? initialValues.model;
+
   return (
-    <Sheet open={open} onOpenChange={handleOpenChange}>
+    <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
         className="sm:max-w-lg flex flex-col"
@@ -372,23 +451,30 @@ export function ProjectSettingsSheet({
             />
           </div>
 
+          {/* Issue 003 of project-settings-completeness PRD: model
+              is rendered as a READ-ONLY label, not a Select. The
+              user discovers their project's model value here but
+              can't switch it from Settings. The display text
+              prefers the human-readable form from
+              MODEL_DISPLAY_LABELS, falling back to the raw model
+              value so an unmapped model still renders something
+              readable. ARIA: aria-readonly="true" tells assistive
+              tech this is a read-only display, not an interactive
+              control. The frozen-on-open snapshot pattern means a
+              mid-edit project refresh (e.g., a background regen)
+              cannot change the displayed model out from under the
+              user. */}
           <div className="space-y-2">
             <Label htmlFor="project-settings-model">Model</Label>
-            <Select value={model} onValueChange={setModel} disabled={isSaving}>
-              <SelectTrigger
-                id="project-settings-model"
-                data-testid="project-settings-model-select"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {MODEL_OPTIONS.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div
+              id="project-settings-model"
+              data-testid="project-settings-model-readonly"
+              aria-readonly="true"
+              className="flex items-center justify-between rounded-md border border-input bg-muted/40 px-3 py-2 text-sm text-foreground"
+            >
+              <span>{modelDisplayLabel}</span>
+              <span className="text-xs text-muted-foreground">Read-only</span>
+            </div>
           </div>
 
           <div className="space-y-2">
