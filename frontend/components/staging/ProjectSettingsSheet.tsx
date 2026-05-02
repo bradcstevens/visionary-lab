@@ -25,6 +25,7 @@ import type {
   StagingProject,
   UpdateProjectBody,
 } from "@/services/stagingApi";
+import { ProjectRoomsManager } from "./ProjectRoomsManager";
 
 /**
  * Project Settings side sheet — issue 002 of the projects-page-
@@ -67,6 +68,15 @@ import type {
  * the server. When no brief exists yet, a small hint below the prompt
  * textarea explains that future edits will be stored on the brief once
  * one is created.
+ *
+ * Issue 004 of the project-settings-completeness PRD: a new
+ * `ProjectRoomsManager` is mounted between the project-level fields
+ * and the generation settings. It encapsulates the rooms list and
+ * inline rename today; subsequent slices add inline delete (issue 005)
+ * and add-photos (issue 006). Room operations persist immediately per
+ * action (rather than deferring to the project-level Save button) and
+ * notify the parent via the new `onProjectUpdate` callback so the page
+ * can resync local state — same pattern as `handleProjectSettingsSave`.
  */
 
 const MODEL_OPTIONS: { value: string; label: string }[] = [
@@ -94,6 +104,18 @@ export interface ProjectSettingsSheetProps {
   onOpenChange: (open: boolean) => void;
   project: StagingProject;
   onSave: (updates: UpdateProjectBody) => Promise<void>;
+  // Issue 004 of project-settings-completeness PRD: room operations
+  // (rename today; delete/add in subsequent slices) persist
+  // immediately per action via the room-scoped API endpoints, NOT
+  // through the project-level Save button. The new ProjectRoomsManager
+  // calls this callback after each successful room mutation so the
+  // parent page can resync local project state (running its existing
+  // SAS-token resolution before the setProject swap, same pattern as
+  // handleProjectSettingsSave). Optional so existing callers don't
+  // have to wire it on day one — but if absent, room renames will
+  // succeed on the server and be invisible in the local UI until the
+  // next reload.
+  onProjectUpdate?: (project: StagingProject) => void | Promise<void>;
 }
 
 /**
@@ -172,6 +194,7 @@ export function ProjectSettingsSheet({
   onOpenChange,
   project,
   onSave,
+  onProjectUpdate,
 }: ProjectSettingsSheetProps) {
   // Snapshot the project values when the sheet opens. The "initial"
   // values stay frozen for the duration of the sheet's open lifecycle
@@ -311,6 +334,24 @@ export function ProjectSettingsSheet({
               </p>
             )}
           </div>
+
+          {/* Issue 004 of project-settings-completeness PRD: rooms
+              manager scaffold + inline rename. Mounted between
+              "Project details" (name, prompt) and "Generation
+              settings" (variations, model, quality, size) per the
+              PRD's "mount the new rooms manager between Project
+              details and Generation settings" placement rule. The
+              `disabled` prop is wired to `isSaving` so a project-
+              level save in flight visually disables room edits too;
+              issue 007 will replace that with the project-status
+              -driven value. The `onProjectUpdate` is forwarded from
+              the parent page and resyncs local project state after
+              a server-confirmed room mutation. */}
+          <ProjectRoomsManager
+            project={project}
+            onProjectUpdate={onProjectUpdate ?? (() => {})}
+            disabled={isSaving}
+          />
 
           <div className="space-y-2">
             <Label htmlFor="project-settings-variations">

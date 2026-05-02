@@ -789,6 +789,23 @@ export default function ProjectDetailPage() {
     }
   }, [projectId, activityLog]);
 
+  // Issue 004 of project-settings-completeness PRD: room operations
+  // (rename today; delete/add in subsequent slices) persist
+  // immediately per action via the room-scoped API endpoints. The
+  // ProjectRoomsManager calls this after each successful mutation so
+  // local state stays in sync with the server. Mirrors
+  // handleProjectSettingsSave's post-PATCH steps: resolveImageUrls
+  // FIRST so SAS-suffixed URLs already in local state aren't replaced
+  // by the bare blob URLs in the response — same regression the
+  // per-room-prompt-addendum spec pinned. No success toast: room
+  // operations are persist-immediately UX where success is silent
+  // (the new label appearing in the row IS the feedback); the
+  // ProjectRoomsManager toasts errors itself.
+  const handleProjectUpdate = useCallback(async (updated: StagingProject) => {
+    await resolveImageUrls(updated);
+    setProject(updated);
+  }, []);
+
   const handleDeleteProject = async () => {
     setIsDeleting(true);
     try {
@@ -1277,6 +1294,7 @@ export default function ProjectDetailPage() {
         onOpenChange={setShowSettingsSheet}
         project={project}
         onSave={handleProjectSettingsSave}
+        onProjectUpdate={handleProjectUpdate}
       />
 
       {/* Edit Prompt dialog — issue 004 of projects-page-improvements

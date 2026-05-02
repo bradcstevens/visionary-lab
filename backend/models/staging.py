@@ -91,15 +91,41 @@ class CreateProjectRequest(BaseModel):
 class UpdateRoomRequest(BaseModel):
     """Partial-update body for ``PATCH /projects/{id}/rooms/{rid}``.
 
-    Only ``prompt_addendum`` is editable today (issue 003 of the
-    projects-page-improvements PRD). Other Room fields (``status``,
-    ``variations``, ``original_image_url``) are derived from generation
-    activity and must not be edited through this endpoint.
+    Issue history:
 
-    ``prompt_addendum=None`` is meaningful: it explicitly clears the
-    addendum. The endpoint normalizes empty / whitespace-only strings to
-    ``None`` before persisting so the model stays clean.
+    - Originally added in issue 003 of the projects-page-improvements
+      PRD with a single editable field (``prompt_addendum``).
+    - Extended in issue 004 of the project-settings-completeness PRD
+      with the ``label`` field so the new ``ProjectRoomsManager`` UI
+      on the Project Settings sheet can rename rooms in place.
+
+    Field semantics (mirrors ``UpdateProjectRequest``):
+
+    - ``label``: required project state when present. Sending ``null``
+      raises 422 — clients shouldn't clear required fields. Empty /
+      whitespace-only is also 422. The endpoint trims surrounding
+      whitespace before persisting.
+
+    - ``prompt_addendum``: ``None`` and empty/whitespace-only are
+      meaningful — they explicitly clear the addendum. The endpoint
+      normalizes both to ``None`` before persisting so the persisted
+      shape stays consistent with the composer's "absent" rule.
+
+    Both fields are independent and ``__fields_set__``-aware in the
+    handler. Critically, this means a label-only PATCH does NOT
+    silently clear an existing addendum (which would happen if the
+    handler defaulted the absent field to ``None`` and unconditionally
+    wrote it back). Other Room fields (``status``, ``variations``,
+    ``original_image_url``) are derived from generation activity and
+    must not be edited through this endpoint.
     """
+    label: Optional[str] = Field(
+        None,
+        description=(
+            "Display label for the room. Trimmed before persisting. "
+            "Send null or empty to receive a 422 (required)."
+        ),
+    )
     prompt_addendum: Optional[str] = Field(
         None,
         description=(
@@ -107,6 +133,19 @@ class UpdateRoomRequest(BaseModel):
             "generations of this room. Pass null or omit to clear."
         ),
     )
+
+    @validator("label")
+    def _label_non_empty(cls, v):
+        # Pydantic v1: validator only fires when the field is explicitly
+        # present in the input (the ``Optional[str] = None`` default
+        # short-circuits before the validator if the field is absent).
+        # So this only fires for explicit values, including explicit
+        # ``null``.
+        if v is None:
+            raise ValueError("label cannot be null; omit the field to leave unchanged")
+        if not v.strip():
+            raise ValueError("label cannot be empty or whitespace-only")
+        return v
 
 
 class UpdateProjectRequest(BaseModel):

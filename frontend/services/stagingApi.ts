@@ -917,6 +917,41 @@ export async function updateRoomAddendum(
   return data.project;
 }
 
+// Issue 004 of project-settings-completeness PRD. Generic
+// PATCH /projects/{id}/rooms/{rid} body — both fields are optional
+// and handled __fields_set__-aware on the backend (a label-only PATCH
+// does NOT silently clear an existing addendum, and vice versa). The
+// backend trims `label` and rejects empty / whitespace-only / null
+// `label` with a 422.
+//
+// `updateRoomAddendum` above is kept as a backwards-compatible
+// convenience for the existing per-room addendum popover in
+// `RoomGroup.tsx`. New call sites that need a label-only or
+// label+addendum update should call `updateRoom` directly.
+export interface UpdateRoomBody {
+  label?: string;
+  prompt_addendum?: string | null;
+}
+
+export async function updateRoom(
+  projectId: string,
+  roomId: string,
+  body: UpdateRoomBody,
+): Promise<StagingProject> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/rooms/${roomId}`;
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to update room: ${response.status} ${errorText}`);
+  }
+  const data = await response.json();
+  return data.project;
+}
+
 // Issue 002 of the projects-page-improvements PRD. Each field is
 // optional — omit a field to leave it unchanged on the server. Sending
 // ``design_brief: null`` explicitly clears the brief; sending null for

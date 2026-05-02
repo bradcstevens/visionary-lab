@@ -278,23 +278,40 @@ async def update_room(
     body: UpdateRoomRequest,
     storage: StagingStorageService = Depends(get_staging_storage),
 ):
-    """Partial-update editable Room fields (currently just
-    ``prompt_addendum``).
+    """Partial-update editable Room fields.
 
-    Issue 003 of the projects-page-improvements PRD. Per the PRD's
-    Further Notes the implementer chose a dedicated room-scoped endpoint
-    over extending ``PATCH /projects/{id}`` because:
+    Issue history:
 
-    - ``PATCH /projects/{id}`` doesn't exist yet (slice 002).
-    - The URL semantics match the resource being edited.
-    - Keeps room-scoped concerns out of the project-level PATCH.
+    - Originally added in issue 003 of the projects-page-improvements
+      PRD with a single editable field (``prompt_addendum``). The
+      implementer chose a dedicated room-scoped endpoint over
+      extending ``PATCH /projects/{id}`` because:
+
+        * ``PATCH /projects/{id}`` doesn't exist yet (slice 002).
+        * The URL semantics match the resource being edited.
+        * Keeps room-scoped concerns out of the project-level PATCH.
+
+    - Extended in issue 004 of the project-settings-completeness PRD
+      with ``label`` so the new ``ProjectRoomsManager`` UI on the
+      Project Settings sheet can rename rooms in place. The endpoint
+      contract becomes ``__fields_set__``-aware for BOTH ``label``
+      AND ``prompt_addendum`` — load-bearing per the rubber-duck
+      blocker call: a label-only PATCH must NOT silently clear an
+      existing addendum (which would happen if the handler defaulted
+      the absent field to ``None`` and unconditionally wrote it back).
 
     The endpoint:
 
-    - Updates only ``room.prompt_addendum`` on the target room.
-    - Normalizes ``""``, ``None``, and whitespace-only to ``None`` so the
-      persisted shape stays consistent with the composer's "absent" rule.
-    - Leaves variations / status / image_url / label untouched.
+    - Updates ONLY the fields the client actually sent (uses
+      ``body.__fields_set__`` to distinguish "absent" from "explicit
+      null", same pattern as ``update_project``).
+    - For ``label``: trims surrounding whitespace before persisting.
+      Empty / whitespace-only / explicit-null is rejected at parse
+      time by ``UpdateRoomRequest._label_non_empty`` (422).
+    - For ``prompt_addendum``: normalizes ``""``, ``None``, and
+      whitespace-only to ``None`` so the persisted shape stays
+      consistent with the composer's "absent" rule.
+    - Leaves variations / status / image_url untouched.
     - Leaves all sibling rooms byte-for-byte unchanged.
     - Leaves project-level status / prompt / settings untouched.
     - Does NOT trigger any generation.
@@ -315,15 +332,32 @@ async def update_room(
         if not room:
             raise HTTPException(status_code=404, detail="Room not found")
 
-        # Normalize empty / whitespace-only addendum to None so the
-        # persisted shape stays clean. Mirrors ``PromptComposer``'s
-        # "absent if it strips to empty" treatment.
-        addendum = body.prompt_addendum
-        if isinstance(addendum, str) and not addendum.strip():
-            addendum = None
-        elif isinstance(addendum, str):
-            addendum = addendum.strip()
-        room["prompt_addendum"] = addendum
+        # Field-set-aware updates (issue 004). Both fields are
+        # independent and only touched when the client actually sent
+        # them. The rubber-duck regression
+        # ``test_patch_room_label_only_preserves_existing_addendum``
+        # pins the load-bearing claim that an absent ``prompt_addendum``
+        # leaves the persisted value untouched.
+        sent = body.__fields_set__
+
+        if "label" in sent:
+            # The validator already rejected null / empty / whitespace,
+            # so ``body.label`` is a non-empty string here. Trim before
+            # persisting (matches the existing addendum-trim behavior
+            # and the ``name`` / ``prompt`` rules in
+            # ``UpdateProjectRequest``).
+            room["label"] = body.label.strip()
+
+        if "prompt_addendum" in sent:
+            # Normalize empty / whitespace-only addendum to None so the
+            # persisted shape stays clean. Mirrors ``PromptComposer``'s
+            # "absent if it strips to empty" treatment.
+            addendum = body.prompt_addendum
+            if isinstance(addendum, str) and not addendum.strip():
+                addendum = None
+            elif isinstance(addendum, str):
+                addendum = addendum.strip()
+            room["prompt_addendum"] = addendum
 
         storage.update_project(project_id, project_data)
 
