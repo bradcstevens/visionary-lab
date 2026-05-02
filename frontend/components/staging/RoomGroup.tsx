@@ -290,6 +290,7 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
             <VariationThumbnail
               key={variation.id}
               imageUrl={variation.image_url}
+              thumbUrl={variation.thumb_url}
               status={variation.status}
               error={variation.error}
               index={index}

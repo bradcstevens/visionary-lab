@@ -54,6 +54,13 @@ export interface Variation {
   id: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   image_url?: string;
+  // Issue 010: derived sibling variants for the storage image. ``thumb_url``
+  // is the 512px-max-edge WebP used by grids; ``md_url`` is the 1024px-max-edge
+  // WebP used by lightbox previews. Both are populated by the thumbnail
+  // deriver on first generation and lazy-backfilled on read for legacy
+  // variations (issue 012). Either can be absent until backfill lands.
+  thumb_url?: string;
+  md_url?: string;
   error?: string;
   // Backend serializes ``generation_metadata`` (issue 002 fix renamed
   // the prior frontend ``metadata?`` field which never matched).

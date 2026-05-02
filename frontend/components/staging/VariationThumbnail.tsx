@@ -15,6 +15,10 @@ import { cn } from "@/utils/cn";
 
 interface VariationThumbnailProps {
   imageUrl?: string;
+  // Issue 011: derived sibling variants. ``thumbUrl`` is preferred for
+  // grid rendering; ``imageUrl`` (the original) is passed alongside as a
+  // download/lightbox handle but is NOT rendered in the grid tile.
+  thumbUrl?: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   error?: string;
   index: number;
@@ -33,6 +37,7 @@ interface VariationThumbnailProps {
 
 export function VariationThumbnail({ 
   imageUrl, 
+  thumbUrl,
   status, 
   error, 
   index, 
@@ -61,11 +66,14 @@ export function VariationThumbnail({
         return (
           <div className="relative w-full h-full group cursor-pointer" onClick={onClick}>
             <StorageImage
-              src={imageUrl}
+              variant="thumb"
+              thumbUrl={thumbUrl ?? imageUrl}
+              jobStatus={status}
               alt={`Variation ${index + 1}`}
               className="w-full h-full object-cover rounded-lg"
               fallbackClassName="w-full h-full rounded-lg"
               fallbackText="Preview unavailable"
+              retryLabel={`Retry loading variation ${index + 1}`}
               overlay={
                 <>
                   <Badge

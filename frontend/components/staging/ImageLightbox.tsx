@@ -3,7 +3,7 @@
 import { useEffect, useCallback, useMemo } from "react";
 import { Dialog, DialogPortal, DialogOverlay, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { X, ExternalLink, RefreshCw, RotateCcw, Sparkles, Loader2, ChevronLeft, ChevronRight, ImageOff } from "lucide-react";
+import { X, ExternalLink, RefreshCw, RotateCcw, Sparkles, Loader2, ChevronLeft, ChevronRight } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -21,7 +21,15 @@ import { cn } from "@/utils/cn";
 import type { Variation } from "@/services/stagingApi";
 
 export interface LightboxImage {
+  /** Full-resolution URL (also used for the External-open action). */
   url: string;
+  /**
+   * Issue 011: optional 1024px-max-edge WebP preview. The lightbox
+   * renders this in the image frame to keep payload small while still
+   * looking sharp at viewport-fit. The full-res ``url`` is kept for
+   * the external-open / download action.
+   */
+  mdUrl?: string;
   /** Stable room id used to look up the up-to-date room in the latest project. */
   roomId: string;
   roomLabel: string;
@@ -260,7 +268,9 @@ export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRege
                 "bg-neutral-900/80",
               )}>
                 <StorageImage
-                  src={image.url}
+                  variant="md"
+                  mdUrl={image.mdUrl ?? image.url}
+                  originalUrl={image.url}
                   alt={`${image.roomLabel} variation ${image.variationIndex + 1}`}
                   className={cn(
                     "block max-w-[88vw] sm:max-w-[82vw] lg:max-w-4xl max-h-[calc(100vh-10rem)] w-auto h-auto object-contain",
@@ -268,14 +278,7 @@ export function ImageLightbox({ image, onClose, onNavigate, onRegenerate, isRege
                   )}
                   fallbackClassName="w-[60vw] sm:w-[50vw] lg:w-[40vw] aspect-[4/3] rounded-xl bg-neutral-900/80"
                   fallbackText="Image could not be loaded"
-                  overlay={
-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none">
-                      <div className="h-12 w-12 rounded-full bg-white/[0.05] flex items-center justify-center">
-                        <ImageOff className="h-6 w-6 text-white/20" />
-                      </div>
-                      <span className="text-sm text-white/30">Image could not be loaded</span>
-                    </div>
-                  }
+                  retryLabel={`Retry loading ${image.roomLabel} variation ${image.variationIndex + 1}`}
                 />
                 {isRegenerating && (
                   <div className="absolute inset-0 flex items-center justify-center">

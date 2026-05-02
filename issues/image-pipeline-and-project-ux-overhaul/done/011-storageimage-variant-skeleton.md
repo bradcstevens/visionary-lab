@@ -34,3 +34,21 @@ and user stories 1, 2, 3, 5.
 - User story 2
 - User story 3
 - User story 5
+
+## Notes (closed)
+
+Shipped: StorageImage variant prop + thumbUrl/mdUrl/originalUrl;
+skeleton shown when chosen variant URL is missing or while loading;
+on terminal load failure a Retry button (data-testid storage-image-retry)
+invalidates the SAS cache and remounts the <img>. VariationThumbnail
+now passes variant="thumb" and thumb_url; ImageLightbox passes
+variant="md" and the new mdUrl alongside the original. Variation type
+gained thumb_url/md_url; LightboxImage gained mdUrl.
+
+Playwright e2e tests for the grid (URLs contain .thumb.) and simulated
+load failure (retry control surfaces) are DEFERRED — they need an
+e2e fixture project with thumbnail-enabled variations and a backend
+that serves the .thumb. URLs. Behavior is pinned by 15 vitest tests
+covering variant resolution, skeleton states, the auto+manual retry
+flow, and src-change reset.
+

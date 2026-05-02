@@ -282,6 +282,7 @@ export default function ProjectDetailPage() {
     if (variation.status === 'completed' && variation.image_url) {
       setLightboxImage({
         url: variation.image_url,
+        mdUrl: variation.md_url,
         roomId: room.id,
         roomLabel: room.label,
         variationIndex,
@@ -295,7 +296,7 @@ export default function ProjectDetailPage() {
     const variation = lightboxImage.variations[variationIndex];
     if (variation?.status === 'completed' && variation.image_url) {
       setLightboxImage((prev) =>
-        prev ? { ...prev, variationIndex, url: variation.image_url! } : null
+        prev ? { ...prev, variationIndex, url: variation.image_url!, mdUrl: variation.md_url } : null
       );
     }
   };
