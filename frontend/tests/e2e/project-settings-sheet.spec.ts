@@ -2153,3 +2153,342 @@ test.describe('Issue 005 — Rooms manager delete with confirm', () => {
     ).toHaveText('Kitchen');
   });
 });
+
+/**
+ * Issue 006 — Rooms manager add photos with analysis + retry.
+ *
+ * Add-photos in `ProjectRoomsManager`. The flow is upload → analyze →
+ * refresh, and on a soft analyze failure the user gets a toast with a
+ * "Retry analysis" action. The component's narrow prop interface is
+ * preserved — all of this lives inside ProjectRoomsManager.
+ *
+ * Test coverage map (PRD AC for issue 006):
+ *
+ *   1. Happy path — file picker → POST /rooms → POST /analyze →
+ *      GET project → new row appears with analyzed metadata,
+ *      onProjectUpdate flowed to setProject (no reload), no
+ *      brief-generation endpoint hit.
+ *
+ *   2. Analyze failure with retry — POST /rooms succeeds, POST
+ *      /analyze 500, GET project still fires + new row appears,
+ *      toast renders with "Retry analysis" action, clicking it
+ *      re-runs /analyze + /project (no second POST /rooms).
+ *
+ * The mock's applyRoomUpload mirrors the backend's upload_rooms
+ * handler (filename → label fallback, append to rooms list) so a
+ * regression that fails to refetch wouldn't silently pass via
+ * mock-state divergence.
+ */
+
+const ADD_PHOTOS_PROJECT_ID = 'test-rooms-add-photos';
+
+interface MockAddPhotosProject extends MockRoomsProject {
+  id: string;
+}
+
+function makeAddPhotosProject(): MockAddPhotosProject {
+  const base = makeRoomsProject();
+  return {
+    ...base,
+    id: ADD_PHOTOS_PROJECT_ID,
+    rooms: base.rooms.map((r) => ({
+      ...r,
+      original_image_url: r.original_image_url.replace(
+        ROOMS_PROJECT_ID,
+        ADD_PHOTOS_PROJECT_ID,
+      ),
+      original_thumbnail_url: r.original_thumbnail_url
+        ? r.original_thumbnail_url.replace(ROOMS_PROJECT_ID, ADD_PHOTOS_PROJECT_ID)
+        : null,
+    })),
+  };
+}
+
+function applyRoomUpload(
+  state: MockAddPhotosProject,
+  filenames: string[],
+  analyzed: boolean,
+): MockAddPhotosProject {
+  const now = new Date().toISOString();
+  const newRooms = filenames.map((fn, i) => ({
+    id: `new-room-${i}-${fn.replace(/[^a-z0-9]/gi, '-')}`,
+    // After analysis, the label would be a friendly name. Pre-analysis
+    // we fall back to filename-as-label so the regression — "renders
+    // analyzed metadata" — depends on the analyze step actually running.
+    label: analyzed ? `Analyzed ${fn}` : fn,
+    original_image_url: `https://storage.blob.core.windows.net/images/staging/${ADD_PHOTOS_PROJECT_ID}/originals/${fn}`,
+    original_thumbnail_url: `https://storage.blob.core.windows.net/images/staging/${ADD_PHOTOS_PROJECT_ID}/originals/${fn}-thumb.png`,
+    status: 'completed' as const,
+    prompt_addendum: null,
+    variations: [],
+    created_at: now,
+    updated_at: now,
+  }));
+  return {
+    ...state,
+    rooms: [...state.rooms, ...newRooms],
+  };
+}
+
+async function setupAddPhotosBriefTripwire(
+  page: Page,
+  hits: string[],
+): Promise<void> {
+  // Tripwire: any brief-generation endpoint MUST NOT be called by the
+  // add-photos flow. POST /brief is the wizard's brief-generation
+  // endpoint; PUT /brief is the explicit brief-save path.
+  await page.route(
+    new RegExp(`${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}/brief`),
+    (route: Route) => {
+      hits.push(route.request().method() + ' ' + route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ brief: {} }),
+      });
+    },
+  );
+}
+
+test.describe('Issue 006 — Rooms manager add photos', () => {
+  test('happy path: pick files → upload → analyze → refresh; new row appears with analyzed metadata; no brief-generate hit', async ({
+    page,
+  }) => {
+    let projectState = makeAddPhotosProject();
+    let analyzed = false;
+    const uploadCalls: string[] = [];
+    const analyzeCalls: string[] = [];
+    const getProjectCalls: string[] = [];
+    const briefHits: string[] = [];
+
+    await setupSasTokenMock(page);
+    await setupAddPhotosBriefTripwire(page, briefHits);
+
+    // GET project (initial load + final refresh).
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          getProjectCalls.push(route.request().url());
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    // POST /rooms — upload. Capture the labels payload to assert
+    // filenames flow through correctly.
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}/rooms`,
+      async (route: Route) => {
+        if (route.request().method() === 'POST') {
+          uploadCalls.push(route.request().url());
+          // Filenames the client uploaded (we read from the multipart
+          // body's labels field; if not present, fall back to a
+          // synthetic name so the test still exercises the chain).
+          const post = route.request().postData() ?? '';
+          const labelsMatch = post.match(/"labels"\s*\r?\n\r?\n(\[.*?\])/);
+          let filenames = ['extra.png'];
+          if (labelsMatch) {
+            try {
+              filenames = JSON.parse(labelsMatch[1]);
+            } catch {}
+          }
+          projectState = applyRoomUpload(projectState, filenames, false);
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              project_id: ADD_PHOTOS_PROJECT_ID,
+              rooms_added: filenames.length,
+              rooms: [],
+            }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    // POST /analyze — flip analyzed flag so post-refresh rooms show
+    // "Analyzed <fn>" labels. Without analyze running, the label
+    // remains the raw filename — and the "renders analyzed metadata"
+    // assertion would fail.
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}/analyze`,
+      (route: Route) => {
+        analyzeCalls.push(route.request().url());
+        analyzed = true;
+        // The mock now updates the most-recently-added rooms' labels
+        // to reflect analysis output.
+        projectState = {
+          ...projectState,
+          rooms: projectState.rooms.map((r) =>
+            r.id.startsWith('new-room-') ? { ...r, label: r.label.startsWith('Analyzed ') ? r.label : `Analyzed ${r.label}` } : r,
+          ),
+        };
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ analyses: [] }),
+        });
+      },
+    );
+
+    await page.goto(`/projects/${ADD_PHOTOS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+    await expect(page.getByTestId('project-rooms-manager')).toBeVisible();
+
+    // Both initial rooms.
+    await expect(page.getByTestId('project-rooms-manager-row-room-A')).toBeVisible();
+    await expect(page.getByTestId('project-rooms-manager-row-room-B')).toBeVisible();
+
+    // Add photos — set files directly on the hidden input.
+    const fileInput = page.getByTestId('project-rooms-manager-add-photos-input');
+    await fileInput.setInputFiles([
+      {
+        name: 'extra.png',
+        mimeType: 'image/png',
+        buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      },
+    ]);
+
+    // Upload, analyze, and refresh all fire in order.
+    await expect.poll(() => uploadCalls.length).toBe(1);
+    await expect.poll(() => analyzeCalls.length).toBe(1);
+    await expect.poll(() => getProjectCalls.length).toBeGreaterThanOrEqual(2);
+
+    // New row appears in the rooms list with analyzed metadata.
+    const newRowLabel = page.getByTestId(
+      'project-rooms-manager-label-new-room-0-extra-png',
+    );
+    await expect(newRowLabel).toHaveText('Analyzed extra.png');
+    expect(analyzed).toBe(true);
+
+    // No brief-generation endpoint was hit.
+    expect(briefHits).toEqual([]);
+  });
+
+  test('analyze failure: rooms still appear, toast offers Retry analysis, retry re-runs analyze + refresh without re-upload', async ({
+    page,
+  }) => {
+    let projectState = makeAddPhotosProject();
+    const uploadCalls: string[] = [];
+    const analyzeCalls: string[] = [];
+    const getProjectCalls: string[] = [];
+    let analyzeShouldFail = true;
+
+    await setupSasTokenMock(page);
+
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}`,
+      (route: Route) => {
+        if (route.request().method() === 'GET') {
+          getProjectCalls.push(route.request().url());
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ project: projectState }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}/rooms`,
+      (route: Route) => {
+        if (route.request().method() === 'POST') {
+          uploadCalls.push(route.request().url());
+          projectState = applyRoomUpload(projectState, ['extra.png'], false);
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              project_id: ADD_PHOTOS_PROJECT_ID,
+              rooms_added: 1,
+              rooms: [],
+            }),
+          });
+        }
+        return route.continue();
+      },
+    );
+
+    await page.route(
+      `${API_BASE}/staging/projects/${ADD_PHOTOS_PROJECT_ID}/analyze`,
+      (route: Route) => {
+        analyzeCalls.push(route.request().url());
+        if (analyzeShouldFail) {
+          return route.fulfill({
+            status: 500,
+            contentType: 'application/json',
+            body: JSON.stringify({ detail: 'analyzer offline' }),
+          });
+        }
+        // On retry: succeed and label the rooms.
+        projectState = {
+          ...projectState,
+          rooms: projectState.rooms.map((r) =>
+            r.id.startsWith('new-room-') ? { ...r, label: `Analyzed ${r.label}` } : r,
+          ),
+        };
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ analyses: [] }),
+        });
+      },
+    );
+
+    await page.goto(`/projects/${ADD_PHOTOS_PROJECT_ID}`);
+    await page.waitForLoadState('networkidle');
+
+    await page.getByRole('button', { name: /more actions/i }).click();
+    await page.getByTestId('overflow-menu-project-settings').click();
+
+    const fileInput = page.getByTestId('project-rooms-manager-add-photos-input');
+    await fileInput.setInputFiles([
+      {
+        name: 'extra.png',
+        mimeType: 'image/png',
+        buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      },
+    ]);
+
+    // Upload + analyze (failed) + refresh all fired.
+    await expect.poll(() => uploadCalls.length).toBe(1);
+    await expect.poll(() => analyzeCalls.length).toBe(1);
+    await expect.poll(() => getProjectCalls.length).toBeGreaterThanOrEqual(2);
+
+    // New row appears (upload preserved despite analyze failure) but
+    // with the un-analyzed (raw filename) label.
+    const newRowLabel = page.getByTestId(
+      'project-rooms-manager-label-new-room-0-extra-png',
+    );
+    await expect(newRowLabel).toHaveText('extra.png');
+
+    // Toast surfaced with "Retry analysis" action.
+    const retry = page.getByRole('button', { name: /retry analysis/i });
+    await expect(retry).toBeVisible();
+
+    // Click retry — analyze is now configured to succeed.
+    analyzeShouldFail = false;
+    await retry.click();
+
+    // Analyze fires again, refresh fires again. Upload does NOT fire
+    // a second time.
+    await expect.poll(() => analyzeCalls.length).toBe(2);
+    await expect.poll(() => getProjectCalls.length).toBeGreaterThanOrEqual(3);
+    expect(uploadCalls.length).toBe(1);
+
+    // Row label updates to the analyzed value.
+    await expect(newRowLabel).toHaveText('Analyzed extra.png');
+  });
+});

@@ -622,3 +622,267 @@ describe("ProjectRoomsManager — issue 005 — mutual exclusion across rows", (
     ).toBe(true);
   });
 });
+
+/**
+ * Issue 006 — add-photos with analysis + retry.
+ *
+ * Vitest covers the upload→analyze→refresh sequence and the retry
+ * flow at the component level. The Playwright integration spec
+ * exercises the same flow at the network boundary.
+ */
+describe("ProjectRoomsManager — issue 006 add photos", () => {
+  let uploadRoomsSpy: ReturnType<typeof vi.spyOn>;
+  let analyzeImagesSpy: ReturnType<typeof vi.spyOn>;
+  let getProjectSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    uploadRoomsSpy = vi.spyOn(stagingApi, "uploadRooms");
+    analyzeImagesSpy = vi.spyOn(stagingApi, "analyzeImages");
+    getProjectSpy = vi.spyOn(stagingApi, "getProject");
+  });
+
+  function makeFile(name: string): File {
+    return new File([new Uint8Array([0])], name, { type: "image/png" });
+  }
+
+  it("renders an Add photos affordance below the rooms list", () => {
+    const project = makeProject();
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />);
+    expect(screen.getByTestId("project-rooms-manager-add-photos")).toBeTruthy();
+  });
+
+  it("renders an Add photos affordance even when there are no rooms yet", () => {
+    const project = makeProject({ rooms: [] });
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />);
+    expect(screen.getByTestId("project-rooms-manager-empty")).toBeTruthy();
+    expect(screen.getByTestId("project-rooms-manager-add-photos")).toBeTruthy();
+  });
+
+  it("clicking Add photos opens the hidden file input", () => {
+    const project = makeProject();
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />);
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    const inputClickSpy = vi.spyOn(input, "click");
+    fireEvent.click(screen.getByTestId("project-rooms-manager-add-photos"));
+    expect(inputClickSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("happy path: selecting files runs upload → analyze → getProject in order, then onProjectUpdate", async () => {
+    const project = makeProject();
+    const refreshed = makeProject({ name: "Refreshed" });
+    uploadRoomsSpy.mockResolvedValue([]);
+    analyzeImagesSpy.mockResolvedValue([]);
+    getProjectSpy.mockResolvedValue(refreshed);
+    const onProjectUpdate = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ProjectRoomsManager project={project} onProjectUpdate={onProjectUpdate} disabled={false} />,
+    );
+
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    const f1 = makeFile("a.png");
+    const f2 = makeFile("b.png");
+    fireEvent.change(input, { target: { files: [f1, f2] } });
+
+    await waitFor(() => expect(onProjectUpdate).toHaveBeenCalledWith(refreshed));
+
+    expect(uploadRoomsSpy).toHaveBeenCalledTimes(1);
+    expect(uploadRoomsSpy).toHaveBeenCalledWith("proj-rooms", [
+      { file: f1, name: "a.png" },
+      { file: f2, name: "b.png" },
+    ]);
+    expect(analyzeImagesSpy).toHaveBeenCalledWith("proj-rooms");
+    expect(getProjectSpy).toHaveBeenCalledWith("proj-rooms");
+
+    // Order: upload before analyze before getProject.
+    const uploadOrder = uploadRoomsSpy.mock.invocationCallOrder[0];
+    const analyzeOrder = analyzeImagesSpy.mock.invocationCallOrder[0];
+    const getProjectOrder = getProjectSpy.mock.invocationCallOrder[0];
+    expect(uploadOrder).toBeLessThan(analyzeOrder);
+    expect(analyzeOrder).toBeLessThan(getProjectOrder);
+    expect(toastErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it("upload failure: shows error toast, does not call analyze or getProject, does not call onProjectUpdate", async () => {
+    const project = makeProject();
+    uploadRoomsSpy.mockRejectedValue(new Error("upload broke"));
+    const onProjectUpdate = vi.fn();
+
+    render(
+      <ProjectRoomsManager project={project} onProjectUpdate={onProjectUpdate} disabled={false} />,
+    );
+
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile("a.png")] } });
+
+    await waitFor(() => expect(toastErrorSpy).toHaveBeenCalled());
+    expect(toastErrorSpy.mock.calls[0][0]).toBe("upload broke");
+    expect(analyzeImagesSpy).not.toHaveBeenCalled();
+    expect(getProjectSpy).not.toHaveBeenCalled();
+    expect(onProjectUpdate).not.toHaveBeenCalled();
+  });
+
+  it("analyze failure: still refetches project + propagates rooms; toast offers Retry analysis action that re-runs analyze + refresh", async () => {
+    const project = makeProject();
+    const refreshed = makeProject({ name: "Refreshed" });
+    uploadRoomsSpy.mockResolvedValue([]);
+    analyzeImagesSpy.mockRejectedValueOnce(new Error("analyze broke"));
+    getProjectSpy.mockResolvedValue(refreshed);
+    const onProjectUpdate = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ProjectRoomsManager project={project} onProjectUpdate={onProjectUpdate} disabled={false} />,
+    );
+
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile("a.png")] } });
+
+    await waitFor(() => expect(onProjectUpdate).toHaveBeenCalledWith(refreshed));
+    await waitFor(() => expect(toastErrorSpy).toHaveBeenCalled());
+    const toastCall = toastErrorSpy.mock.calls[0];
+    expect(toastCall[0]).toBe("Couldn't analyze the new photos.");
+    const opts = toastCall[1] as {
+      description: string;
+      action: { label: string; onClick: () => void };
+    };
+    expect(opts.description).toBe("analyze broke");
+    expect(opts.action.label).toBe("Retry analysis");
+
+    // Retry: re-runs analyzeImages + getProject, no second upload.
+    analyzeImagesSpy.mockResolvedValueOnce([]);
+    onProjectUpdate.mockClear();
+    getProjectSpy.mockClear();
+    getProjectSpy.mockResolvedValue(refreshed);
+    opts.action.onClick();
+    await waitFor(() => expect(onProjectUpdate).toHaveBeenCalledWith(refreshed));
+    expect(uploadRoomsSpy).toHaveBeenCalledTimes(1);
+    expect(analyzeImagesSpy).toHaveBeenCalledTimes(2);
+    expect(getProjectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT call generateBrief as part of the add flow", async () => {
+    const project = makeProject();
+    const refreshed = makeProject({ name: "Refreshed" });
+    uploadRoomsSpy.mockResolvedValue([]);
+    analyzeImagesSpy.mockResolvedValue([]);
+    getProjectSpy.mockResolvedValue(refreshed);
+    const generateBriefSpy = vi.spyOn(stagingApi, "generateBrief");
+
+    render(
+      <ProjectRoomsManager
+        project={project}
+        onProjectUpdate={vi.fn().mockResolvedValue(undefined)}
+        disabled={false}
+      />,
+    );
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile("a.png")] } });
+
+    await waitFor(() => expect(getProjectSpy).toHaveBeenCalled());
+    expect(generateBriefSpy).not.toHaveBeenCalled();
+  });
+
+  it("disables Add photos when the disabled prop is true", () => {
+    const project = makeProject();
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={true} />);
+    expect(
+      (screen.getByTestId("project-rooms-manager-add-photos") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("disables Add photos while a row is in rename-edit mode (mutual exclusion)", () => {
+    const project = makeProject();
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />);
+    fireEvent.click(screen.getByTestId("project-rooms-manager-edit-room-A"));
+    expect(
+      (screen.getByTestId("project-rooms-manager-add-photos") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("disables Add photos while a row is in delete-confirm mode (mutual exclusion)", () => {
+    const project = makeProject();
+    render(<ProjectRoomsManager project={project} onProjectUpdate={() => {}} disabled={false} />);
+    fireEvent.click(screen.getByTestId("project-rooms-manager-delete-room-A"));
+    expect(
+      (screen.getByTestId("project-rooms-manager-add-photos") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("disables row pencil + trash while add-photos is in flight (mutual exclusion)", async () => {
+    const project = makeProject();
+    let resolveUpload: ((value: unknown) => void) | null = null;
+    uploadRoomsSpy.mockReturnValue(
+      new Promise((resolve) => {
+        resolveUpload = resolve;
+      }) as ReturnType<typeof stagingApi.uploadRooms>,
+    );
+    analyzeImagesSpy.mockResolvedValue([]);
+    getProjectSpy.mockResolvedValue(project);
+
+    render(
+      <ProjectRoomsManager
+        project={project}
+        onProjectUpdate={vi.fn().mockResolvedValue(undefined)}
+        disabled={false}
+      />,
+    );
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile("a.png")] } });
+
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("project-rooms-manager-edit-room-A") as HTMLButtonElement).disabled,
+      ).toBe(true);
+    });
+    expect(
+      (screen.getByTestId("project-rooms-manager-delete-room-A") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    resolveUpload?.([]);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("project-rooms-manager-edit-room-A") as HTMLButtonElement).disabled,
+      ).toBe(false);
+    });
+  });
+
+  it("rapid second change while upload is in flight does not fire upload twice", async () => {
+    const project = makeProject();
+    let resolveUpload: ((value: unknown) => void) | null = null;
+    uploadRoomsSpy.mockReturnValue(
+      new Promise((resolve) => {
+        resolveUpload = resolve;
+      }) as ReturnType<typeof stagingApi.uploadRooms>,
+    );
+    analyzeImagesSpy.mockResolvedValue([]);
+    getProjectSpy.mockResolvedValue(project);
+    render(
+      <ProjectRoomsManager
+        project={project}
+        onProjectUpdate={vi.fn().mockResolvedValue(undefined)}
+        disabled={false}
+      />,
+    );
+    const input = screen.getByTestId(
+      "project-rooms-manager-add-photos-input",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [makeFile("a.png")] } });
+    fireEvent.change(input, { target: { files: [makeFile("b.png")] } });
+
+    await waitFor(() => expect(uploadRoomsSpy).toHaveBeenCalled());
+    expect(uploadRoomsSpy).toHaveBeenCalledTimes(1);
+    resolveUpload?.([]);
+  });
+});

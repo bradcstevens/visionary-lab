@@ -1,22 +1,30 @@
 "use client";
 
-import { useState } from "react";
-import { Loader2, Pencil, Save, Trash2, X } from "lucide-react";
+import { useRef, useState } from "react";
+import { ImagePlus, Loader2, Pencil, Save, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { StorageImage } from "./StorageImage";
-import { removeRoom, updateRoom, type StagingProject } from "@/services/stagingApi";
+import {
+  analyzeImages,
+  getProject,
+  removeRoom,
+  updateRoom,
+  uploadRooms,
+  type StagingProject,
+} from "@/services/stagingApi";
 
 /**
- * Project rooms manager — issues 004 + 005 of the project-settings-
- * completeness PRD.
+ * Project rooms manager — issues 004 + 005 + 006 of the project-
+ * settings-completeness PRD.
  *
  * Mounted on the Project Settings sheet between the project-level
  * fields (name, prompt) and the generation settings (variations, model,
  * quality, size). Renders the project's rooms as a vertical list with
- * an inline rename affordance and an inline delete-with-confirm
- * affordance per row. Issue 006 will add an "Add photos" affordance.
+ * an inline rename affordance, an inline delete-with-confirm
+ * affordance per row, and an "Add photos" affordance below the list
+ * that runs the same upload→analyze→refresh sequence the wizard does.
  *
  * Design constraints (per PRD § Implementation Decisions and the
  * issues' "Acceptance criteria" sections):
@@ -104,6 +112,15 @@ export function ProjectRoomsManager({
   const [deletingRoomId, setDeletingRoomId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // Issue 006 — add-photos state. Tracks the upload→analyze→refresh
+  // pipeline so the button can show a spinner / disable other row
+  // affordances while in flight, and so analysis-only retries (after
+  // a partial failure) reuse the same in-flight guard. The hidden
+  // file <input> is reset on each open so selecting the same file
+  // twice in a row still re-triggers `onChange`.
+  const [addingPhotos, setAddingPhotos] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // Mutual exclusion (issue 005): a row is "elsewhere active" if any
   // OTHER row is currently editing, saving a rename, in delete-confirm,
   // or being deleted. Used to disable a row's pencil + trash buttons
@@ -113,7 +130,8 @@ export function ProjectRoomsManager({
     editingRoomId !== null ||
     savingRoomId !== null ||
     deleteConfirmRoomId !== null ||
-    deletingRoomId !== null;
+    deletingRoomId !== null ||
+    addingPhotos;
 
   const handleEditClick = (roomId: string, currentLabel: string) => {
     setEditingRoomId(roomId);
@@ -203,6 +221,147 @@ export function ProjectRoomsManager({
     }
   };
 
+  // Issue 006 — add-photos handlers.
+  //
+  // The flow is upload → analyze → refresh, executed in order:
+  //
+  //   1. `uploadRooms` creates the new room records on the server.
+  //   2. `analyzeImages` runs the same per-image analysis pipeline
+  //      the wizard uses so labels and per-image notes are populated.
+  //   3. `getProject` refetches the canonical project state so the
+  //      caller's `onProjectUpdate` receives the SAS-resolved
+  //      payload (the page-level handler runs `resolveImageUrls`
+  //      then `setProject`).
+  //
+  // Failure handling matches the issue 006 acceptance criteria:
+  //   - Step 1 (upload) failure: error toast, no project state
+  //     mutation.
+  //   - Step 2 (analyze) failure: the upload IS preserved (rooms
+  //     exist on the server). We still refetch + propagate so the
+  //     new rows render, then surface a non-blocking toast offering
+  //     a "Retry analysis" action that re-runs analyzeImages +
+  //     refresh. The retry path reuses `addingPhotos` as its
+  //     in-flight guard so a click-spam during retry is harmless.
+  //   - Step 3 (refresh) failure: surfaced as an error toast. The
+  //     server-side state (rooms + analyses) IS persisted, so the
+  //     next mount or reload will pick it up.
+  //
+  // The design brief is intentionally NOT regenerated as part of
+  // this flow (the user keeps their edits; the existing Brief tab
+  // + Regenerate banner remain the path).
+
+  const refreshProjectAfterAnalysis = async () => {
+    const updated = await getProject(project.id);
+    await onProjectUpdate(updated);
+  };
+
+  const retryAnalysis = async () => {
+    if (addingPhotos) return;
+    setAddingPhotos(true);
+    try {
+      await analyzeImages(project.id);
+      await refreshProjectAfterAnalysis();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to analyze the new photos";
+      toast.error("Couldn't analyze the new photos.", {
+        description: message,
+        action: { label: "Retry analysis", onClick: () => void retryAnalysis() },
+      });
+    } finally {
+      setAddingPhotos(false);
+    }
+  };
+
+  const handleAddPhotosClick = () => {
+    if (disabled || addingPhotos || someRowIsActive) return;
+    fileInputRef.current?.click();
+  };
+
+  const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    // Reset the input value so re-selecting the same file fires
+    // onChange again. Done eagerly so an early return below still
+    // leaves the input in a clean state.
+    event.target.value = "";
+    if (files.length === 0) return;
+    if (addingPhotos) return;
+
+    setAddingPhotos(true);
+    try {
+      // Step 1: upload. A failure here is hard — no rooms were
+      // created server-side, so we surface an error toast and bail
+      // without mutating project state.
+      try {
+        await uploadRooms(
+          project.id,
+          files.map((file) => ({ file, name: file.name })),
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to upload photos";
+        toast.error(message);
+        return;
+      }
+
+      // Step 2: analyze. A failure here is soft — the rooms exist
+      // on the server, so we DON'T abort. We still refetch the
+      // project so the new rows render, then offer a retry action.
+      let analyzeError: string | null = null;
+      try {
+        await analyzeImages(project.id);
+      } catch (err) {
+        analyzeError = err instanceof Error ? err.message : "Failed to analyze the new photos";
+      }
+
+      // Step 3: refresh. Always run so the new rows propagate
+      // regardless of whether analysis succeeded.
+      try {
+        await refreshProjectAfterAnalysis();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to refresh project";
+        toast.error(message);
+        return;
+      }
+
+      if (analyzeError) {
+        toast.error("Couldn't analyze the new photos.", {
+          description: analyzeError,
+          action: { label: "Retry analysis", onClick: () => void retryAnalysis() },
+        });
+      }
+    } finally {
+      setAddingPhotos(false);
+    }
+  };
+
+  const addPhotosDisabled = disabled || addingPhotos || someRowIsActive;
+  const addPhotosFooter = (
+    <div className="flex items-center gap-2 pt-1">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        data-testid="project-rooms-manager-add-photos-input"
+        onChange={handleFilesSelected}
+      />
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={handleAddPhotosClick}
+        disabled={addPhotosDisabled}
+        data-testid="project-rooms-manager-add-photos"
+      >
+        {addingPhotos ? (
+          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <ImagePlus className="mr-1.5 h-3.5 w-3.5" />
+        )}
+        Add photos
+      </Button>
+    </div>
+  );
+
   if (project.rooms.length === 0) {
     return (
       <div className="space-y-2" data-testid="project-rooms-manager">
@@ -213,6 +372,7 @@ export function ProjectRoomsManager({
         >
           No rooms yet.
         </p>
+        {addPhotosFooter}
       </div>
     );
   }
@@ -382,6 +542,7 @@ export function ProjectRoomsManager({
           );
         })}
       </ul>
+      {addPhotosFooter}
     </div>
   );
 }
