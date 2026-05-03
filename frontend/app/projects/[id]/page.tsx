@@ -25,6 +25,7 @@ import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
 import { getHeaderAction } from "@/utils/staging-header";
+import { getRecoveryState, type RecoveryState } from "@/utils/recovery-state";
 import { useActivityLog } from "@/context/activity-log-context";
 import { useRetryQueue } from "@/hooks/useRetryQueue";
 import { useGenerationFleet, type LostOp } from "@/hooks/useGenerationFleet";
@@ -863,8 +864,33 @@ export default function ProjectDetailPage() {
     }
   };
 
-  // Detect stale processing: project loaded with 'processing' but no active SSE stream
-  const isStaleProcessing = project?.status === 'processing' && !isAnyInFlight;
+  // Issue 002 of projects-page-stalled-stream-error-cleanup PRD:
+  // single recovery-state classifier replaces the prior trio of in-line
+  // banner blocks (`generationError`, `isStaleProcessing`, project-scope
+  // `fleet.lostOps`) and the now-deleted `isStaleProcessing` derived
+  // boolean. The banner block, the header `<Badge>`, and the header CTA
+  // visibility all derive from the single classifier so they cannot
+  // drift out of sync. Computed unconditionally (project may be null on
+  // first paint) using the project's current status (or 'pending' as a
+  // safe pre-load default that resolves to `kind: 'none'`).
+  const projectLostOps = fleet.lostOps.filter(
+    (op): op is Extract<LostOp, { kind: 'project' }> => op.kind === 'project',
+  );
+  const parsedGenerationError = generationError
+    ? parseApiError(generationError)
+    : null;
+  const recoveryState: RecoveryState = getRecoveryState({
+    projectStatus: project?.status ?? 'pending',
+    isAnyInFlight,
+    projectLostOps,
+    generationError: parsedGenerationError
+      ? {
+          statusCode: parsedGenerationError.statusCode ?? undefined,
+          detail: parsedGenerationError.detail ?? undefined,
+          raw: generationError ?? '',
+        }
+      : null,
+  });
 
   if (isLoading || !project) {
     return (
@@ -896,9 +922,35 @@ export default function ProjectDetailPage() {
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <h1 className="text-3xl font-bold">{project.name}</h1>
-              <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : project.status === 'processing' ? 'secondary' : 'outline'} className="text-xs">
-                {project.status === 'pending' ? 'ready' : project.status}
-              </Badge>
+              {(() => {
+                // Issue 002: badge derives from recoveryState.kind first
+                // so the header agrees with the unified banner below.
+                // `stream-lost` and `interrupted` share the `interrupted`
+                // label intentionally — they describe the same
+                // user-visible truth ("a previous run didn't finish").
+                if (recoveryState.kind === 'error') {
+                  return (
+                    <Badge variant="destructive" className="text-xs">
+                      error
+                    </Badge>
+                  );
+                }
+                if (
+                  recoveryState.kind === 'stream-lost' ||
+                  recoveryState.kind === 'interrupted'
+                ) {
+                  return (
+                    <Badge variant="secondary" className="text-xs">
+                      interrupted
+                    </Badge>
+                  );
+                }
+                return (
+                  <Badge variant={project.status === 'completed' ? 'default' : project.status === 'failed' ? 'destructive' : project.status === 'processing' ? 'secondary' : 'outline'} className="text-xs">
+                    {project.status === 'pending' ? 'ready' : project.status}
+                  </Badge>
+                );
+              })()}
             </div>
             {/* Issue 014 of image-pipeline-and-project-ux-overhaul PRD:
                 collapsed prompt header. Renders ``prompt_summary`` by
@@ -925,8 +977,12 @@ export default function ProjectDetailPage() {
           <div className="flex items-center gap-2 shrink-0">
             {/* Primary action — derived from a pure 3-state helper so the
                 label tells the truth (issue 002 of per-room-generation-control).
-                See `frontend/utils/staging-header.ts` for the contract. */}
-            {(() => {
+                See `frontend/utils/staging-header.ts` for the contract.
+                Issue 002 of projects-page-stalled-stream-error-cleanup
+                PRD: hidden (not disabled) while a recovery banner is
+                showing, so the page presents a single recovery path
+                instead of competing CTAs. */}
+            {recoveryState.kind === 'none' && (() => {
               const action = getHeaderAction(project.rooms);
               if (action.kind === 'hidden') return null;
               if (action.kind === 'generate') {
@@ -993,65 +1049,171 @@ export default function ProjectDetailPage() {
         </div>
       </div>
 
-      {/* Generation error banner */}
-      {generationError && (() => {
-        const parsed = parseApiError(generationError);
-        return (
-          <div className="overflow-hidden rounded-lg border border-destructive/20 bg-destructive/[0.04]">
-            <div className="flex items-start gap-3 p-4">
-              <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
-              <div className="flex-1 min-w-0 space-y-1">
-                <p className="text-sm font-medium text-destructive">
-                  Generation encountered an error
-                  {parsed.statusCode ? ` (${parsed.statusCode})` : ""}
-                </p>
-                {parsed.detail && (
-                  <Collapsible>
-                    <p className="text-xs text-destructive/80 line-clamp-2 break-words">
-                      {parsed.detail}
-                    </p>
-                    {(parsed.isTruncated || (parsed.detail?.length ?? 0) > 120) && (
-                      <CollapsibleTrigger className="group inline-flex items-center gap-1 text-[11px] text-destructive/60 hover:text-destructive transition-colors mt-1 cursor-pointer">
-                        <ChevronDown className="h-3 w-3 transition-transform group-data-[state=open]:rotate-180" />
-                        Full error
-                      </CollapsibleTrigger>
-                    )}
-                    <CollapsibleContent>
-                      <pre className="mt-2 rounded-md bg-destructive/[0.06] border border-destructive/10 px-3 py-2 text-[11px] text-destructive/70 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-                        {parsed.detail}{parsed.isTruncated && "…"}
-                      </pre>
-                    </CollapsibleContent>
-                  </Collapsible>
-                )}
+      {/* Issue 002 of projects-page-stalled-stream-error-cleanup PRD:
+          unified recovery banner. Replaces the three prior in-line
+          banner blocks (`generationError`, `isStaleProcessing`,
+          project-scope `fleet.lostOps`). The classifier resolves
+          precedence so exactly one arm renders. `data-testid` and
+          `data-recovery-kind` decouple test assertions from copy. */}
+      {recoveryState.kind === 'error' && (
+          <div
+            data-testid="recovery-banner"
+            data-recovery-kind="error"
+            className="overflow-hidden rounded-lg border border-destructive/20 bg-destructive/[0.04]"
+          >
+              <div className="flex items-start gap-3 p-4">
+                <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0 space-y-1">
+                  <p className="text-sm font-medium text-destructive">
+                    Generation encountered an error
+                    {parsedGenerationError?.statusCode ? ` (${parsedGenerationError.statusCode})` : ""}
+                  </p>
+                  {parsedGenerationError?.detail && (
+                    <Collapsible>
+                      <p className="text-xs text-destructive/80 line-clamp-2 break-words">
+                        {parsedGenerationError.detail}
+                      </p>
+                      {(parsedGenerationError.isTruncated || (parsedGenerationError.detail?.length ?? 0) > 120) && (
+                        <CollapsibleTrigger className="group inline-flex items-center gap-1 text-[11px] text-destructive/60 hover:text-destructive transition-colors mt-1 cursor-pointer">
+                          <ChevronDown className="h-3 w-3 transition-transform group-data-[state=open]:rotate-180" />
+                          Full error
+                        </CollapsibleTrigger>
+                      )}
+                      <CollapsibleContent>
+                        <pre
+                          data-testid="recovery-banner-detail"
+                          className="mt-2 rounded-md bg-destructive/[0.06] border border-destructive/10 px-3 py-2 text-[11px] text-destructive/70 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto"
+                        >
+                          {parsedGenerationError.detail}{parsedGenerationError.isTruncated && "…"}
+                        </pre>
+                      </CollapsibleContent>
+                    </Collapsible>
+                  )}
+                </div>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="recovery-banner-primary"
+                    onClick={() => {
+                      // PRD error-arm chain: clear `generationError`,
+                      // dismiss every project-scope lost op (in case
+                      // one coexists with the server error), then
+                      // regenerate. Single click leaves the page in
+                      // a fully cleared state.
+                      setGenerationError(null);
+                      fleet.lostOps
+                        .filter((op) => op.kind === 'project')
+                        .forEach((op) => fleet.dismissLostOp(op.id));
+                      retryQueue.clear();
+                      if (!isAnyInFlight) {
+                        startGeneration();
+                        toast.info('Regenerating all rooms...');
+                      }
+                    }}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                    Retry
+                  </Button>
+                  <p className="text-[11px] text-muted-foreground">
+                    Retries the failed run.
+                  </p>
+                </div>
               </div>
-              <Button size="sm" variant="outline" onClick={handleRegenerateAll} className="shrink-0">
+            </div>
+          )}
+
+      {recoveryState.kind === 'stream-lost' && (
+        <div
+          data-testid="recovery-banner"
+          data-recovery-kind="stream-lost"
+          className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg"
+        >
+          <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium">Generation stalled — no SSE events for 2 minutes</p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              The project-level stream watchdog fired. You can resume the existing run or dismiss this notice to re-sync with the server.
+            </p>
+          </div>
+          <div className="flex flex-col items-end gap-1 shrink-0">
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                data-testid="recovery-banner-secondary"
+                onClick={() => {
+                  // PRD: dismiss then re-sync with server.
+                  fleet.dismissLostOp(recoveryState.lostOpId);
+                  loadProject();
+                }}
+              >
+                Dismiss
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="recovery-banner-primary"
+                disabled={isAnyInFlight}
+                onClick={() => {
+                  // PRD: dismiss then startGeneration. NO
+                  // loadProject interleave — the POST response
+                  // reconciles state and inserting a fetch round-
+                  // trip risks the user clicking Retry again
+                  // before the start fires.
+                  fleet.dismissLostOp(recoveryState.lostOpId);
+                  startGeneration();
+                }}
+              >
                 <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                Retry
+                Retry generation
               </Button>
             </div>
+            <p className="text-[11px] text-muted-foreground">
+              Resumes the existing run.
+            </p>
           </div>
-        );
-      })()}
+        </div>
+      )}
 
-      {/* Stale processing recovery banner */}
-      {isStaleProcessing && (
-        <div className="flex items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-          <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
+      {recoveryState.kind === 'interrupted' && (
+        <div
+          data-testid="recovery-banner"
+          data-recovery-kind="interrupted"
+          className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg"
+        >
+          <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0 mt-0.5" />
           <div className="flex-1">
             <p className="text-sm font-medium">Generation was interrupted</p>
             <p className="text-xs text-muted-foreground mt-0.5">
-              A previous generation didn&apos;t finish. Reset to try again, or regenerate individual rooms.
+              A previous run didn&apos;t finish. Reset to start over, or refresh to re-sync with the server.
             </p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <Button size="sm" variant="outline" onClick={loadProject} disabled={isResetting}>
-              <RefreshCw className="h-3.5 w-3.5 mr-1" />
-              Refresh
-            </Button>
-            <Button size="sm" onClick={handleResetProject} disabled={isResetting}>
-              {isResetting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1" />}
-              Reset &amp; Retry
-            </Button>
+          <div className="flex flex-col items-end gap-1 shrink-0">
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="recovery-banner-secondary"
+                onClick={loadProject}
+                disabled={isResetting}
+              >
+                <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                Refresh
+              </Button>
+              <Button
+                size="sm"
+                data-testid="recovery-banner-primary"
+                onClick={handleResetProject}
+                disabled={isResetting}
+              >
+                {isResetting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1" />}
+                Reset &amp; Retry
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Discards prior progress and starts over.
+            </p>
           </div>
         </div>
       )}
@@ -1095,56 +1257,11 @@ export default function ProjectDetailPage() {
           variation status, the other off live job docs from SSE. */}
       <ProgressTracker kind="per-project" jobs={projectJobs.jobs} />
 
-      {/* Issue 007 of projects-page-improvements PRD: project-level
-          stream-lost banner. Renders when the watchdog fires on the
-          project-level stream. The user can Retry (replays via
-          startGeneration so the existing retryQueue.clear / toast /
-          activity-log side-effects all run as if the user clicked
-          Generate fresh) or Dismiss. The button is disabled if any
-          OTHER op is currently in flight (rubber-duck-flagged: lost-op
-          Retry must obey the same busy gates as the original click). */}
-      {fleet.lostOps
-        .filter((op): op is Extract<LostOp, { kind: 'project' }> => op.kind === 'project')
-        .map((op) => (
-          <div
-            key={op.id}
-            data-testid="stream-lost-banner-project"
-            className="flex items-center gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg"
-          >
-            <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0" />
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium">Stream lost — project generation stalled</p>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                No SSE events arrived for 2 minutes. Click Retry to start a fresh project generation.
-              </p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => fleet.dismissLostOp(op.id)}
-              >
-                Dismiss
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                data-testid="stream-lost-retry-project"
-                disabled={isAnyInFlight}
-                onClick={() => {
-                  // Dismiss the lost op, then route through the normal
-                  // page-level startGeneration path so retryQueue.clear,
-                  // activity-log, and toast side-effects all fire.
-                  fleet.dismissLostOp(op.id);
-                  startGeneration();
-                }}
-              >
-                <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                Retry
-              </Button>
-            </div>
-          </div>
-        ))}
+      {/* Issue 002 of projects-page-stalled-stream-error-cleanup PRD:
+          the project-level stream-lost banner has been collapsed into
+          the unified `recovery-banner` block above. Per-room
+          (room-scope) lost-op banners remain in the room-list section
+          below. */}
 
       {/* Room Groups */}
       <div className="space-y-12">

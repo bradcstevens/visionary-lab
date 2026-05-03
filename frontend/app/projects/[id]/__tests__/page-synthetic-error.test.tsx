@@ -203,7 +203,7 @@ describe('ProjectDetailPage — synthetic-watchdog error suppression', () => {
     });
 
     expect(
-      screen.queryByText(/Generation encountered an error/i),
+      screen.queryByTestId('recovery-banner'),
     ).toBeNull();
 
     expect(g.__toastSpy.error).toHaveBeenCalled();
@@ -227,9 +227,9 @@ describe('ProjectDetailPage — synthetic-watchdog error suppression', () => {
     });
 
     await waitFor(() => {
-      expect(
-        screen.getByText(/Generation encountered an error/i),
-      ).toBeTruthy();
+      const banner = screen.getByTestId('recovery-banner');
+      expect(banner).toBeTruthy();
+      expect(banner.getAttribute('data-recovery-kind')).toBe('error');
     });
   });
 });
