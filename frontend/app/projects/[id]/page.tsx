@@ -650,7 +650,16 @@ export default function ProjectDetailPage() {
           message: 'Generation error',
           detail: event.error || 'Unknown error',
         });
-        setGenerationError(event.error || 'Generation failed');
+        // Issue 001 of projects-page-stalled-stream-error-cleanup PRD:
+        // only real server-sent error events flip the destructive
+        // generationError banner. Watchdog-synthesized errors carry
+        // ``synthetic: true`` and are surfaced via the amber lost-op
+        // banner + activity log + toast above instead, so we don't
+        // double-paint a red banner for a transient stream-lost
+        // condition that the user can recover from with one click.
+        if (!event.synthetic) {
+          setGenerationError(event.error || 'Generation failed');
+        }
         toast.error(event.error || 'Generation failed');
         loadProject();
         // Issue 004 of failed-variation-retry-queue PRD: drop queued

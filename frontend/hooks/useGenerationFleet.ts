@@ -320,6 +320,13 @@ export function useGenerationFleet(
           record.userHandler({
             type: 'error',
             error: 'Stream lost — no SSE events for 2 minutes',
+            // Issue 001 of projects-page-stalled-stream-error-cleanup PRD:
+            // mark this event as fabricated by the watchdog so the page-
+            // level 'error' handler can suppress side-effects reserved
+            // for real backend errors (notably the destructive red
+            // banner). The amber lost-op banner remains the right
+            // surface for a stream-lost fire.
+            synthetic: true,
           });
         } catch {
           // Caller's handler threw — ignore (we still want to record

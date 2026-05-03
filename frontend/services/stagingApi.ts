@@ -137,6 +137,14 @@ export interface StagingStreamEvent {
   data?: any;
   message?: string;
   error?: string;
+  // Issue 001 of projects-page-stalled-stream-error-cleanup PRD: top-level
+  // discriminator stamped onto events fabricated by client-side machinery
+  // (e.g. the useGenerationFleet watchdog) so subscribers can distinguish
+  // them from real server-sent events. Real SSE frames from the backend
+  // never carry this field. Intentionally NOT plumbed through the
+  // serializer in stream*() — those parse JSON payloads off the wire
+  // and any `synthetic` field in the JSON would be untrusted noise.
+  synthetic?: boolean;
 }
 
 export type StagingStreamEventCallback = (event: StagingStreamEvent) => void;

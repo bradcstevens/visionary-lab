@@ -585,6 +585,11 @@ describe('useGenerationFleet — watchdog', () => {
     expect(lastCall).toMatchObject({
       type: 'error',
       error: expect.stringContaining('Stream lost'),
+      // Issue 001 of projects-page-stalled-stream-error-cleanup PRD:
+      // the synthesized event MUST carry ``synthetic: true`` so the
+      // page-level 'error' handler can distinguish it from real
+      // backend errors (and skip flipping the destructive red banner).
+      synthetic: true,
     });
   });
 
