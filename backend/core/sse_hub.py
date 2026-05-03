@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 #   yield (items: list[dict], continuation_token: str | None)
 #
 # The hub passes a resume-state dict on each call:
-#   {"continuation": Optional[str], "since": Optional[str]}
+#   {"continuation": Optional[str], "since": Optional[datetime]}
 # The source decides which (if either) to forward to the SDK.
 FeedSource = Callable[[dict], Iterable[tuple]]
 
@@ -88,7 +88,7 @@ class SSEHub:
         # Resume state — touched only on the worker thread inside
         # ``_collect_once``, so no lock needed.
         self._continuation: Optional[str] = None
-        self._since: Optional[str] = None
+        self._since: Optional[datetime] = None
 
     # ------------------------------------------------------------------
     # Subscriber surface
@@ -188,10 +188,10 @@ class SSEHub:
           ``_continuation`` to the latest token and clear ``_since``.
           A token always trumps a timestamp.
         - Items observed but no token → clear ``_continuation`` and
-          set ``_since`` to the ISO timestamp captured immediately
-          *before* the feed source was invoked. Using the pre-call
-          timestamp ensures the next poll catches anything written
-          while the prior poll was in flight.
+          set ``_since`` to the timezone-aware UTC ``datetime`` captured
+          immediately *before* the feed source was invoked. Using the
+          pre-call timestamp ensures the next poll catches anything
+          written while the prior poll was in flight.
         - No items and no token → leave both fields untouched. The
           previously-stored resume marker is preserved so we don't
           silently advance past unseen events.
@@ -201,7 +201,7 @@ class SSEHub:
         drained before the raise), so a failed poll still cannot
         silently advance past unseen events.
         """
-        poll_start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        poll_start_dt = datetime.now(timezone.utc)
         state = {"continuation": self._continuation, "since": self._since}
         out: list[dict] = []
         latest_token: Optional[str] = None
@@ -221,7 +221,7 @@ class SSEHub:
             self._since = None
         elif out:
             self._continuation = None
-            self._since = poll_start_iso
+            self._since = poll_start_dt
         # else: state untouched
         return out, err
 
@@ -263,7 +263,7 @@ async def get_sse_hub() -> SSEHub:
          (Cosmos resumes precisely where the prior poll left off).
       2. else ``state["since"]`` truthy → pass as ``start_time=``
          (resume by timestamp captured before the prior poll began).
-      3. else cold start → pass ``start_time=boot_iso`` so newly-
+      3. else cold start → pass ``start_time=boot_dt`` so newly-
          connected EventSource clients only see events that landed
          AFTER this replica started serving.
     """
@@ -276,7 +276,7 @@ async def get_sse_hub() -> SSEHub:
         from backend.core.job_store import JobStore  # local to avoid import cycles
 
         store = JobStore()
-        boot_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        boot_dt = datetime.now(timezone.utc)
 
         def _feed(state: dict):
             continuation = state.get("continuation")
@@ -285,7 +285,7 @@ async def get_sse_hub() -> SSEHub:
                 return store.subscribe_change_feed(continuation=continuation)
             if since:
                 return store.subscribe_change_feed(start_time=since)
-            return store.subscribe_change_feed(start_time=boot_iso)
+            return store.subscribe_change_feed(start_time=boot_dt)
 
         hub = SSEHub(feed_source=_feed)
         await hub.start()

@@ -301,32 +301,42 @@ async def test_resume_round_trip_token_appears_on_next_poll():
 @pytest.mark.asyncio
 async def test_since_fallback_when_items_yielded_without_token():
     """A poll that yields items but no token sets state['since'] on the
-    next poll to an ISO timestamp captured immediately before the
-    token-less poll began (NOT boot_iso, NOT poll-end time).
+    next poll to a timezone-aware UTC ``datetime`` captured immediately
+    before the token-less poll began (NOT boot time, NOT poll-end time).
 
-    Verified by patching ``sse_hub.time.strftime`` *only on the
-    sse_hub module's bound reference* so the global ``time`` module
-    is untouched.
+    Verified by patching ``sse_hub.datetime`` *only on the sse_hub
+    module's bound reference* so the global ``datetime`` module is
+    untouched.
+
+    The ``isinstance(..., datetime)`` assertion below is the
+    load-bearing regression pin: the SDK raises ``ValueError: Invalid
+    start_time`` if anyone reintroduces an ISO string here.
     """
+    from datetime import datetime, timezone
+
     import backend.core.sse_hub as sse_hub_mod
 
-    class FakeTime:
-        """Stand-in for the ``time`` module rebinding inside sse_hub."""
+    sentinel = datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc)
 
-        def __init__(self, real):
-            self._real = real
-            self.n = 0
+    class FakeDatetime:
+        """Stand-in for the ``datetime`` *class* rebinding inside sse_hub.
 
-        def strftime(self, fmt, t=None):
-            self.n += 1
-            if self.n == 1:
-                # First strftime call is poll_start_iso for the
-                # token-less producing poll.
-                return "2026-05-02T00:00:00Z"
-            return self._real.strftime(fmt, t) if t is not None else self._real.strftime(fmt, self._real.gmtime())
+        Only ``now`` is overridden; everything else delegates to the real
+        class so isinstance checks against ``datetime`` still work.
+        """
 
-        def gmtime(self, *a, **kw):
-            return self._real.gmtime(*a, **kw)
+        _real = datetime
+        n = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.n += 1
+            if cls.n == 1:
+                return sentinel
+            return cls._real.now(tz)
+
+        def __instancecheck__(cls, instance):  # pragma: no cover
+            return isinstance(instance, datetime)
 
     class ItemsNoToken:
         def __init__(self):
@@ -343,8 +353,8 @@ async def test_since_fallback_when_items_yielded_without_token():
 
     feed = ItemsNoToken()
     hub = SSEHub(feed_source=feed, poll_interval=0.01)
-    real_time = sse_hub_mod.time
-    sse_hub_mod.time = FakeTime(real_time)
+    real_datetime = sse_hub_mod.datetime
+    sse_hub_mod.datetime = FakeDatetime
     sub = await hub.subscribe("proj-A")
     try:
         await hub.start()
@@ -355,14 +365,18 @@ async def test_since_fallback_when_items_yielded_without_token():
             await asyncio.sleep(0.02)
         await hub.stop()
     finally:
-        sse_hub_mod.time = real_time
+        sse_hub_mod.datetime = real_datetime
         await sub.aclose()
 
     assert len(feed.calls) >= 2
     assert feed.calls[0] == {"continuation": None, "since": None}
-    # Next poll's `since` must be the timestamp captured BEFORE the
-    # producing poll, not boot_iso or any later wall-clock value.
-    assert feed.calls[1] == {"continuation": None, "since": "2026-05-02T00:00:00Z"}
+    # Next poll's `since` must be the datetime captured BEFORE the
+    # producing poll, and MUST be a real datetime (not an ISO string).
+    next_since = feed.calls[1]["since"]
+    assert feed.calls[1]["continuation"] is None
+    assert isinstance(next_since, datetime)
+    assert next_since is sentinel
+    assert next_since.tzinfo is not None
 
 
 @pytest.mark.asyncio
@@ -592,3 +606,55 @@ async def test_double_start_is_noop():
     await hub.start()
     await hub.start()  # no exception, single task
     await hub.stop()
+
+
+# ---------------------------------------------------------------------------
+# get_sse_hub cold-start: forwards a datetime, not an ISO string
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sse_hub_cold_start_forwards_datetime_to_subscribe_change_feed():
+    """Regression pin for the ``Invalid start_time`` bug.
+
+    On cold start, the ``_feed`` closure inside ``get_sse_hub`` calls
+    ``store.subscribe_change_feed(start_time=boot_dt)``. ``boot_dt``
+    MUST be a timezone-aware ``datetime`` — anything else (notably an
+    ISO 8601 string) raises ``ValueError: Invalid start_time`` on the
+    very first poll inside the Cosmos SDK.
+    """
+    from datetime import datetime, timezone
+
+    import backend.core.job_store as job_store_mod
+    import backend.core.sse_hub as sse_hub_mod
+
+    captured: dict = {}
+
+    class FakeStore:
+        def subscribe_change_feed(self, start_time=None, *, continuation=None):
+            captured["start_time"] = start_time
+            captured["continuation"] = continuation
+            # Return an empty single-page iterator so the pump idles.
+            def _gen():
+                yield [], None
+            return _gen()
+
+    real_store_cls = job_store_mod.JobStore
+    job_store_mod.JobStore = FakeStore  # type: ignore[assignment]
+    try:
+        await sse_hub_mod.reset_sse_hub_for_tests()
+        hub = await sse_hub_mod.get_sse_hub()
+        try:
+            for _ in range(100):
+                if "start_time" in captured:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await sse_hub_mod.reset_sse_hub_for_tests()
+    finally:
+        job_store_mod.JobStore = real_store_cls
+
+    assert "start_time" in captured, "feed source was never invoked"
+    assert captured["continuation"] is None
+    assert isinstance(captured["start_time"], datetime)
+    assert captured["start_time"].tzinfo is not None

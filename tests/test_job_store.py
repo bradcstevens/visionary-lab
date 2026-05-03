@@ -257,11 +257,13 @@ def test_subscribe_change_feed_continuation_takes_priority():
     ``start_time`` and no ``is_start_from_beginning``. Fixes the
     once-per-second ``ValueError: is_start_from_beginning and start_time
     are exclusive`` crash."""
+    from datetime import datetime, timezone
+
     store, container = _make_store_with_mock_container()
     iterator = _make_change_feed_iterator([], etag="t1")
     container.query_items_change_feed.return_value = iterator
 
-    list(store.subscribe_change_feed(start_time="2026-01-01T00:00:00Z", continuation="abc"))
+    list(store.subscribe_change_feed(start_time=datetime(2026, 1, 1, tzinfo=timezone.utc), continuation="abc"))
 
     kwargs = container.query_items_change_feed.call_args.kwargs
     assert kwargs == {"continuation": "abc"}
@@ -270,15 +272,26 @@ def test_subscribe_change_feed_continuation_takes_priority():
 
 
 def test_subscribe_change_feed_start_time_when_no_continuation():
-    """``start_time`` only — never together with ``is_start_from_beginning``."""
+    """``start_time`` only — never together with ``is_start_from_beginning``.
+
+    The kwarg forwarded to the SDK MUST be a ``datetime`` (not an ISO
+    8601 string): the Cosmos SDK raises ``ValueError: Invalid start_time``
+    on string input. The ``isinstance`` assertion below is the
+    load-bearing regression pin against reintroducing the bug."""
+    from datetime import datetime, timezone
+
     store, container = _make_store_with_mock_container()
     iterator = _make_change_feed_iterator([], etag="t2")
     container.query_items_change_feed.return_value = iterator
 
-    list(store.subscribe_change_feed(start_time="2026-01-01T00:00:00Z"))
+    when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    list(store.subscribe_change_feed(start_time=when))
 
     kwargs = container.query_items_change_feed.call_args.kwargs
-    assert kwargs == {"start_time": "2026-01-01T00:00:00Z"}
+    assert set(kwargs.keys()) == {"start_time"}
+    captured = kwargs["start_time"]
+    assert isinstance(captured, datetime)
+    assert captured is when
     assert "continuation" not in kwargs
     assert "is_start_from_beginning" not in kwargs
 

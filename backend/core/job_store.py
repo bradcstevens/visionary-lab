@@ -217,12 +217,19 @@ class JobStore:
 
     def subscribe_change_feed(
         self,
-        start_time: Optional[str] = None,
+        start_time: Optional[datetime] = None,
         *,
         continuation: Optional[str] = None,
     ) -> Iterator[tuple[list[dict[str, Any]], Optional[str]]]:
         """Yield ``(items, continuation_token)`` batches from the change
         feed across all partitions.
+
+        ``start_time`` is forwarded verbatim to the Cosmos SDK, which
+        accepts ``datetime`` (or the literal ``"Now"``/``"Beginning"``
+        sentinels, which this method does not expose) — passing an ISO
+        8601 string raises ``ValueError: Invalid start_time`` inside the
+        SDK on the first poll. Callers must pass a timezone-aware UTC
+        ``datetime``.
 
         Exactly one of the mutually-exclusive Cosmos resume kwargs
         (``continuation``, ``start_time``, or ``is_start_from_beginning``)
