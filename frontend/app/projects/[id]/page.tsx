@@ -1249,7 +1249,11 @@ export default function ProjectDetailPage() {
       )}
 
       {/* Progress Tracker */}
-      <ProgressTracker project={project} isGenerating={isAnyInFlight} />
+      <ProgressTracker
+        project={project}
+        isGenerating={isAnyInFlight}
+        projectRecoveryState={recoveryState}
+      />
 
       {/* Issue 009: per-project aggregate progress bar fed by useProjectJobs.
           Hidden when no active jobs (component returns null). Coexists with
@@ -1393,6 +1397,7 @@ export default function ProjectDetailPage() {
                   jobsByVariationId={jobsByVariationId}
                   roomIndex={index + 1}
                   totalRooms={project.rooms.length}
+                  projectRecoveryState={recoveryState}
                 />
               </div>
             );

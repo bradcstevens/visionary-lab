@@ -8,6 +8,8 @@ import {
   TERMINAL_JOB_STATUSES,
 } from "@/context/jobs-context";
 import { cn } from "@/utils/cn";
+import { RoomStatusPill } from "./RoomStatusPill";
+import type { RecoveryState } from "@/utils/recovery-state";
 
 // ---------------------------------------------------------------------------
 // Issue 009 — image-pipeline-and-project-ux-overhaul
@@ -64,6 +66,14 @@ interface SummaryProgressProps {
   kind?: "summary";
   project: StagingProject;
   isGenerating?: boolean;
+  /**
+   * Issue 003 of projects-page-stalled-stream-error-cleanup PRD: project-
+   * level recovery classification, threaded into RoomStatusPill so the
+   * summary card's per-room pills render the amber stalled treatment in
+   * sync with the room-list cards. Optional and defaults to
+   * `{ kind: 'none' }` for callers that haven't been migrated.
+   */
+  projectRecoveryState?: RecoveryState;
 }
 
 export type ProgressTrackerProps =
@@ -82,6 +92,7 @@ export function ProgressTracker(props: ProgressTrackerProps) {
     <SummaryTracker
       project={props.project}
       isGenerating={props.isGenerating}
+      projectRecoveryState={props.projectRecoveryState}
     />
   );
 }
@@ -185,9 +196,11 @@ function PerProjectBar({
 function SummaryTracker({
   project,
   isGenerating,
+  projectRecoveryState,
 }: {
   project: StagingProject;
   isGenerating?: boolean;
+  projectRecoveryState?: RecoveryState;
 }) {
   // Only show if project is processing
   if (project.status !== 'processing') {
@@ -203,20 +216,6 @@ function SummaryTracker({
   const progressPercentage = totalVariations > 0 
     ? (completedVariations / totalVariations) * 100 
     : 0;
-
-  const getRoomStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
-    switch (status) {
-      case 'completed':
-        return 'default';
-      case 'processing':
-        return 'secondary';
-      case 'failed':
-        return 'destructive';
-      case 'pending':
-      default:
-        return 'outline';
-    }
-  };
 
   // Stale = project is processing but no active SSE stream in this tab
   const isStale = !isGenerating;
@@ -260,9 +259,13 @@ function SummaryTracker({
 
             return (
               <div key={room.id} className="flex items-center gap-2">
-                <Badge variant={getRoomStatusVariant(room.status)} className="text-xs">
-                  {room.label}
-                </Badge>
+                <RoomStatusPill
+                  status={room.status}
+                  label={room.label}
+                  projectRecoveryState={
+                    projectRecoveryState ?? { kind: "none" }
+                  }
+                />
                 <span className="text-xs text-muted-foreground">
                   {roomCompletedVariations}/{roomTotalVariations}
                 </span>

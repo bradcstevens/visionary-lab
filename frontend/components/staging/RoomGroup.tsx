@@ -9,7 +9,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { RefreshCw, Clock, Info, AlertTriangle, Pencil, Loader2 } from "lucide-react";
 import { VariationThumbnail } from "./VariationThumbnail";
 import { StorageImage } from "./StorageImage";
+import { RoomStatusPill } from "./RoomStatusPill";
 import { Room } from "@/services/stagingApi";
+import type { RecoveryState } from "@/utils/recovery-state";
 
 interface RoomGroupProps {
   room: Room;
@@ -58,9 +60,19 @@ interface RoomGroupProps {
    */
   roomIndex?: number;
   totalRooms?: number;
+  /**
+   * Issue 003 of projects-page-stalled-stream-error-cleanup PRD: the
+   * project-level recovery classification. Threaded into RoomStatusPill
+   * so a room rendered while the project is in `interrupted` or
+   * `stream-lost` recovery shows the amber stalled treatment for its
+   * `processing` rooms. Optional and defaults to `{ kind: 'none' }`
+   * so callers that haven't been migrated keep rendering the four
+   * pre-existing visuals exactly as today.
+   */
+  projectRecoveryState?: RecoveryState;
 }
 
-export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds, jobsByVariationId, roomIndex, totalRooms }: RoomGroupProps) {
+export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenerateRoom, onRegenerateVariation, onEditPromptVariation, onUpdateAddendum, regeneratingVariationId, isRoomBusy, inFlightVariationIds, queuedVariationIds, jobsByVariationId, roomIndex, totalRooms, projectRecoveryState }: RoomGroupProps) {
   // Pencil-icon popover state for the per-room prompt addendum (issue 003 of
   // the projects-page-improvements PRD). The draft is reset to the persisted
   // value every time the popover opens so a Cancel followed by another open
@@ -92,20 +104,6 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
       setIsAddendumOpen(false);
     } finally {
       setIsSavingAddendum(false);
-    }
-  };
-
-  const getStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
-    switch (status) {
-      case 'completed':
-        return 'default';
-      case 'processing':
-        return 'secondary';
-      case 'failed':
-        return 'destructive';
-      case 'pending':
-      default:
-        return 'outline';
     }
   };
 
@@ -220,9 +218,10 @@ export function RoomGroup({ room, onVariationClick, onRetryVariation, onRegenera
               </PopoverContent>
             </Popover>
           )}
-          <Badge variant={getStatusVariant(room.status)} className="text-xs">
-            {room.status}
-          </Badge>
+          <RoomStatusPill
+            status={room.status}
+            projectRecoveryState={projectRecoveryState ?? { kind: "none" }}
+          />
           {totalCount > 0 && (
             <span className="text-xs text-muted-foreground">
               {completedCount}/{totalCount} variations
