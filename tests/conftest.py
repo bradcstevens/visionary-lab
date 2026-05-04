@@ -23,6 +23,15 @@ os.environ["AZURE_BLOB_IMAGE_CONTAINER"] = "images"
 os.environ["AZURE_BLOB_VIDEO_CONTAINER"] = "videos"
 os.environ["AZURE_COSMOS_DB_ENDPOINT"] = "https://test.documents.azure.com:443/"
 
+# Issue 001 of active-and-queued-jobs-ux-redesign PRD: ``backend/main.py``
+# now installs a FastAPI lifespan that auto-spawns an embedded JobWorker
+# in dev. Tests construct ``TestClient(app)`` (sometimes via
+# ``with TestClient(app) as client``) which runs the lifespan and would
+# otherwise try to construct a real JobWorker against mocked-but-not-
+# wired Cosmos / Storage Queue clients. Setting AUTO_START_WORKER=False
+# here makes the embedded-worker policy short-circuit during tests.
+os.environ["AUTO_START_WORKER"] = "False"
+
 # --- Module-level mocks ---
 # backend.core.__init__ creates real Azure SDK clients at import time
 # (DefaultAzureCredential, AzureOpenAI, BlobServiceClient, Sora, etc.).

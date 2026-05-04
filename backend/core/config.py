@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     # after smoke test.
     FEATURE_ASYNC_QUEUE: bool = True
 
+    # Issue 001 of active-and-queued-jobs-ux-redesign PRD: when true,
+    # the FastAPI lifespan auto-spawns an embedded JobWorker inside the
+    # API process so ``uv run fastapi dev`` is enough to drain the
+    # queue (the dedicated worker container is still the prod path).
+    # Defaults to True so dev "just works"; production overrides via
+    # ``infra/modules/containerApp.bicep`` setting AUTO_START_WORKER=False
+    # explicitly so a misconfigured deployment cannot accidentally start
+    # a second worker instance. See ``backend/core/embedded_worker.py``.
+    AUTO_START_WORKER: bool = True
+
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
 

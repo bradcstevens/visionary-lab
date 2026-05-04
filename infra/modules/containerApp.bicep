@@ -224,6 +224,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = if(deployNew) {
               name: 'CDN_BLOB_URL'
               value: CDN_BLOB_URL
             }
+            {
+              // Issue 001 of active-and-queued-jobs-ux-redesign PRD:
+              // belt-and-suspenders. ``backend/main.py`` lifespan
+              // auto-spawns an embedded JobWorker only when this flag
+              // is true and ROLE != 'worker'. Setting it explicitly
+              // to False on the API container ensures a deployment
+              // misconfiguration (or a pydantic-default flip) cannot
+              // accidentally start a second worker instance racing
+              // the dedicated worker Container App for the queue.
+              name: 'AUTO_START_WORKER'
+              value: 'False'
+            }
           ]
         }
       ]
