@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from fastapi import UploadFile
 
@@ -858,6 +858,162 @@ class StagingPipeline:
         project.status = ProjectStatusCalculator.compute_status(project.rooms)
         await self._persist_project_locked(project)
         yield {"type": "project_completed", "status": project.status}
+
+    async def generate_project_for_job(
+        self,
+        project: StagingProject,
+        *,
+        brief_prompts: Optional[Dict[str, Any]],
+        progress_callback: Callable[[Dict[str, Any]], None],
+        is_cancelled: Callable[[], bool],
+    ) -> Dict[str, Any]:
+        """Queue-friendly sibling to :py:meth:`generate_project`.
+
+        Mirrors the legacy async-generator's room/variation orchestration
+        but replaces ``yield`` with a synchronous ``progress_callback``
+        and adds an ``is_cancelled`` poll between events. Designed to be
+        invoked by the ``generate_project`` worker dispatcher (issue 005)
+        which provides callback shims that persist progress to JobStore.
+
+        Parameters
+        ----------
+        project:
+            The :class:`StagingProject` to generate. Mutated in-place
+            for status / room transitions just like the legacy path.
+        brief_prompts:
+            * If a dict — used verbatim, ``BriefGeneratorService.brief_to_prompts``
+              is NOT called. This is the **brief reuse on retry** contract:
+              the POST handler computes ``brief_prompts`` once and stashes
+              it on the queued job payload so a redelivery does not re-run
+              the LLM compose pass (cost + latency + non-determinism).
+            * If ``None`` AND ``project.design_brief`` is present — fall
+              back to the legacy compute path (mirrors ``generate_project``).
+            * If ``None`` AND no ``design_brief`` — pass an empty dict to
+              ``process_room`` so it falls back to per-room ``adapt_prompt``.
+        progress_callback:
+            Synchronous callable invoked once per event the legacy path
+            ``yield``s, plus a final ``project_completed`` event. The
+            dispatcher maps these to JobStore progress writes.
+        is_cancelled:
+            Synchronous predicate polled before every event delivery.
+            When it returns True we cancel in-flight room workers and
+            raise :class:`JobCancelled` so the worker routes the message
+            to ``complete`` (drop) rather than ``abandon`` (redeliver).
+
+        Returns
+        -------
+        dict
+            ``{"project_id": str, "status": ProjectStatus}`` — the result
+            payload the worker persists on the success path.
+
+        Raises
+        ------
+        JobCancelled
+            If ``is_cancelled()`` returns True at any polling point.
+        """
+        # Lazy import to avoid the circular ``job_worker`` <-> ``staging_pipeline``
+        # at module import time (job_worker imports nothing from the pipeline,
+        # but staging_dispatcher will eventually import both — keeping this
+        # local mirrors the existing late-import pattern for BriefGeneratorService).
+        from backend.core.job_worker import JobCancelled
+
+        if is_cancelled():
+            raise JobCancelled()
+
+        project.status = ProjectStatus.PROCESSING
+        await self._persist_project_locked(project)
+
+        if brief_prompts is None:
+            if project.design_brief:
+                from backend.core.brief_generator import BriefGeneratorService
+                from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+
+                brief = DBModel(**project.design_brief)
+                analyses = [ImageAnalysis(**a) for a in (project.analyses or [])]
+                brief_service = BriefGeneratorService(
+                    async_llm_client=self.async_llm_client,
+                    llm_deployment=self.llm_deployment,
+                )
+                brief_prompts = await brief_service.brief_to_prompts(
+                    brief=brief,
+                    image_analyses=analyses,
+                    n_variations=project.settings.variations_per_room,
+                )
+            else:
+                brief_prompts = {}
+
+        pending_rooms = [
+            r for r in project.rooms
+            if r.status in (ItemStatus.PENDING, ItemStatus.FAILED)
+        ]
+
+        if not pending_rooms:
+            project.status = ProjectStatusCalculator.compute_status(project.rooms)
+            await self._persist_project_locked(project)
+            progress_callback(
+                {"type": "project_completed", "status": project.status}
+            )
+            return {"project_id": project.id, "status": project.status}
+
+        # Same fan-out + queue-drain pattern as ``generate_project``.
+        # The progress_callback replaces ``yield``; is_cancelled() is
+        # polled at the top of each drain iteration so the check fires
+        # naturally between every variation event AND between every room
+        # event (both are emitted as queue items by ``process_room``).
+        _WORKER_DONE = object()
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _room_worker(room: Room) -> None:
+            try:
+                async for event in self.process_room(
+                    project, room, brief_prompts=brief_prompts
+                ):
+                    await event_queue.put(event)
+            except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Room %s failed: %s", room.id, exc)
+                room.status = ItemStatus.FAILED
+                room.error = (
+                    str(exc) if not isinstance(exc, asyncio.CancelledError) else "cancelled"
+                )
+                await self._update_room_in_project(project, room)
+                await event_queue.put(
+                    {"type": "room_failed", "room_id": room.id, "error": str(exc)}
+                )
+            finally:
+                await event_queue.put(_WORKER_DONE)
+
+        tasks = [
+            asyncio.create_task(_room_worker(room)) for room in pending_rooms
+        ]
+        cancelled_flag = False
+        try:
+            workers_done = 0
+            total_workers = len(pending_rooms)
+            while workers_done < total_workers:
+                if is_cancelled():
+                    cancelled_flag = True
+                    break
+                event = await event_queue.get()
+                if event is _WORKER_DONE:
+                    workers_done += 1
+                    continue
+                progress_callback(event)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if cancelled_flag:
+            raise JobCancelled()
+
+        project.status = ProjectStatusCalculator.compute_status(project.rooms)
+        await self._persist_project_locked(project)
+        progress_callback(
+            {"type": "project_completed", "status": project.status}
+        )
+        return {"project_id": project.id, "status": project.status}
 
     async def _derive_variants_for_variation(
         self, *, saved_url: str, variation: Variation,
