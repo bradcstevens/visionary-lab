@@ -10,12 +10,15 @@ import asyncio
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from pydantic import BaseModel, StrictBool
+
 from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.brief_generator import backfill_legacy_brief_sections
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
 from backend.core.job_queue import JobQueue
 from backend.core.job_store import JobStore, deterministic_job_id
+from backend.core.project_lease import cascade_cancel_variation_jobs
 from backend.core.sse_hub import SSEHub, get_sse_hub
 from backend.core.project_status import ProjectStatusCalculator
 from backend.core.prompt_composer import PromptComposer
@@ -2019,6 +2022,162 @@ async def enqueue_regenerate_jobs(
         project_id, len(job_ids),
     )
     return {"job_ids": job_ids}
+
+
+class GenerateProjectJobRequest(BaseModel):
+    """Request body for ``POST /projects/{id}/jobs/generate``.
+
+    ``regenerate_all`` is a destructive flag: when true, every existing
+    variation's image_url / thumb_url / md_url is scheduled for blob
+    cleanup and reset to PENDING. ``StrictBool`` (NOT ``bool``) so a
+    client passing ``"yes"``, ``"true"``, ``1``, ``[1]`` etc. gets a
+    422 instead of silently triggering the destructive path. The
+    ``False`` default matches legacy ``POST /projects/{id}/generate``
+    semantics (resume in-place).
+    """
+
+    regenerate_all: StrictBool = False
+
+
+@router.post("/projects/{project_id}/jobs/generate", status_code=202)
+async def enqueue_generate_project_job(
+    project_id: str,
+    body: Optional[GenerateProjectJobRequest] = None,
+    storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
+    queue: JobQueue = Depends(get_job_queue),
+):
+    """Enqueue a single ``generate_project`` job for the worker pool.
+
+    This is the producer side of the project-generation async cutover
+    (PRD 2026-05-03). The legacy synchronous ``POST /generate`` SSE
+    endpoint runs the entire image pipeline inline on the request
+    thread for 5-30 minutes; this endpoint instead composes the brief
+    inline (~30-90s) and hands a single job document to the
+    ``JobQueue`` for the ``JobWorker`` (issue 003) +
+    ``generate_project_dispatcher`` (issue 005) to execute in the
+    background.
+
+    Body shape (all fields optional)::
+
+        {"regenerate_all": false}     # default — resume in place
+        {"regenerate_all": true}      # destructive — reset all
+                                      # variations + cancel in-flight
+                                      # variation jobs FIRST
+
+    Algorithm (point-of-no-return contract: cascade-cancel in step 5
+    persists even if create_job/enqueue subsequently fails — there is
+    NO rollback because uncancelling could race a legitimate
+    user-initiated cancel)::
+
+        1. Feature-flag gate (503 if FEATURE_ASYNC_QUEUE off)
+        2. Project exists (404 if missing)
+        3. Project has at least one room (400 — preserves legacy
+           POST /projects/{id}/generate parity; rejects BEFORE
+           burning brief composition or pre-cancelling siblings)
+        4. Inline brief composition (5xx on failure; no side
+           effects yet — no job created, no cascade run)
+        5. If regenerate_all=true: cascade-cancel every non-terminal
+           regenerate_variation job for the project. POINT OF NO
+           RETURN.
+        6. Mint a new doc id with revision = uuid.uuid4().hex (NOT
+           an integer counter — two concurrent POSTs MUST produce
+           two distinct doc ids; the regenerate_variation idempotent
+           revision selector silently collapses concurrent integer
+           collisions)
+        7. queue.enqueue with compensation: if it raises, mark the
+           orphan doc status="failed" so the SSE feed and
+           GET /jobs surface the failure. Compensation is best-
+           effort (warn-log on inner failure); endpoint returns 502.
+
+    Returns ``{"job_id": "<deterministic id>"}`` with 202.
+    """
+    _require_async_queue_enabled()
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    clean = {
+        k: v for k, v in project_data.items()
+        if k != "doc_type" and not k.startswith("_")
+    }
+    project = StagingProject(**clean)
+
+    if not project.rooms:
+        raise HTTPException(status_code=400, detail="No rooms uploaded yet")
+
+    regenerate_all = bool(body.regenerate_all) if body is not None else False
+
+    brief_prompts: Optional[dict] = None
+    if project.design_brief and project.analyses:
+        from backend.core.brief_generator import BriefGeneratorService
+        from backend.core import async_llm_client
+        from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+
+        brief = DBModel(**project.design_brief)
+        analyses = [ImageAnalysis(**a) for a in project.analyses]
+        brief_service = BriefGeneratorService(
+            async_llm_client=async_llm_client,
+            llm_deployment=settings.LLM_DEPLOYMENT,
+        )
+        brief_prompts = await brief_service.brief_to_prompts(
+            brief=brief,
+            image_analyses=analyses,
+            n_variations=project.settings.variations_per_room,
+        )
+
+    if regenerate_all:
+        cancelled = cascade_cancel_variation_jobs(
+            store=store, project_id=project_id
+        )
+        logger.info(
+            "staging.jobs.generate.cascade_cancel project_id=%s cancelled=%d",
+            project_id, cancelled,
+        )
+
+    revision = uuid.uuid4().hex
+    doc = store.create_job(
+        project_id=project_id,
+        room_id="__project__",
+        variation_id="__project__",
+        revision=revision,
+        kind="generate_project",
+        payload={
+            "regenerate_all": regenerate_all,
+            "brief_prompts": brief_prompts,
+        },
+    )
+    job_id = doc["id"]
+
+    try:
+        queue.enqueue(job_id=job_id, project_id=project_id)
+    except Exception as enqueue_exc:
+        try:
+            store.update_job(
+                job_id, project_id,
+                status="failed",
+                error=f"enqueue failed: {enqueue_exc!r}",
+            )
+        except Exception as compensation_exc:
+            logger.warning(
+                "staging.jobs.generate.compensation_failed job_id=%s error=%s",
+                job_id, compensation_exc,
+            )
+        logger.warning(
+            "staging.jobs.generate.enqueue_failed job_id=%s error=%s",
+            job_id, enqueue_exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Queue enqueue failed: {enqueue_exc}",
+        )
+
+    logger.info(
+        "staging.jobs.generate.enqueued project_id=%s job_id=%s regenerate_all=%s",
+        project_id, job_id, regenerate_all,
+    )
+    return {"job_id": job_id}
 
 
 @router.get("/projects/{project_id}/jobs")
