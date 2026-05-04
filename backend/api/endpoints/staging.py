@@ -24,7 +24,11 @@ from backend.core.project_status import ProjectStatusCalculator
 from backend.core.prompt_composer import PromptComposer
 from backend.core.prompt_summarizer import PromptSummarizer, truncate_to_summary
 from backend.core.staging_pipeline import _get_project_lock
-from backend.core.staging_reconcile import reconcile_project
+from backend.core.staging_reconcile import (
+    _derive_status_from_rooms,
+    compute_project_status_from_jobs,
+    reconcile_project,
+)
 from backend.core.staging_storage import StagingStorageService
 from backend.core.thumbnail_backfill import backfill_project_thumbnails
 from backend.core.thumbnail_deriver import ThumbnailDeriver
@@ -181,19 +185,26 @@ async def list_projects(
     limit: int = 50,
     offset: int = 0,
     storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
 ):
     projects_raw = storage.list_projects(limit=limit, offset=offset)
     total = storage.count_projects()
     projects = []
     for p in projects_raw:
-        # Combine reconcile + legacy-brief-migration + section backfill
-        # into a single optional writeback. Each pass alone may mutate;
-        # if multiple mutate we only persist once. ``or`` short-circuits,
-        # but we want every call to run, so we OR the results explicitly.
+        # Combine reconcile + status-from-jobs + legacy-brief-migration +
+        # section backfill into a single optional writeback. Each pass alone
+        # may mutate; if multiple mutate we only persist once.
+        # Issue 003: status derivation moved out of reconcile_project into
+        # compute_project_status_from_jobs (jobs-container backed). The
+        # buggy "mixed rooms ⇒ failed" branch is gone.
         reconciled = reconcile_project(p)
+        new_status = compute_project_status_from_jobs(p, store)
+        status_changed = new_status is not None and new_status != p.get("status")
+        if status_changed:
+            p["status"] = new_status
         migrated = _migrate_design_brief_in_place(p)
         sections_backfilled = backfill_legacy_brief_sections(p)
-        if reconciled or migrated or sections_backfilled:
+        if reconciled or status_changed or migrated or sections_backfilled:
             try:
                 storage.update_project(p["id"], p)
             except Exception as e:
@@ -207,6 +218,7 @@ async def list_projects(
 async def get_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
     backfill_deps: tuple = Depends(get_thumbnail_backfill_deps),
 ):
     project = storage.get_project(project_id)
@@ -216,7 +228,13 @@ async def get_project(
     # Auto-heal stale processing states + opportunistically migrate legacy
     # plant_palette → object_palette + lazy-backfill canonical brief
     # sections (issue 016) on read (single combined writeback).
+    # Issue 003: status derivation now reads from the jobs container so a
+    # genuinely-queued project no longer flips to 'failed' on staleness.
     reconciled = reconcile_project(project)
+    new_status = compute_project_status_from_jobs(project, store)
+    status_changed = new_status is not None and new_status != project.get("status")
+    if status_changed:
+        project["status"] = new_status
     migrated = _migrate_design_brief_in_place(project)
     sections_backfilled = backfill_legacy_brief_sections(project)
     # Issue 012: lazy thumbnail backfill. Variations created before issue
@@ -237,7 +255,7 @@ async def get_project(
         logger.warning("Thumbnail backfill raised for project %s: %s", project_id, e)
         backfilled = False
 
-    if reconciled or migrated or backfilled or sections_backfilled:
+    if reconciled or status_changed or migrated or backfilled or sections_backfilled:
         try:
             storage.update_project(project_id, project)
         except Exception as e:
@@ -308,13 +326,30 @@ async def delete_project(
 async def reset_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
 ):
     """Force-reset a stuck project: all processing/failed items → pending."""
     project = storage.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Variation cleanup (force=True bypasses staleness gate). Issue 003:
+    # reconcile_project no longer mutates project status.
     reconcile_project(project, force=True)
+
+    # Compute the new status. compute_project_status_from_jobs is the
+    # canonical path, but it short-circuits on missing job id / active
+    # non-terminal job. The /reset endpoint is the user explicitly clicking
+    # "give up — put me back to a usable state" so we additionally apply
+    # _derive_status_from_rooms when the canonical path returns None,
+    # otherwise reset wouldn't move stuck legacy projects (no job id) off
+    # 'processing' at all.
+    new_status = compute_project_status_from_jobs(project, store)
+    if new_status is None:
+        new_status = _derive_status_from_rooms(project)
+    if new_status != project.get("status"):
+        project["status"] = new_status
+
     try:
         storage.update_project(project_id, project)
     except Exception as e:
@@ -946,13 +981,22 @@ async def generate_project(
     project_id: str,
     storage: StagingStorageService = Depends(get_staging_storage),
     pipeline=Depends(get_staging_pipeline),
+    store: JobStore = Depends(get_job_store),
 ):
     project_data = storage.get_project(project_id)
     if not project_data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Auto-heal stale processing before starting
-    if reconcile_project(project_data):
+    # Auto-heal stale processing before starting. Issue 003: status
+    # derivation moved out of reconcile_project; we now combine variation
+    # cleanup + jobs-derived status into a single optional writeback so
+    # genuinely-queued projects don't flip to 'failed' on staleness.
+    reconciled = reconcile_project(project_data)
+    new_status = compute_project_status_from_jobs(project_data, store)
+    status_changed = new_status is not None and new_status != project_data.get("status")
+    if status_changed:
+        project_data["status"] = new_status
+    if reconciled or status_changed:
         try:
             storage.update_project(project_id, project_data)
         except Exception as e:

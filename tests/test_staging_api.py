@@ -2239,3 +2239,286 @@ def test_retry_with_no_prior_prompt_falls_back_to_fresh_and_composes_addendum(
         f"Retry-with-no-prior must fall back to fresh AND compose the "
         f"addendum. Got: {captured_prompts!r}"
     )
+
+
+# ----------------------------------------------------------------------------
+# Issue 003: queued-projects-stay-processing integration tests.
+#
+# These tests pin the bug-report scenario at the HTTP boundary: a project
+# with status='processing' and pending rooms must NOT flip to 'failed' when
+# the staleness window elapses. The reconcile path NEVER produces 'failed'
+# in the new design.
+# ----------------------------------------------------------------------------
+
+
+def _build_stale_processing_project(
+    *,
+    project_id: str = "proj-stuck",
+    rooms_status: str = "pending",
+    current_project_job_id: str | None = None,
+    job_status: str = "pending",
+):
+    """Build a project doc that LOOKS stale to reconcile_project's
+    staleness gate (updated_at well past the threshold) but is genuinely
+    queued behind the worker. The pre-fix code flipped this to 'failed';
+    the new code must keep it at 'processing'."""
+    proj = {
+        "id": project_id,
+        "name": "Stuck Project",
+        "prompt": "A queued project waiting for the worker",
+        "status": "processing",
+        "rooms": [
+            {
+                "id": "r1",
+                "name": "Living Room",
+                "label": "Living Room",
+                "original_image_url": "/img/r1-original.png",
+                "status": rooms_status,
+                "image_url": "/img/r1.png",
+                "thumb_url": "/img/r1.png",
+                "variations": [],
+                "settings": {
+                    "variations_per_room": 5,
+                    "model": "gpt-image-2",
+                    "quality": "high",
+                    "size": "auto",
+                },
+            }
+        ],
+        "settings": {
+            "variations_per_room": 5,
+            "model": "gpt-image-2",
+            "quality": "high",
+            "size": "auto",
+        },
+        "updated_at": "2020-01-01T00:00:00Z",
+        "created_at": "2020-01-01T00:00:00Z",
+    }
+    if current_project_job_id is not None:
+        proj["current_project_job_id"] = current_project_job_id
+    return proj
+
+
+def test_get_project_queued_with_pending_job_stays_processing(client, mock_staging_deps):
+    """Bug-report scenario: a project genuinely queued behind the worker
+    must not flip to 'failed' (or any other status) just because the
+    staleness window elapsed. The active non-terminal job in the jobs
+    container is the source of truth."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+    mock_container.read_item.return_value = proj
+
+    # Active, non-terminal job in the jobs container -> short-circuit
+    # to 'no change'. Status must remain 'processing'.
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "pending",
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-stuck")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "processing", (
+        "Pre-fix bug: project flipped to 'failed' on staleness. New "
+        "behavior: active non-terminal job keeps status at 'processing'."
+    )
+    job_store.get_job.assert_called_once_with(
+        "proj-stuck:project:project:rev1", "proj-stuck"
+    )
+
+
+def test_get_project_no_job_id_stays_processing(client, mock_staging_deps):
+    """Legacy project without ``current_project_job_id`` is left alone by
+    the new derivation path (short-circuits to no-change). Status stays
+    where it was; the user's escape hatch is the explicit /reset endpoint.
+    """
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id=None,
+    )
+    mock_container.read_item.return_value = proj
+
+    response = client.get("/api/v1/staging/projects/proj-stuck")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "processing"
+    # Short-circuit: don't even consult the jobs container.
+    assert job_store.get_job.call_count == 0
+
+
+def test_get_project_terminal_job_with_pending_rooms_yields_pending_not_failed(
+    client, mock_staging_deps
+):
+    """Worker has finished the job (terminal status) but the rooms ended
+    up in mixed/all-pending states. Reconcile path NEVER produces
+    'failed' (AC#6); status derives to 'pending' instead."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+    mock_container.read_item.return_value = proj
+
+    # Job done (any terminal status). Rooms are all-pending -> derived
+    # status is 'pending'. The bug used to derive 'failed' here.
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "succeeded",
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-stuck")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "pending"
+
+
+def test_get_project_terminal_failed_job_with_failed_rooms_yields_pending(
+    client, mock_staging_deps
+):
+    """Direct repro of the headline bug: worker reports 'failed', rooms
+    are all 'failed' in their last attempt — but the reconcile path must
+    still surface 'pending' (the user can retry). Failure is reserved for
+    the worker / cancellation cascade / producer-side error paths."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="failed",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+    mock_container.read_item.return_value = proj
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "failed",
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-stuck")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "pending", (
+        "Reconcile path NEVER produces 'failed'. The pre-fix bug derived "
+        "'failed' from all-failed rooms; the new behavior is 'pending'."
+    )
+
+
+def test_get_project_persists_status_change_with_single_writeback(
+    client, mock_staging_deps
+):
+    """When status transitions from processing → pending (terminal job +
+    pending rooms), exactly one writeback to storage occurs. We're not
+    fanning out a writeback per derivation pass."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+    mock_container.read_item.return_value = proj
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "succeeded",
+    }
+
+    response = client.get("/api/v1/staging/projects/proj-stuck")
+    assert response.status_code == 200
+
+    # Exactly one writeback. The reconcile path mutated rooms (variations
+    # cleanup) AND the status-from-jobs path mutated status — but the
+    # endpoint coalesces them into a single update_project call.
+    assert mock_container.replace_item.call_count <= 1
+
+
+def test_list_projects_does_not_flip_queued_projects_to_failed(
+    client, mock_staging_deps
+):
+    """List endpoint applies the same derivation path. A queued project
+    in the list response must surface 'processing', not 'failed'."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+
+    def _query(query=None, **kwargs):
+        if query and "SELECT VALUE COUNT(1)" in query:
+            return [1]
+        return [proj]
+
+    mock_container.query_items = _query
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "pending",
+    }
+
+    response = client.get("/api/v1/staging/projects?limit=10")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["projects"]) == 1
+    assert data["projects"][0]["status"] == "processing"
+
+
+def test_reset_project_force_resets_status_off_processing(client, mock_staging_deps):
+    """The /reset endpoint is the user's manual escape hatch for stuck
+    projects without a tracked job id. compute_project_status_from_jobs
+    short-circuits in that case (returns None), so reset_project applies
+    _derive_status_from_rooms directly to ensure the project doesn't stay
+    stuck in 'processing'."""
+    mock_container = mock_staging_deps["container"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="pending",
+        current_project_job_id=None,  # No job id; compute returns None.
+    )
+    mock_container.read_item.return_value = proj
+
+    response = client.post("/api/v1/staging/projects/proj-stuck/reset")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "pending", (
+        "Reset must derive from rooms when there's no job id; otherwise "
+        "the project stays stuck in 'processing'."
+    )
+
+
+def test_reset_project_force_with_terminal_job_derives_from_rooms(
+    client, mock_staging_deps
+):
+    """When the job has reached a terminal state, reset still produces
+    a sensible status from rooms (and never 'failed' from the reconcile
+    path)."""
+    mock_container = mock_staging_deps["container"]
+    job_store = mock_staging_deps["job_store"]
+
+    proj = _build_stale_processing_project(
+        rooms_status="failed",
+        current_project_job_id="proj-stuck:project:project:rev1",
+    )
+    mock_container.read_item.return_value = proj
+    job_store.get_job.return_value = {
+        "id": "proj-stuck:project:project:rev1",
+        "project_id": "proj-stuck",
+        "status": "failed",
+    }
+
+    response = client.post("/api/v1/staging/projects/proj-stuck/reset")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"]["status"] == "pending"
