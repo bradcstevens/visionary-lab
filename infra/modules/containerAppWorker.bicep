@@ -113,6 +113,18 @@ resource workerApp 'Microsoft.App/containerApps@2024-03-01' = if (deployNew) {
         {
           name: containerAppName
           image: DOCKER_IMAGE
+          // Override the Dockerfile's API CMD so this container runs
+          // the JobWorker bootstrap (issue 007 of the
+          // project-generation-async-queue-cutover PRD). The API
+          // container keeps its `fastapi run backend/main.py`
+          // entrypoint untouched — same image, different processes.
+          command: [
+            'python'
+          ]
+          args: [
+            '-m'
+            'backend.worker_main'
+          ]
           resources: {
             cpu: 1
             memory: '2Gi'

@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.38.3.11034",
-      "templateHash": "5554718835774863193"
+      "templateHash": "6235646196808251635"
     }
   },
   "parameters": {
@@ -33,6 +33,13 @@
     "containerAppNameFrontend": {
       "type": "string",
       "defaultValue": "[format('ca-frontend-{0}', parameters('environmentName'))]"
+    },
+    "containerAppNameWorker": {
+      "type": "string",
+      "defaultValue": "[format('ca-worker-{0}', parameters('environmentName'))]",
+      "metadata": {
+        "description": "Name of the worker Container App that consumes the persistent image-job queue (PRD § Infrastructure → KEDA worker)."
+      }
     },
     "logAnalyticsWorkspaceName": {
       "type": "string",
@@ -164,6 +171,13 @@
       "type": "string",
       "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
     },
+    "DOCKER_IMAGE_WORKER": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Docker image for the queue-worker Container App. Defaults to the backend image — worker and backend share the same image and branch on the ROLE env var. azd populates this from SERVICE_WORKER_IMAGE_NAME when present."
+      }
+    },
     "API_PROTOCOL": {
       "type": "string",
       "defaultValue": ""
@@ -231,9 +245,17 @@
     "cosmosContainerName": {
       "type": "string",
       "defaultValue": "visionarylab"
+    },
+    "allowedClientIpAddresses": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Comma-separated list of client IP addresses or CIDR ranges to allow through the Cosmos DB and Storage Account firewalls (e.g., for running the backend locally against Azure resources). Leave empty to keep services reachable only via private endpoint. Example: \"203.0.113.7,198.51.100.0/24\"."
+      }
     }
   },
   "variables": {
+    "allowedClientIpAddressList": "[if(empty(parameters('allowedClientIpAddresses')), createArray(), split(replace(parameters('allowedClientIpAddresses'), ' ', ''), ','))]",
     "cosmosPrefix": "[toLower(substring(uniqueString(resourceGroup().id, parameters('environmentName')), 0, 5))]",
     "cosmosAccountNamePrefixed": "[format('{0}-{1}', variables('cosmosPrefix'), parameters('cosmosAccountName'))]"
   },
@@ -256,6 +278,9 @@
           },
           "deployNew": {
             "value": true
+          },
+          "allowedIpAddresses": {
+            "value": "[variables('allowedClientIpAddressList')]"
           }
         },
         "template": {
@@ -265,7 +290,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.38.3.11034",
-              "templateHash": "14792142527125372438"
+              "templateHash": "3606957016652987134"
             }
           },
           "parameters": {
@@ -279,7 +304,36 @@
             "deployNew": {
               "type": "bool",
               "defaultValue": true
+            },
+            "allowedIpAddresses": {
+              "type": "array",
+              "defaultValue": [],
+              "metadata": {
+                "description": "Optional list of client IP addresses or CIDR ranges allowed through the storage firewall (e.g., for local development). When empty, the account stays fully private and is reachable only via private endpoint."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {
+                "SecurityControl": "Ignore"
+              },
+              "metadata": {
+                "description": "Resource tags merged onto the storage account. The SecurityControl=Ignore tag exempts the account from the tenant-level MCAPS local-auth governance policies."
+              }
             }
+          },
+          "variables": {
+            "copy": [
+              {
+                "name": "ipRules",
+                "count": "[length(parameters('allowedIpAddresses'))]",
+                "input": {
+                  "value": "[parameters('allowedIpAddresses')[copyIndex('ipRules')]]",
+                  "action": "Allow"
+                }
+              }
+            ],
+            "hasIpAllowList": "[not(empty(parameters('allowedIpAddresses')))]"
           },
           "resources": [
             {
@@ -288,24 +342,64 @@
               "apiVersion": "2024-01-01",
               "name": "[parameters('storageAccountName')]",
               "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
               "sku": {
                 "name": "Standard_LRS"
               },
               "kind": "StorageV2",
               "properties": {
-                "publicNetworkAccess": "Disabled",
+                "publicNetworkAccess": "[if(variables('hasIpAllowList'), 'Enabled', 'Disabled')]",
                 "allowBlobPublicAccess": false,
                 "networkAcls": {
                   "defaultAction": "Deny",
-                  "bypass": "None"
+                  "bypass": "[if(variables('hasIpAllowList'), 'AzureServices', 'None')]",
+                  "ipRules": "[variables('ipRules')]"
                 }
               }
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.Storage/storageAccounts/queueServices",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}', parameters('storageAccountName'), 'default')]",
+              "properties": {},
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', 'imagejobs')]",
+              "properties": {
+                "metadata": {}
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/queueServices', parameters('storageAccountName'), 'default')]"
+              ]
+            },
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}/{2}', parameters('storageAccountName'), 'default', 'imagejobs-poison')]",
+              "properties": {
+                "metadata": {}
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/queueServices', parameters('storageAccountName'), 'default')]"
+              ]
             }
           ],
           "outputs": {
             "storageAccountPrimaryEndpoint": {
               "type": "string",
               "value": "[reference(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2024-01-01').primaryEndpoints.blob]"
+            },
+            "storageAccountPrimaryQueueEndpoint": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2024-01-01').primaryEndpoints.queue]"
             },
             "storageAccountId": {
               "type": "string",
@@ -314,6 +408,14 @@
             "storageAccountName": {
               "type": "string",
               "value": "[parameters('storageAccountName')]"
+            },
+            "imageJobsQueueName": {
+              "type": "string",
+              "value": "imagejobs"
+            },
+            "imageJobsPoisonQueueName": {
+              "type": "string",
+              "value": "imagejobs-poison"
             }
           }
         }
@@ -496,6 +598,9 @@
           },
           "publicNetworkAccess": {
             "value": "Disabled"
+          },
+          "allowedIpAddresses": {
+            "value": "[variables('allowedClientIpAddressList')]"
           }
         },
         "template": {
@@ -505,7 +610,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.38.3.11034",
-              "templateHash": "12368776970956173106"
+              "templateHash": "7094667299489768536"
             }
           },
           "parameters": {
@@ -534,10 +639,28 @@
             "publicNetworkAccess": {
               "type": "string",
               "defaultValue": "Enabled"
+            },
+            "allowedIpAddresses": {
+              "type": "array",
+              "defaultValue": [],
+              "metadata": {
+                "description": "Optional list of client IP addresses or CIDR ranges allowed through the Cosmos DB firewall (e.g., for local development). When empty, no IP rules are applied."
+              }
             }
           },
           "variables": {
-            "uniqueCosmosAccountName": "[if(equals(parameters('cosmosAccountName'), ''), format('cosmos-{0}', uniqueString(resourceGroup().id)), parameters('cosmosAccountName'))]"
+            "copy": [
+              {
+                "name": "ipRules",
+                "count": "[length(parameters('allowedIpAddresses'))]",
+                "input": {
+                  "ipAddressOrRange": "[parameters('allowedIpAddresses')[copyIndex('ipRules')]]"
+                }
+              }
+            ],
+            "uniqueCosmosAccountName": "[if(equals(parameters('cosmosAccountName'), ''), format('cosmos-{0}', uniqueString(resourceGroup().id)), parameters('cosmosAccountName'))]",
+            "hasIpAllowList": "[not(empty(parameters('allowedIpAddresses')))]",
+            "effectivePublicNetworkAccess": "[if(variables('hasIpAllowList'), 'Enabled', parameters('publicNetworkAccess'))]"
           },
           "resources": [
             {
@@ -553,9 +676,10 @@
               "properties": {
                 "databaseAccountOfferType": "Standard",
                 "enableFreeTier": false,
-                "publicNetworkAccess": "[parameters('publicNetworkAccess')]",
+                "publicNetworkAccess": "[variables('effectivePublicNetworkAccess')]",
                 "networkAclBypass": "None",
                 "isVirtualNetworkFilterEnabled": false,
+                "ipRules": "[variables('ipRules')]",
                 "consistencyPolicy": {
                   "defaultConsistencyLevel": "Session"
                 },
@@ -2750,6 +2874,394 @@
     {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
+      "name": "containerAppWorker",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerAppName": {
+            "value": "[parameters('containerAppNameWorker')]"
+          },
+          "containerAppEnvId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod'), '2025-04-01').outputs.containerAppEnvId.value]"
+          },
+          "deployNew": {
+            "value": true
+          },
+          "AZURE_BLOB_SERVICE_URL": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value]"
+          },
+          "AZURE_STORAGE_ACCOUNT_NAME": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "AZURE_BLOB_IMAGE_CONTAINER": {
+            "value": "images"
+          },
+          "AZURE_STORAGE_QUEUE_URL": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryQueueEndpoint.value]"
+          },
+          "JOB_QUEUE_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.imageJobsQueueName.value]"
+          },
+          "JOB_QUEUE_POISON_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.imageJobsPoisonQueueName.value]"
+          },
+          "CDN_BLOB_URL": {
+            "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'frontDoorMod'), '2025-04-01').outputs.frontDoorEndpointHostName.value)]"
+          },
+          "DOCKER_IMAGE": "[if(equals(parameters('DOCKER_IMAGE_WORKER'), ''), createObject('value', parameters('DOCKER_IMAGE_BACKEND')), createObject('value', parameters('DOCKER_IMAGE_WORKER')))]",
+          "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryLoginServer.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_USERNAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryUsername.value]"
+          },
+          "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerRegistryMod'), '2025-04-01').outputs.containerRegistryPassword.value]"
+          },
+          "AI_FOUNDRY_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryEndpoint.value]"
+          },
+          "LLM_DEPLOYMENT": {
+            "value": "[parameters('LLM_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_15_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+          },
+          "IMAGEGEN_1_MINI_DEPLOYMENT": {
+            "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+          },
+          "SORA_DEPLOYMENT": {
+            "value": "[parameters('SORA_DEPLOYMENT')]"
+          },
+          "FLUX_KONTEXT_DEPLOYMENT": {
+            "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+          },
+          "COSMOS_ENDPOINT": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.cosmosAccountEndpoint.value]"
+          },
+          "COSMOS_DATABASE_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.databaseName.value]"
+          },
+          "COSMOS_CONTAINER_NAME": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.containerName.value]"
+          },
+          "azdServiceName": {
+            "value": "worker"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "8620681291147605070"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string"
+            },
+            "containerAppName": {
+              "type": "string"
+            },
+            "containerAppEnvId": {
+              "type": "string"
+            },
+            "DOCKER_IMAGE": {
+              "type": "string"
+            },
+            "deployNew": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "azdServiceName": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AI_FOUNDRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "LLM_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-5-4"
+            },
+            "IMAGEGEN_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "gpt-image-2"
+            },
+            "IMAGEGEN_15_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "IMAGEGEN_1_MINI_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "SORA_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": "sora-2"
+            },
+            "FLUX_KONTEXT_DEPLOYMENT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_BLOB_SERVICE_URL": {
+              "type": "string"
+            },
+            "AZURE_STORAGE_ACCOUNT_NAME": {
+              "type": "string"
+            },
+            "AZURE_BLOB_IMAGE_CONTAINER": {
+              "type": "string",
+              "defaultValue": "images"
+            },
+            "CDN_BLOB_URL": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_STORAGE_QUEUE_URL": {
+              "type": "string"
+            },
+            "JOB_QUEUE_NAME": {
+              "type": "string",
+              "defaultValue": "imagejobs"
+            },
+            "JOB_QUEUE_POISON_NAME": {
+              "type": "string",
+              "defaultValue": "imagejobs-poison"
+            },
+            "COSMOS_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_DATABASE_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "COSMOS_CONTAINER_NAME": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+              "type": "string",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_USERNAME": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "AZURE_CONTAINER_REGISTRY_PASSWORD": {
+              "type": "securestring",
+              "defaultValue": ""
+            },
+            "minReplicas": {
+              "type": "int",
+              "defaultValue": 0,
+              "metadata": {
+                "description": "Minimum replica count. 0 enables true scale-to-zero (PRD requirement)."
+              }
+            },
+            "maxReplicas": {
+              "type": "int",
+              "defaultValue": 10,
+              "metadata": {
+                "description": "Maximum replica count. PRD default is 10."
+              }
+            },
+            "queueLength": {
+              "type": "int",
+              "defaultValue": 5,
+              "metadata": {
+                "description": "KEDA queueLength trigger — replicas added per N pending messages."
+              }
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {
+                "SecurityControl": "Ignore"
+              },
+              "metadata": {
+                "description": "Resource tags merged onto the worker container app. SecurityControl=Ignore exempts the resource from the tenant MCAPS local-auth governance policies."
+              }
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('deployNew')]",
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2024-03-01",
+              "name": "[parameters('containerAppName')]",
+              "location": "[parameters('location')]",
+              "tags": "[union(parameters('tags'), if(not(equals(parameters('azdServiceName'), '')), createObject('azd-service-name', parameters('azdServiceName')), createObject()))]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "managedEnvironmentId": "[parameters('containerAppEnvId')]",
+                "configuration": {
+                  "activeRevisionsMode": "Single",
+                  "registries": "[if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('server', parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), 'username', parameters('AZURE_CONTAINER_REGISTRY_USERNAME'), 'passwordSecretRef', 'acr-password')), createArray())]",
+                  "secrets": "[if(not(equals(parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT'), '')), createArray(createObject('name', 'acr-password', 'value', parameters('AZURE_CONTAINER_REGISTRY_PASSWORD'))), createArray())]"
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "[parameters('containerAppName')]",
+                      "image": "[parameters('DOCKER_IMAGE')]",
+                      "command": [
+                        "python"
+                      ],
+                      "args": [
+                        "-m",
+                        "backend.worker_main"
+                      ],
+                      "resources": {
+                        "cpu": 1,
+                        "memory": "2Gi"
+                      },
+                      "env": [
+                        {
+                          "name": "ROLE",
+                          "value": "worker"
+                        },
+                        {
+                          "name": "AI_FOUNDRY_ENDPOINT",
+                          "value": "[parameters('AI_FOUNDRY_ENDPOINT')]"
+                        },
+                        {
+                          "name": "LLM_DEPLOYMENT",
+                          "value": "[parameters('LLM_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_15_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_15_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "IMAGEGEN_1_MINI_DEPLOYMENT",
+                          "value": "[parameters('IMAGEGEN_1_MINI_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "SORA_DEPLOYMENT",
+                          "value": "[parameters('SORA_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "FLUX_KONTEXT_DEPLOYMENT",
+                          "value": "[parameters('FLUX_KONTEXT_DEPLOYMENT')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_SERVICE_URL",
+                          "value": "[parameters('AZURE_BLOB_SERVICE_URL')]"
+                        },
+                        {
+                          "name": "AZURE_STORAGE_ACCOUNT_NAME",
+                          "value": "[parameters('AZURE_STORAGE_ACCOUNT_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_BLOB_IMAGE_CONTAINER",
+                          "value": "[parameters('AZURE_BLOB_IMAGE_CONTAINER')]"
+                        },
+                        {
+                          "name": "AZURE_STORAGE_QUEUE_URL",
+                          "value": "[parameters('AZURE_STORAGE_QUEUE_URL')]"
+                        },
+                        {
+                          "name": "JOB_QUEUE_NAME",
+                          "value": "[parameters('JOB_QUEUE_NAME')]"
+                        },
+                        {
+                          "name": "JOB_QUEUE_POISON_NAME",
+                          "value": "[parameters('JOB_QUEUE_POISON_NAME')]"
+                        },
+                        {
+                          "name": "CDN_BLOB_URL",
+                          "value": "[parameters('CDN_BLOB_URL')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ENDPOINT",
+                          "value": "[parameters('COSMOS_ENDPOINT')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_DB_ID",
+                          "value": "[parameters('COSMOS_DATABASE_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_COSMOS_CONTAINER_ID",
+                          "value": "[parameters('COSMOS_CONTAINER_NAME')]"
+                        },
+                        {
+                          "name": "AZURE_CONTAINER_REGISTRY_ENDPOINT",
+                          "value": "[parameters('AZURE_CONTAINER_REGISTRY_ENDPOINT')]"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": "[parameters('minReplicas')]",
+                    "maxReplicas": "[parameters('maxReplicas')]",
+                    "rules": [
+                      {
+                        "name": "azure-queue-imagejobs",
+                        "custom": {
+                          "type": "azure-queue",
+                          "identity": "system",
+                          "metadata": {
+                            "accountName": "[parameters('AZURE_STORAGE_ACCOUNT_NAME')]",
+                            "queueName": "[parameters('JOB_QUEUE_NAME')]",
+                            "queueLength": "[string(parameters('queueLength'))]",
+                            "cloud": "AzurePublicCloud"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "containerAppId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "value": "[if(parameters('deployNew'), reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'full').identity.principalId, '')]"
+            },
+            "containerAppName": {
+              "type": "string",
+              "value": "[parameters('containerAppName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppEnvMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerRegistryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDbMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'frontDoorMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'storageAccountMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
       "name": "containerAppFrontend",
       "properties": {
         "expressionEvaluationOptions": {
@@ -3362,7 +3874,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.38.3.11034",
-              "templateHash": "7307478725998366282"
+              "templateHash": "9574569700926695645"
             }
           },
           "parameters": {
@@ -3381,7 +3893,8 @@
           },
           "variables": {
             "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
-            "storageBlobDelegatorRoleId": "db58b8e5-c6ad-4a2a-8342-4190687cbf4a"
+            "storageBlobDelegatorRoleId": "db58b8e5-c6ad-4a2a-8342-4190687cbf4a",
+            "storageQueueDataContributorRoleId": "974c5e8b-45b9-4653-ba55-5f855dd0fb88"
           },
           "resources": [
             {
@@ -3405,6 +3918,17 @@
                 "principalId": "[parameters('containerAppPrincipalId')]",
                 "principalType": "ServicePrincipal"
               }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageQueueDataContributorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageQueueDataContributorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
             }
           ],
           "outputs": {
@@ -3415,12 +3939,262 @@
             "blobDelegatorRoleAssignmentId": {
               "type": "string",
               "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDelegatorRoleId')))]"
+            },
+            "queueContributorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageQueueDataContributorRoleId')))]"
             }
           }
         }
       },
       "dependsOn": [
         "[resourceId('Microsoft.Resources/deployments', 'containerAppBackend')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workerCosmosRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "cosmosAccountName": {
+            "value": "[variables('cosmosAccountNamePrefixed')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppWorker'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          },
+          "dataContributorRoleId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'cosmosDbMod'), '2025-04-01').outputs.dataContributorRoleId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "16635995319012366928"
+            }
+          },
+          "parameters": {
+            "cosmosAccountName": {
+              "type": "string"
+            },
+            "containerAppPrincipalId": {
+              "type": "string"
+            },
+            "dataContributorRoleId": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+              "apiVersion": "2024-05-15",
+              "name": "[format('{0}/{1}', parameters('cosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), parameters('containerAppPrincipalId'), 'container-app-assignment'))]",
+              "properties": {
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "roleDefinitionId": "[parameters('dataContributorRoleId')]",
+                "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName'))]"
+              }
+            }
+          ],
+          "outputs": {
+            "roleAssignmentId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments', parameters('cosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), parameters('containerAppPrincipalId'), 'container-app-assignment'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppWorker')]",
+        "[resourceId('Microsoft.Resources/deployments', 'cosmosDbMod')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workerAiFoundryRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "aiFoundryId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aiFoundryMod'), '2025-04-01').outputs.aiFoundryId.value]"
+          },
+          "aiFoundryName": {
+            "value": "[parameters('aiFoundryName')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppWorker'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "1455866470436997523"
+            }
+          },
+          "parameters": {
+            "aiFoundryId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource ID of the AI Foundry resource"
+              }
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the Container App managed identity"
+              }
+            },
+            "aiFoundryName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the AI Foundry resource"
+              }
+            }
+          },
+          "variables": {
+            "cognitiveServicesOpenAIUserRoleId": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.CognitiveServices/accounts/{0}', parameters('aiFoundryName'))]",
+              "name": "[guid(parameters('aiFoundryId'), parameters('containerAppPrincipalId'), variables('cognitiveServicesOpenAIUserRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('cognitiveServicesOpenAIUserRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            }
+          ],
+          "outputs": {
+            "roleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.CognitiveServices/accounts', parameters('aiFoundryName')), 'Microsoft.Authorization/roleAssignments', guid(parameters('aiFoundryId'), parameters('containerAppPrincipalId'), variables('cognitiveServicesOpenAIUserRoleId')))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'aiFoundryMod')]",
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppWorker')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "workerStorageRoleAssignmentMod",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "storageAccountName": {
+            "value": "[parameters('storageAccountName')]"
+          },
+          "containerAppPrincipalId": {
+            "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppWorker'), '2025-04-01').outputs.containerAppPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.38.3.11034",
+              "templateHash": "9574569700926695645"
+            }
+          },
+          "parameters": {
+            "storageAccountName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Storage Account"
+              }
+            },
+            "containerAppPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the Container App managed identity"
+              }
+            }
+          },
+          "variables": {
+            "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+            "storageBlobDelegatorRoleId": "db58b8e5-c6ad-4a2a-8342-4190687cbf4a",
+            "storageQueueDataContributorRoleId": "974c5e8b-45b9-4653-ba55-5f855dd0fb88"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDataContributorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataContributorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDelegatorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDelegatorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', parameters('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageQueueDataContributorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageQueueDataContributorRoleId'))]",
+                "principalId": "[parameters('containerAppPrincipalId')]",
+                "principalType": "ServicePrincipal"
+              }
+            }
+          ],
+          "outputs": {
+            "blobContributorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDataContributorRoleId')))]"
+            },
+            "blobDelegatorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageBlobDelegatorRoleId')))]"
+            },
+            "queueContributorRoleAssignmentId": {
+              "type": "string",
+              "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('containerAppPrincipalId'), variables('storageQueueDataContributorRoleId')))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Resources/deployments', 'containerAppWorker')]"
       ]
     }
   ],
@@ -3456,6 +4230,22 @@
     "AZURE_BLOB_SERVICE_URL": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryEndpoint.value]"
+    },
+    "AZURE_STORAGE_QUEUE_URL": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.storageAccountPrimaryQueueEndpoint.value]"
+    },
+    "JOB_QUEUE_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.imageJobsQueueName.value]"
+    },
+    "JOB_QUEUE_POISON_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'storageAccountMod'), '2025-04-01').outputs.imageJobsPoisonQueueName.value]"
+    },
+    "WORKER_CONTAINER_APP_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'containerAppWorker'), '2025-04-01').outputs.containerAppName.value]"
     },
     "AI_FOUNDRY_ENDPOINT": {
       "type": "string",
