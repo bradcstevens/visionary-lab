@@ -388,3 +388,420 @@ describe("useProjectJobs — lifecycle", () => {
     expect(MockEventSource.instances[1].url).toContain("/staging/projects/p2/jobs/stream")
   })
 })
+
+// ---------------------------------------------------------------------------
+// Issue 009 — generate_project slice + cancelProjectGeneration handler
+//
+// Selector contract (3-tier):
+//   1. ≥1 running generate_project    → freshest running by updated_at
+//   2. exactly 1 non-terminal         → return it (covers single-pending)
+//   3. else (multi-pending, no run)   → null  (deliberate; ambiguous)
+//
+// cancel handler: no-arg; reads slice internally; null → no-op.
+// ---------------------------------------------------------------------------
+
+describe("useProjectJobs — inFlightProjectGeneration slice", () => {
+  it("returns null when there are no generate_project jobs (only regenerate_variation)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({ id: "rv1", kind: "regenerate_variation", status: "running" }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => expect(result.current.jobs).toHaveLength(1))
+    expect(result.current.inFlightProjectGeneration).toBeNull()
+  })
+
+  it("returns null when all generate_project jobs are terminal", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({ id: "g1", kind: "generate_project", status: "succeeded" }),
+        makeJob({ id: "g2", kind: "generate_project", status: "failed" }),
+        makeJob({ id: "g3", kind: "generate_project", status: "cancelled" }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => expect(result.current.jobs).toHaveLength(3))
+    expect(result.current.inFlightProjectGeneration).toBeNull()
+  })
+
+  it("surfaces a single pending generate_project job (tier 2 of selector)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "pending",
+          phase: "queued",
+          progress: 0,
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).not.toBeNull()
+    })
+    expect(result.current.inFlightProjectGeneration).toEqual({
+      jobId: "g1",
+      progress: 0,
+      phase: "queued",
+      status: "pending",
+    })
+  })
+
+  it("surfaces a running generate_project job with full slice shape (jobId+progress+phase+status)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "running",
+          phase: "generating",
+          progress: 47,
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).not.toBeNull()
+    })
+    expect(result.current.inFlightProjectGeneration).toEqual({
+      jobId: "g1",
+      progress: 47,
+      phase: "generating",
+      status: "running",
+    })
+  })
+
+  it("prefers the running generate_project over a pending one (tier 1 wins, queued follow-up rule)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g-pending",
+          kind: "generate_project",
+          status: "pending",
+          phase: "queued",
+          progress: 0,
+          updated_at: "2026-05-03T00:00:10.000Z",
+        }),
+        makeJob({
+          id: "g-running",
+          kind: "generate_project",
+          status: "running",
+          phase: "generating",
+          progress: 30,
+          updated_at: "2026-05-03T00:00:05.000Z",
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).not.toBeNull()
+    })
+    // Running wins even though pending was updated more recently — the
+    // 3-tier rule prioritises status===running over updated_at recency.
+    expect(result.current.inFlightProjectGeneration?.jobId).toBe("g-running")
+    expect(result.current.inFlightProjectGeneration?.status).toBe("running")
+  })
+
+  it("returns null when multiple non-terminal generate_project jobs exist but none is running (tier 3, ambiguous)", async () => {
+    // Two pending-but-not-yet-picked-up jobs is genuinely ambiguous —
+    // we shouldn't guess. The PRD reserves queued-backlog visibility
+    // for a future slice; issue 009 only exposes the active/running job.
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({ id: "g1", kind: "generate_project", status: "pending" }),
+        makeJob({ id: "g2", kind: "generate_project", status: "pending" }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => expect(result.current.jobs).toHaveLength(2))
+    expect(result.current.inFlightProjectGeneration).toBeNull()
+  })
+
+  it("flips to null when the slice's job reaches terminal status via SSE event", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "running",
+          phase: "generating",
+          progress: 80,
+          updated_at: "2026-05-03T00:00:01.000Z",
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: MockEventSource as unknown as typeof EventSource,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration?.jobId).toBe("g1")
+    })
+    await waitFor(() => expect(MockEventSource.instances.length).toBe(1))
+    const es = MockEventSource.instances[0]
+    act(() => {
+      es.dispatch("job", makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "succeeded",
+        phase: "finalizing",
+        progress: 100,
+        updated_at: "2026-05-03T00:01:00.000Z",
+      }))
+    })
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).toBeNull()
+    })
+  })
+
+  it("phase defaults to 'queued' when the underlying job has phase=null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "pending",
+          phase: null,
+          progress: 0,
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).not.toBeNull()
+    })
+    expect(result.current.inFlightProjectGeneration?.phase).toBe("queued")
+  })
+
+  it("stays non-null when cancel_requested=true but status is still non-terminal (cancelling-in-flight)", async () => {
+    // The backend flips cancel_requested=true on DELETE, but the worker
+    // doesn't emit status="cancelled" until it observes the flag and
+    // exits. The slice MUST remain visible in this window so the UI can
+    // show a "Cancelling..." sub-state (derived from
+    // jobsById[id].cancel_requested) instead of disappearing the banner.
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "running",
+          phase: "generating",
+          progress: 60,
+          cancel_requested: true,
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration).not.toBeNull()
+    })
+    expect(result.current.inFlightProjectGeneration?.jobId).toBe("g1")
+    expect(result.current.inFlightProjectGeneration?.status).toBe("running")
+    // Page derives cancelling state directly from jobsById.
+    expect(result.current.jobsById["g1"]?.cancel_requested).toBe(true)
+  })
+})
+
+describe("useProjectJobs — cancelProjectGeneration handler", () => {
+  it("is a no-op (no fetch fired) when inFlightProjectGeneration is null", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ jobs: [] }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    expect(result.current.inFlightProjectGeneration).toBeNull()
+
+    const callsBefore = fetchMock.mock.calls.length
+    await act(async () => {
+      await result.current.cancelProjectGeneration()
+    })
+    expect(fetchMock.mock.calls.length).toBe(callsBefore)
+  })
+
+  it("issues DELETE to /staging/jobs/{id} with the slice's jobId", async () => {
+    const fetchMock = vi.fn()
+      // initial REST seed with one running generate_project job
+      .mockResolvedValueOnce(jsonResponse({
+        jobs: [
+          makeJob({
+            id: "g-active",
+            kind: "generate_project",
+            status: "running",
+            phase: "generating",
+            progress: 50,
+          }),
+        ],
+      }))
+      // cancel DELETE
+      .mockResolvedValueOnce(jsonResponse({
+        status: "accepted",
+        job_id: "g-active",
+        already_terminal: false,
+      }))
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration?.jobId).toBe("g-active")
+    })
+
+    await act(async () => {
+      await result.current.cancelProjectGeneration()
+    })
+
+    const lastCall = fetchMock.mock.calls[fetchMock.mock.calls.length - 1]
+    expect(lastCall[0]).toBe("http://api/staging/jobs/g-active")
+    expect(lastCall[1].method).toBe("DELETE")
+    expect(lastCall[1].credentials).toBe("include")
+  })
+
+  it("does NOT optimistically mutate jobs state (status observed via SSE only)", async () => {
+    // Contrast with retry() which DOES optimistic-insert. Cancel is
+    // intentionally async-observed: the backend flips cancel_requested
+    // but does not change status; the SSE stream delivers the eventual
+    // terminal flip. Asserting no synchronous mutation here pins that
+    // contract against accidental "convenience" optimistic flips that
+    // would race with a status=running re-emission.
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        jobs: [
+          makeJob({
+            id: "g-active",
+            kind: "generate_project",
+            status: "running",
+            phase: "generating",
+            progress: 50,
+            cancel_requested: false,
+          }),
+        ],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        status: "accepted",
+        job_id: "g-active",
+        already_terminal: false,
+      }))
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration?.jobId).toBe("g-active")
+    })
+
+    const beforeJob = result.current.jobsById["g-active"]
+    await act(async () => {
+      await result.current.cancelProjectGeneration()
+    })
+
+    // Same status, same cancel_requested, same progress — no in-place
+    // mutation. The slice is still non-null (terminal flip arrives
+    // later via SSE).
+    const afterJob = result.current.jobsById["g-active"]
+    expect(afterJob.status).toBe("running")
+    expect(afterJob.cancel_requested).toBe(false)
+    expect(afterJob.progress).toBe(beforeJob.progress)
+    expect(result.current.inFlightProjectGeneration?.jobId).toBe("g-active")
+  })
+
+  it("throws with both status code AND response body when DELETE returns non-2xx", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        jobs: [
+          makeJob({
+            id: "g-active",
+            kind: "generate_project",
+            status: "running",
+            phase: "generating",
+            progress: 50,
+          }),
+        ],
+      }))
+      .mockResolvedValueOnce(
+        new Response("Async queue feature flag is disabled", {
+          status: 503,
+          headers: { "Content-Type": "text/plain" },
+        }),
+      )
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => {
+      expect(result.current.inFlightProjectGeneration?.jobId).toBe("g-active")
+    })
+
+    await expect(
+      result.current.cancelProjectGeneration(),
+    ).rejects.toThrow(/503.*Async queue feature flag is disabled/)
+  })
+})

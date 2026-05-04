@@ -109,6 +109,33 @@ export interface ProjectJobsState {
   lastError: string | null
   retry: (job: { room_id: string; variation_id: string }) => Promise<string[]>
   refresh: () => Promise<void>
+  // Issue 009 of project-generation-async-queue-cutover PRD: live view of
+  // the in-flight ``kind="generate_project"`` job for this project, derived
+  // from ``activeJobs`` (single source of truth for "non-terminal").
+  //
+  // Selector contract (3-tier — see useMemo body):
+  //   1. ≥1 running generate_project    → freshest running by updated_at
+  //   2. exactly 1 non-terminal         → return it (covers single pending)
+  //   3. else (multiple pending, none running) → null  (deliberate)
+  //
+  // The tier-3 ambiguous case deliberately surfaces no banner / no cancel
+  // affordance — picking one would wire the UI to an arbitrary job, and the
+  // PRD reserves "queued backlog visibility" for a future slice. This
+  // contract is pinned by the "two pending → null" test.
+  inFlightProjectGeneration: {
+    jobId: string
+    progress: number
+    phase: string
+    status: string
+  } | null
+  // Issue 009 of project-generation-async-queue-cutover PRD: cancels the
+  // currently exposed ``inFlightProjectGeneration`` job. No args by design
+  // — the slice is the canonical "active job"; passing an explicit jobId
+  // would let callers cancel queued/wrong jobs out of sync with the read
+  // side. Null slice → no-op (no DELETE fired). Status flip arrives via
+  // the SSE/REST stream after the worker observes ``cancel_requested=true``;
+  // we intentionally do NOT optimistically mutate (contrast with retry()).
+  cancelProjectGeneration: () => Promise<void>
 }
 
 interface UseProjectJobsOptions {
@@ -400,6 +427,67 @@ export function useProjectJobs(
     [jobs],
   )
 
+  // Issue 009 of project-generation-async-queue-cutover PRD: derive the
+  // single "active project-generation" slice from activeJobs (NOT jobs)
+  // so we share the same canonical "non-terminal" definition. If a future
+  // status (e.g. ``timed_out``) is added to TERMINAL_JOB_STATUSES it
+  // automatically removes those jobs from this slice without a separate
+  // edit here.
+  const inFlightProjectGeneration = useMemo(() => {
+    const candidates = activeJobs.filter((j) => j.kind === "generate_project")
+    if (candidates.length === 0) return null
+    const running = candidates.filter((j) => j.status === "running")
+    let chosen: ProjectJob | null = null
+    if (running.length > 0) {
+      // Tier 1: at least one running — pick the freshest (highest updated_at).
+      // Defensive sort even though there should normally be exactly one
+      // running per project (concurrent jobs are queued, not co-running).
+      chosen = [...running].sort((a, b) => {
+        const aT = a.updated_at ? Date.parse(a.updated_at) : 0
+        const bT = b.updated_at ? Date.parse(b.updated_at) : 0
+        return bT - aT
+      })[0]
+    } else if (candidates.length === 1) {
+      // Tier 2: exactly one non-terminal (likely a pending job not yet
+      // picked up by the worker) — surface it.
+      chosen = candidates[0]
+    } else {
+      // Tier 3: multiple pending, none running — ambiguous. Returning null
+      // is deliberate; queued-backlog visibility is a future slice.
+      return null
+    }
+    return {
+      jobId: chosen.id,
+      progress: chosen.progress ?? 0,
+      phase: (chosen.phase ?? "queued") as string,
+      status: chosen.status,
+    }
+  }, [activeJobs])
+
+  const cancelProjectGeneration = useCallback(async (): Promise<void> => {
+    // Read the slice's jobId at call time — the closure captures the
+    // memoised slice, which rebinds when activeJobs changes.
+    const jobId = inFlightProjectGeneration?.jobId
+    if (!jobId) return
+    const resp = await fetchFn(`${apiBaseUrl}/staging/jobs/${jobId}`, {
+      method: "DELETE",
+      credentials: "include",
+    })
+    if (!resp.ok) {
+      // Preserve the response body (matches enqueueProjectGeneration's
+      // convention) — the cancel endpoint returns 404 for unknown ids
+      // and 503 when the async-queue feature flag is off; both have
+      // useful body text the UI can surface.
+      let detail = ""
+      try { detail = await resp.text() } catch { /* ignore */ }
+      throw new Error(
+        `Cancel failed: HTTP ${resp.status}${detail ? ` - ${detail}` : ""}`,
+      )
+    }
+    // Intentionally NO optimistic mutation — the SSE stream will deliver
+    // the cancel_requested flip and the eventual terminal status.
+  }, [apiBaseUrl, fetchFn, inFlightProjectGeneration])
+
   return {
     jobs,
     jobsById,
@@ -408,6 +496,8 @@ export function useProjectJobs(
     lastError,
     retry,
     refresh: seedFromRest,
+    inFlightProjectGeneration,
+    cancelProjectGeneration,
   }
 }
 
