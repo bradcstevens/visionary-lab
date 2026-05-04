@@ -110,6 +110,7 @@ def build_worker() -> JobWorker:
     configure_dispatcher_dependencies(
         storage_factory=lambda: storage,
         pipeline_factory=lambda: pipeline,
+        store_factory=lambda: store,
     )
 
     return JobWorker(

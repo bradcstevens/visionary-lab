@@ -110,16 +110,22 @@ def test_build_worker_configures_dispatcher_dependencies_with_constructed_instan
     kwargs = configure.call_args.kwargs
     assert "storage_factory" in kwargs
     assert "pipeline_factory" in kwargs
+    assert "store_factory" in kwargs
 
     # Factories must resolve to the SAME instances we constructed,
     # not new ones on every call. Sharing matters: pipeline construction
-    # is heavy (LLM client + image clients + blob clients).
+    # is heavy (LLM client + image clients + blob clients). The store
+    # is shared across the worker (state writes) and the dispatcher
+    # (progress phase writes) — passing a different instance would
+    # split the change-feed view.
     assert kwargs["storage_factory"]() is patched_constructors["storage"]
     assert kwargs["pipeline_factory"]() is patched_constructors["pipeline"]
+    assert kwargs["store_factory"]() is patched_constructors["job_store"]
     # Calling the factory twice MUST return the same instance — otherwise
     # we'd be paying construction cost on every dispatch call.
     assert kwargs["storage_factory"]() is kwargs["storage_factory"]()
     assert kwargs["pipeline_factory"]() is kwargs["pipeline_factory"]()
+    assert kwargs["store_factory"]() is kwargs["store_factory"]()
 
 
 def test_build_worker_passes_staging_dispatcher_into_jobworker(patched_constructors):
