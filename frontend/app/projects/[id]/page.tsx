@@ -20,7 +20,7 @@ import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox
 import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
 import { EditPromptDialog } from "@/components/staging/EditPromptDialog";
 import { CollapsiblePrompt } from "@/components/staging/CollapsiblePrompt";
-import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
+import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, enqueueProjectGeneration, EnqueueGenerationTimeoutError, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -30,6 +30,7 @@ import { useActivityLog } from "@/context/activity-log-context";
 import { useRetryQueue } from "@/hooks/useRetryQueue";
 import { useGenerationFleet, type LostOp } from "@/hooks/useGenerationFleet";
 import { useProjectJobs } from "@/context/jobs-context";
+import { ProjectGenerationBanner } from "@/components/staging/ProjectGenerationBanner";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -44,6 +45,13 @@ export default function ProjectDetailPage() {
   // `inFlightRooms` / `inFlightVariations` substitute for the prior reads
   // of `isGenerating` / `regeneratingVariationId`.
   const [generationError, setGenerationError] = useState<string | null>(null);
+  // Issue 011 of project-generation-async-queue-cutover PRD: tracks the
+  // 30-90s window between the user clicking Generate and the producer
+  // endpoint returning 202 with a job_id (inline brief composition runs
+  // here). The header CTA hides during this window so the user can't
+  // double-enqueue and the legacy "Generating" banner doesn't compete
+  // with the in-flight banner that's about to appear.
+  const [isEnqueueing, setIsEnqueueing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -283,6 +291,20 @@ export default function ProjectDetailPage() {
   // Issue 009: live job state for the per-image overlay bars and the
   // per-project header aggregate bar. Disabled until projectId is known.
   const projectJobs = useProjectJobs(projectId, { enabled: !!projectId });
+  // Issue 011: in-flight project-generation slice (single-tenant: at most
+  // one generate_project job in non-terminal status at a time per project).
+  // The page mounts the ProjectGenerationBanner whenever this is non-null.
+  const inFlightProjectGeneration = projectJobs.inFlightProjectGeneration;
+  const cancelProjectGeneration = projectJobs.cancelProjectGeneration;
+  // Composite busy flag: true when ANY generation flow is mutating the
+  // project. The fleet half (isAnyInFlight) covers the legacy variation /
+  // room SSE streams; isProjectGenerationBusy covers the new async path
+  // (the 30-90s enqueue window AND the worker-running window). Per the
+  // single-banner / single-action contract, every site that previously
+  // gated on isAnyInFlight must use this composite so concurrent writes
+  // from the worker and a stray click can't race.
+  const isProjectGenerationBusy = isEnqueueing || inFlightProjectGeneration !== null;
+  const isAnyGenerationBusy = isAnyInFlight || isProjectGenerationBusy;
   // Map each variation to its most-recent (highest-revision) job so the
   // overlay reflects the active attempt rather than a stale prior one.
   const jobsByVariationId = (() => {
@@ -554,7 +576,12 @@ export default function ProjectDetailPage() {
     // signal. This preserves the four existing retry-queue scenarios
     // (queue, dedup, supersede on Regenerate Room, drop on global error)
     // verbatim against the new fleet-driven state.
-    isGenerating: isAnyInFlight,
+    //
+    // Issue 011: extended to ``isAnyGenerationBusy`` so a project-scope
+    // job (enqueueing OR worker-running) ALSO blocks retry-queue drain.
+    // Without this, a queued failed-variation retry could drain mid-
+    // project-job and race the worker for the same variation.
+    isGenerating: isAnyGenerationBusy,
     regeneratingVariationId: null,
     onDispatch: handleRegenerateVariation,
     onDrop: onDropQueuedRetry,
@@ -686,47 +713,81 @@ export default function ProjectDetailPage() {
   }, [retryQueue, activityLog, debouncedReload, loadProject]);
 
   // Issue 003 of failed-variation-retry-queue PRD + issue 007 of projects-
-  // page-improvements PRD: the three "larger regen action" entry points
-  // each call ``retryQueue.clear()`` BEFORE delegating to the fleet hook.
-  // The supersede semantic is preserved: when the user triggers a regen
-  // action that subsumes individual failed-variation retries, the queued
-  // per-variation retries are silently cleared. The fleet hook also
-  // cascades: startProject() aborts ALL in-flight streams; startRoom()
-  // aborts in-flight variations within the same room (preserves retry-
-  // queue scenario 3). The page no longer manages a single
-  // ``streamCleanupRef``; the hook owns each stream's abort.
-  const startGeneration = useCallback(() => {
+  // page-improvements PRD + issue 011 of project-generation-async-queue-
+  // cutover PRD: the three "larger regen action" entry points each call
+  // ``retryQueue.clear()`` BEFORE delegating. The supersede semantic is
+  // preserved: when the user triggers a regen action that subsumes
+  // individual failed-variation retries, the queued per-variation retries
+  // are silently cleared.
+  //
+  // Post-cutover (issue 011): startGeneration enqueues a project-scope
+  // job via the async producer endpoint instead of opening a long-lived
+  // SSE stream. Inline brief composition runs on the producer side
+  // (30-90s blocking) - the user sees `isEnqueueing=true` during this
+  // window, then the worker begins processing and the change feed
+  // delivers a job event that the inFlightProjectGeneration slice
+  // consumes. The legacy fleet.startProject path is no longer wired here
+  // (variation/room regen still use the fleet).
+  //
+  // ``regenerateAll: false`` is intentional and matches the established
+  // "Generate Remaining (N)" semantic - process pending + failed only,
+  // leave completed rooms alone. The destructive `regenerate_all=true`
+  // backend path is reserved for a distinct future affordance (per PRD
+  // issue 006: it pre-cancels in-flight variation jobs and reruns
+  // everything from scratch).
+  const startGeneration = useCallback(async () => {
     retryQueue.clear();
-    if (isAnyInFlight) return;
+    if (isAnyGenerationBusy) return;
     setGenerationError(null);
+    setIsEnqueueing(true);
     activityLog.log({
       level: 'info',
       icon: '▶',
       message: `Starting generation for "${project?.name}"`,
       detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
     });
-    fleet.startProject(projectId, handleStreamEvent);
-  }, [retryQueue, activityLog, project, totalVariations, isAnyInFlight, fleet, projectId, handleStreamEvent]);
+    try {
+      await enqueueProjectGeneration(projectId, { regenerateAll: false });
+    } catch (err: unknown) {
+      // 180s client-side abort surfaces as a user-visible toast rather
+      // than a frozen spinner (PRD AC: "user-visible error message
+      // 'Couldn't start generation, please try again'").
+      if (err instanceof EnqueueGenerationTimeoutError) {
+        toast.error("Couldn't start generation, please try again.");
+      } else {
+        // Non-2xx + network errors: surface as a destructive recovery
+        // banner via setGenerationError. The recovery classifier maps
+        // this to the existing 'error' arm and renders the prior
+        // collapsible "Full error" detail block.
+        const message = err instanceof Error ? err.message : String(err);
+        setGenerationError(message);
+        toast.error("Couldn't start generation, please try again.");
+      }
+    } finally {
+      setIsEnqueueing(false);
+    }
+  }, [retryQueue, activityLog, project, totalVariations, isAnyGenerationBusy, projectId]);
 
   const handleRegenerateRoom = useCallback((room: Room) => {
     retryQueue.clear();
     // Per the new disabling rules (issue 007), the room-level Regenerate
     // is disabled iff `inFlightProject || inFlightRooms.has(room.id)`.
-    // The fleet hook is also idempotent on the same roomId, so a double-
-    // click is silently deduped. We DO NOT gate on `isAnyInFlight` here
-    // because variation regen in this room shouldn't block room
-    // Regenerate (preserves the retry-queue scenario 3 supersede path).
-    if (inFlightProject || inFlightRooms.has(room.id)) return;
+    // Issue 011 adds `isProjectGenerationBusy` to the gate so a click
+    // can't race a worker-running project-scope job.
+    if (isProjectGenerationBusy || inFlightProject || inFlightRooms.has(room.id)) return;
     setGenerationError(null);
     toast.info(`Regenerating ${room.label}...`);
     fleet.startRoom(projectId, room.id, handleStreamEvent);
-  }, [retryQueue, inFlightProject, inFlightRooms, fleet, projectId, handleStreamEvent]);
+  }, [retryQueue, isProjectGenerationBusy, inFlightProject, inFlightRooms, fleet, projectId, handleStreamEvent]);
 
   const handleRegenerateAll = () => {
     retryQueue.clear();
-    if (isAnyInFlight) return;
-    startGeneration();
+    if (isAnyGenerationBusy) return;
     toast.info('Regenerating all rooms...');
+    // Delegates to startGeneration (which enqueues with regenerateAll=
+    // false). The toast difference is the only user-visible delta vs
+    // the header "Generate" path.
+    startGeneration();
   };
 
   const handleRetryVariation = (room: Room, variationIndex: number) => {
@@ -881,7 +942,13 @@ export default function ProjectDetailPage() {
     : null;
   const recoveryState: RecoveryState = getRecoveryState({
     projectStatus: project?.status ?? 'pending',
-    isAnyInFlight,
+    // Issue 011: feed the composite busy flag so the 'interrupted' arm
+    // (status='processing' && !isAnyInFlight) cannot fire while a
+    // project-scope async job is enqueueing or running. Without this,
+    // refreshing the page during an in-flight async generation would
+    // briefly flash the destructive recovery banner before the change-
+    // feed seeded the inFlightProjectGeneration slice.
+    isAnyInFlight: isAnyGenerationBusy,
     projectLostOps,
     generationError: parsedGenerationError
       ? {
@@ -981,8 +1048,11 @@ export default function ProjectDetailPage() {
                 Issue 002 of projects-page-stalled-stream-error-cleanup
                 PRD: hidden (not disabled) while a recovery banner is
                 showing, so the page presents a single recovery path
-                instead of competing CTAs. */}
-            {recoveryState.kind === 'none' && (() => {
+                instead of competing CTAs. Issue 011: ALSO hidden while
+                a project-scope async job is enqueueing or running -
+                the ProjectGenerationBanner owns the in-progress UI
+                surface (single-action contract). */}
+            {recoveryState.kind === 'none' && !isProjectGenerationBusy && (() => {
               const action = getHeaderAction(project.rooms);
               if (action.kind === 'hidden') return null;
               if (action.kind === 'generate') {
@@ -990,9 +1060,9 @@ export default function ProjectDetailPage() {
                   <Button
                     data-testid="project-header-action"
                     onClick={startGeneration}
-                    disabled={isAnyInFlight}
+                    disabled={isAnyGenerationBusy}
                   >
-                    {isAnyInFlight ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
+                    {isAnyGenerationBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Play className="h-4 w-4 mr-2" />}
                     Generate
                   </Button>
                 );
@@ -1002,9 +1072,9 @@ export default function ProjectDetailPage() {
                   data-testid="project-header-action"
                   variant="outline"
                   onClick={handleRegenerateAll}
-                  disabled={isAnyInFlight}
+                  disabled={isAnyGenerationBusy}
                 >
-                  {isAnyInFlight ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                  {isAnyGenerationBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
                   Generate Remaining ({action.count})
                 </Button>
               );
@@ -1049,13 +1119,44 @@ export default function ProjectDetailPage() {
         </div>
       </div>
 
+      {/* Issue 011 of project-generation-async-queue-cutover PRD:
+          in-flight project-generation banner. The slice is non-null
+          for any non-terminal generate_project job; mounting this
+          banner takes precedence over the recovery banner blocks
+          below (single-banner contract). The Cancel button signals
+          the worker via cancelProjectGeneration; the slice stays
+          non-null until the worker observes the cancel_requested
+          flag and flips status to 'cancelled' (during which window
+          the banner shows the disabled "Cancelling…" state via the
+          cancelling prop). */}
+      {inFlightProjectGeneration && (
+        <ProjectGenerationBanner
+          progress={inFlightProjectGeneration.progress}
+          phase={inFlightProjectGeneration.phase}
+          status={inFlightProjectGeneration.status}
+          onCancel={() => {
+            cancelProjectGeneration().catch((err: unknown) => {
+              const message = err instanceof Error ? err.message : String(err);
+              toast.error(`Couldn't cancel generation: ${message}`);
+            });
+          }}
+          cancelling={
+            projectJobs.jobsById[inFlightProjectGeneration.jobId]
+              ?.cancel_requested === true
+          }
+        />
+      )}
+
       {/* Issue 002 of projects-page-stalled-stream-error-cleanup PRD:
           unified recovery banner. Replaces the three prior in-line
           banner blocks (`generationError`, `isStaleProcessing`,
           project-scope `fleet.lostOps`). The classifier resolves
           precedence so exactly one arm renders. `data-testid` and
-          `data-recovery-kind` decouple test assertions from copy. */}
-      {recoveryState.kind === 'error' && (
+          `data-recovery-kind` decouple test assertions from copy.
+          Issue 011: SUPPRESSED while a project-scope async job is
+          enqueueing or running (the in-flight banner above takes
+          precedence — single-banner contract). */}
+      {!isProjectGenerationBusy && recoveryState.kind === 'error' && (
           <div
             data-testid="recovery-banner"
             data-recovery-kind="error"
@@ -1123,7 +1224,7 @@ export default function ProjectDetailPage() {
             </div>
           )}
 
-      {recoveryState.kind === 'stream-lost' && (
+      {!isProjectGenerationBusy && recoveryState.kind === 'stream-lost' && (
         <div
           data-testid="recovery-banner"
           data-recovery-kind="stream-lost"
@@ -1176,7 +1277,7 @@ export default function ProjectDetailPage() {
         </div>
       )}
 
-      {recoveryState.kind === 'interrupted' && (
+      {!isProjectGenerationBusy && recoveryState.kind === 'interrupted' && (
         <div
           data-testid="recovery-banner"
           data-recovery-kind="interrupted"

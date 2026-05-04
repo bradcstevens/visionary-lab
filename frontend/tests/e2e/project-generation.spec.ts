@@ -1,10 +1,18 @@
 import { test, expect, Page, Route } from '@playwright/test';
 
 /**
- * Project Generation E2E Tests
+ * Project Generation E2E Tests — async-queue cutover (issue 011 of
+ * project-generation-async-queue-cutover PRD).
  *
- * Validates the full generation lifecycle: SSE streaming, activity log,
- * progress tracker, and variation thumbnail updates.
+ * The page-level Generate CTA no longer opens a long-lived SSE
+ * stream against `POST /staging/projects/{id}/generate`. It enqueues
+ * an async job via `POST /staging/projects/{id}/jobs/generate` (returns
+ * 202 + {job_id}), and the in-flight banner is driven by the
+ * jobs-context slice that hydrates from `GET /staging/projects/{id}/jobs`
+ * (REST seed) + `GET /staging/projects/{id}/jobs/stream` (SSE updates).
+ *
+ * Variation/room regen still uses the legacy SSE path (regenerate
+ * endpoints) — those tests are kept verbatim from the pre-cutover spec.
  *
  * Run with: npx playwright test tests/e2e/project-generation.spec.ts --headed
  */
@@ -12,10 +20,60 @@ import { test, expect, Page, Route } from '@playwright/test';
 const SCREENSHOT_DIR = 'test-results/screenshots/project-generation';
 const PROJECT_ID = 'test-project-gen';
 const API_BASE = 'http://localhost:8000/api/v1';
+const JOB_ID = 'job-test-001';
 
 // ---------------------------------------------------------------------------
-// Mock Data
+// Mock data — project + job shapes
 // ---------------------------------------------------------------------------
+
+interface MockVariation {
+  id: string;
+  status: string;
+  image_url?: string;
+  error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface MockRoom {
+  id: string;
+  label: string;
+  original_image_url: string;
+  status: string;
+  variations: MockVariation[];
+  created_at: string;
+  updated_at: string;
+}
+
+interface MockProject {
+  id: string;
+  name: string;
+  prompt: string;
+  status: string;
+  settings: Record<string, unknown>;
+  rooms: MockRoom[];
+  total_variations: number;
+  completed_variations: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface MockJob {
+  id: string;
+  project_id: string;
+  room_id: string;
+  variation_id: string;
+  revision: number;
+  kind: string;
+  status: string;
+  progress?: number;
+  phase?: string | null;
+  attempts?: number;
+  error?: string | null;
+  cancel_requested?: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 function makeMockProject(overrides: Partial<MockProject> = {}): MockProject {
   return {
@@ -68,89 +126,61 @@ function makeRoom(
   };
 }
 
-interface MockVariation {
-  id: string;
-  status: string;
-  image_url?: string;
-  error?: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface MockRoom {
-  id: string;
-  label: string;
-  original_image_url: string;
-  status: string;
-  variations: MockVariation[];
-  created_at: string;
-  updated_at: string;
-}
-
-interface MockProject {
-  id: string;
-  name: string;
-  prompt: string;
-  status: string;
-  settings: Record<string, unknown>;
-  rooms: MockRoom[];
-  total_variations: number;
-  completed_variations: number;
-  created_at: string;
-  updated_at: string;
+function makeProjectGenerationJob(overrides: Partial<MockJob> = {}): MockJob {
+  return {
+    id: JOB_ID,
+    project_id: PROJECT_ID,
+    // generate_project jobs use the project as their target — room/variation
+    // ids are conventionally empty strings (see backend models/jobs.py).
+    room_id: '',
+    variation_id: '',
+    revision: 0,
+    kind: 'generate_project',
+    status: 'running',
+    progress: 35,
+    phase: 'generating',
+    attempts: 1,
+    cancel_requested: false,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    ...overrides,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
 
-/** Build a single SSE event string (same format as backend _sse_event). */
-function sseEvent(type: string, data: Record<string, unknown>): string {
-  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-/** Build a complete SSE body for a successful 3-room generation. */
-function buildFullGenerationSSE(): string {
-  let body = '';
-  const rooms = ['room-1', 'room-2', 'room-3'];
-  const labels = ['Front Yard', 'Side Garden', 'Back Patio'];
-
-  for (let r = 0; r < rooms.length; r++) {
-    body += sseEvent('room_started', { type: 'room_started', room_id: rooms[r], label: labels[r] });
-    for (let v = 0; v < 5; v++) {
-      body += sseEvent('variation_completed', {
-        type: 'variation_completed',
-        room_id: rooms[r],
-        variation_index: v,
-        image_url: `https://storage.blob.core.windows.net/images/staging/${PROJECT_ID}/variations/${rooms[r]}/v${v}.png`,
-        elapsed_ms: 3000 + Math.random() * 2000,
-        tokens_used: 1200 + Math.floor(Math.random() * 300),
-        model: 'gpt-image-2',
-      });
-    }
-    body += sseEvent('room_completed', { type: 'room_completed', room_id: rooms[r], status: 'completed' });
-  }
-  body += sseEvent('project_completed', { type: 'project_completed', status: 'completed' });
-  return body;
+function sseEvent(name: string, data: unknown): string {
+  return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 // ---------------------------------------------------------------------------
-// Route helpers
+// Route helpers — async cutover (the page no longer opens /generate)
 // ---------------------------------------------------------------------------
 
-/**
- * Set up API route mocks with stateful GET handling.
- * The first GET returns `initialProject`, subsequent GETs return `updatedProject`.
- */
-async function setupMockedRoutes(
-  page: Page,
-  initialProject: MockProject,
-  updatedProject: MockProject,
-  sseBody: string,
-) {
-  let getCount = 0;
+interface AsyncRouteSetup {
+  /** Stateful project — first GET returns initialProject, subsequent return updatedProject. */
+  initialProject: MockProject;
+  updatedProject: MockProject;
+  /** Jobs returned by `GET /staging/projects/{id}/jobs` (REST seed). */
+  initialJobs: MockJob[];
+  /** Jobs delivered as the SSE `seed` event payload. */
+  streamSeedJobs?: MockJob[];
+  /** Job updates delivered as discrete SSE `job` events after the seed. */
+  streamJobEvents?: MockJob[];
+  /** Status returned by `POST /staging/projects/{id}/jobs/generate`. */
+  enqueueStatus?: number;
+  /** Body returned by enqueue (default 202 with job_id). */
+  enqueueBody?: object;
+  /** Status returned by `DELETE /staging/jobs/{jobId}` (default 200). */
+  cancelStatus?: number;
+}
 
-  // Mock SAS tokens
+async function setupAsyncRoutes(page: Page, setup: AsyncRouteSetup) {
+  let projectGetCount = 0;
+
+  // SAS tokens — image overlays expect these.
   await page.route(`${API_BASE}/gallery/sas-tokens`, (route: Route) =>
     route.fulfill({
       status: 200,
@@ -165,481 +195,315 @@ async function setupMockedRoutes(
     }),
   );
 
-  // Stateful project GET
-  await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}`, (route: Route) => {
-    if (route.request().method() === 'GET') {
-      getCount++;
-      const data = getCount <= 1 ? initialProject : updatedProject;
-      return route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ project: data }),
-      });
-    }
-    return route.continue();
-  });
+  // Stateful project GET. Use a regex so the trailing-slash and query-string
+  // variants both match.
+  await page.route(
+    new RegExp(`/api/v1/staging/projects/${PROJECT_ID}(\\?.*)?$`),
+    (route: Route) => {
+      if (route.request().method() === 'GET') {
+        projectGetCount++;
+        const data = projectGetCount <= 1 ? setup.initialProject : setup.updatedProject;
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ project: data }),
+        });
+      }
+      return route.continue();
+    },
+  );
 
-  // SSE generation endpoint
-  await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/generate`, (route: Route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'text/event-stream',
-      headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
-      body: sseBody,
-    }),
+  // jobs-context REST seed: `GET /staging/projects/{id}/jobs`.
+  await page.route(
+    `${API_BASE}/staging/projects/${PROJECT_ID}/jobs`,
+    (route: Route) => {
+      if (route.request().method() === 'GET') {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ jobs: setup.initialJobs }),
+        });
+      }
+      return route.continue();
+    },
+  );
+
+  // SSE stream: `GET /staging/projects/{id}/jobs/stream?...`.
+  // Deliver the seed event + any pre-staged job events in one body. The
+  // EventSource will re-connect after this body ends — the route is
+  // re-mounted so the same body is re-served, which is harmless because
+  // mergeJobs in jobs-context dedupes by `_isNewer` (same updated_at →
+  // no state change).
+  const seedBody = sseEvent('seed', { jobs: setup.streamSeedJobs ?? [] })
+    + (setup.streamJobEvents ?? []).map((j) => sseEvent('job', j)).join('');
+  await page.route(
+    new RegExp(`/api/v1/staging/projects/${PROJECT_ID}/jobs/stream(\\?.*)?$`),
+    (route: Route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+        body: seedBody,
+      }),
+  );
+
+  // Producer endpoint: `POST /staging/projects/{id}/jobs/generate`.
+  await page.route(
+    `${API_BASE}/staging/projects/${PROJECT_ID}/jobs/generate`,
+    (route: Route) => {
+      if (route.request().method() === 'POST') {
+        return route.fulfill({
+          status: setup.enqueueStatus ?? 202,
+          contentType: 'application/json',
+          body: JSON.stringify(setup.enqueueBody ?? { job_id: JOB_ID }),
+        });
+      }
+      return route.continue();
+    },
+  );
+
+  // Cancel: `DELETE /staging/jobs/{jobId}`.
+  await page.route(
+    new RegExp(`/api/v1/staging/jobs/${JOB_ID}$`),
+    (route: Route) => {
+      if (route.request().method() === 'DELETE') {
+        return route.fulfill({
+          status: setup.cancelStatus ?? 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ ok: true }),
+        });
+      }
+      return route.continue();
+    },
   );
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — async-cutover behaviour
 // ---------------------------------------------------------------------------
 
-test.describe('Project Generation', () => {
-
+test.describe('Project Generation — async cutover', () => {
   test('project page loads with rooms and pending variations', async ({ page }) => {
     const project = makeMockProject();
-    await setupMockedRoutes(page, project, project, '');
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [],
+    });
 
     await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
-    // Project name
     await expect(page.locator('h1')).toContainText('Backyard Redesign');
 
-    // All three room labels visible
     for (const label of ['Front Yard', 'Side Garden', 'Back Patio']) {
       await expect(page.getByText(label, { exact: true }).first()).toBeVisible();
     }
 
-    // Pending variation placeholders
+    // Pending placeholders for at least one variation per room.
     const pendingBadges = page.getByText('Awaiting generation');
     expect(await pendingBadges.count()).toBeGreaterThanOrEqual(3);
 
-    // Generate CTA with variation count
-    await expect(page.getByRole('button', { name: /Generate 15 Variations/i })).toBeVisible();
+    // The header CTA (issue 011 still uses the same data-testid hook).
+    await expect(page.getByTestId('project-header-action')).toBeVisible();
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/01-page-loaded.png`, fullPage: true });
   });
 
-  test('generate button triggers SSE and shows generating banner', async ({ page }) => {
-    const pending = makeMockProject();
-    const processing = makeMockProject({
-      status: 'processing',
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'processing'),
-        makeRoom('room-2', 'Side Garden', 5),
-        makeRoom('room-3', 'Back Patio', 5),
-      ],
+  test('clicking Generate enqueues a job via /jobs/generate (NOT /generate)', async ({ page }) => {
+    const project = makeMockProject();
+    // No in-flight jobs yet — the banner is hidden until the post lands
+    // and the change feed surfaces a `generate_project` job.
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [],
     });
 
-    // Minimal SSE — just room_started + project_completed
-    const sse = sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('project_completed', { type: 'project_completed', status: 'completed' });
+    // Spy on POSTs to either endpoint so we can assert the cutover.
+    const postRequests: string[] = [];
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && req.url().includes('/generate')) {
+        postRequests.push(req.url());
+      }
+    });
 
-    await setupMockedRoutes(page, pending, processing, sse);
     await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
-    // Click Generate
-    const generateBtn = page.getByRole('button', { name: /Generate 15 Variations/i });
+    const generateBtn = page.getByTestId('project-header-action');
     await expect(generateBtn).toBeVisible();
 
     const [postReq] = await Promise.all([
-      page.waitForRequest(req => req.url().includes('/generate') && req.method() === 'POST'),
+      page.waitForRequest((req) =>
+        req.url().includes('/jobs/generate') && req.method() === 'POST',
+      ),
       generateBtn.click(),
     ]);
+
     expect(postReq).toBeTruthy();
+    // Issue 011 critical assertion: cutover hits the new producer endpoint.
+    expect(postReq.url()).toContain('/jobs/generate');
 
-    // Generating banner should appear
-    await expect(page.getByText('Generating variations...')).toBeVisible({ timeout: 5000 });
-
-    // The big CTA disappears (replaced by the banner)
-    await expect(page.getByRole('button', { name: /Generate 15 Variations/i })).not.toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/02-generating-banner.png`, fullPage: true });
-  });
-
-  test('activity log receives and renders SSE events', async ({ page }) => {
-    const errors: string[] = [];
-    page.on('pageerror', (err) => errors.push(err.message));
-
-    const pending = makeMockProject();
-    const processing = makeMockProject({ status: 'processing' });
-
-    const sse =
-      sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 0,
-        image_url: 'https://example.com/img.png', elapsed_ms: 4500, tokens_used: 1300, model: 'gpt-image-2',
-      })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 1,
-        image_url: 'https://example.com/img2.png', elapsed_ms: 3200, tokens_used: 1100, model: 'gpt-image-2',
-      })
-      + sseEvent('project_completed', { type: 'project_completed', status: 'completed' });
-
-    await setupMockedRoutes(page, pending, processing, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    // Start generation
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // After issue 006 the activity log no longer auto-opens on the first
-    // log entry — open it manually via the toggle to assert content.
-    const activityToggle = page.locator(
-      'button[title="Show activity log"], button[title="Hide activity log"]',
+    // Negative assertion: no request to the legacy /generate SSE endpoint.
+    // (We need a small grace period for any stragglers — `waitForRequest`
+    // already returned, so we just inspect the recorded list.)
+    const legacyHits = postRequests.filter((u) =>
+      u.includes('/generate') && !u.includes('/jobs/generate') && !u.includes('/regenerate'),
     );
-    await expect(activityToggle).toBeVisible({ timeout: 8000 });
-    // Wait for at least one log entry to register (entry-count badge appears).
-    await expect(activityToggle.locator('span.tabular-nums')).toBeVisible({ timeout: 8000 });
-    // The panel is still closed at this point (the new no-auto-open contract).
-    await expect(activityToggle).toHaveAttribute('title', 'Show activity log');
-    // Open the panel.
-    await activityToggle.click();
-    await expect(activityToggle).toHaveAttribute('title', 'Hide activity log');
+    expect(legacyHits).toEqual([]);
 
-    const activityPanel = page.getByRole('heading', { name: 'Activity' });
-    await expect(activityPanel).toBeVisible({ timeout: 8000 });
-
-    // Log entries should contain generation messages
-    await expect(page.getByText(/Starting generation for/).first()).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText(/Variation 1 saved/).first()).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText(/Variation 2 saved/).first()).toBeVisible({ timeout: 8000 });
-
-    // Summary counters should show success count
-    const successBadge = page.locator('text=/^[0-9]+$/').first();
-    await expect(successBadge).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/03-activity-log.png`, fullPage: true });
-    expect(errors).toEqual([]);
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/02-enqueue-jobs-generate.png`, fullPage: true });
   });
 
-  test('progress tracker renders during generation with correct progress', async ({ page }) => {
-    // Initial state: pending
-    const pending = makeMockProject();
-
-    // After reload: processing with 2/15 complete
-    const processing = makeMockProject({
-      status: 'processing',
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'processing', [
-          { id: 'room-1-v0', status: 'completed', image_url: 'https://example.com/1.png', created_at: '', updated_at: '' },
-          { id: 'room-1-v1', status: 'completed', image_url: 'https://example.com/2.png', created_at: '', updated_at: '' },
-          { id: 'room-1-v2', status: 'processing', created_at: '', updated_at: '' },
-          { id: 'room-1-v3', status: 'pending', created_at: '', updated_at: '' },
-          { id: 'room-1-v4', status: 'pending', created_at: '', updated_at: '' },
-        ]),
-        makeRoom('room-2', 'Side Garden', 5),
-        makeRoom('room-3', 'Back Patio', 5),
-      ],
+  test('in-flight project-generation banner mounts when slice is non-null', async ({ page }) => {
+    const project = makeMockProject({ status: 'processing' });
+    const runningJob = makeProjectGenerationJob({
+      status: 'running',
+      progress: 42,
+      phase: 'generating',
     });
 
-    const sse =
-      sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 0,
-        image_url: 'https://example.com/1.png', elapsed_ms: 4000, tokens_used: 1300, model: 'gpt-image-2',
-      })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 1,
-        image_url: 'https://example.com/2.png', elapsed_ms: 3800, tokens_used: 1200, model: 'gpt-image-2',
-      });
-    // No project_completed — stream stays open (tests mid-generation state)
-
-    await setupMockedRoutes(page, pending, processing, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    // Start generation
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // Wait for the debounced reload to fire and render the progress tracker
-    await expect(page.getByText('Generation Progress')).toBeVisible({ timeout: 10_000 });
-
-    // Progress bar exists
-    const progressBar = page.locator('[role="progressbar"]');
-    await expect(progressBar).toBeVisible();
-
-    // Variations count (appears in both header and progress tracker; use exact match)
-    await expect(page.getByText('2/15 variations', { exact: true }).first()).toBeVisible();
-
-    // Per-room badges
-    await expect(page.getByText('Front Yard').first()).toBeVisible();
-    await expect(page.getByText('Side Garden').first()).toBeVisible();
-    await expect(page.getByText('Back Patio').first()).toBeVisible();
-
-    // ProgressTracker shows a status badge (Processing or Interrupted depending on timing)
-    const processingOrInterrupted = page.locator('text=/Processing|Interrupted/').first();
-    await expect(processingOrInterrupted).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/04-progress-tracker.png`, fullPage: true });
-  });
-
-  test('variation thumbnails transition from pending to completed', async ({ page }) => {
-    const pending = makeMockProject();
-
-    const withCompleted = makeMockProject({
-      status: 'processing',
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'completed', [
-          { id: 'r1-v0', status: 'completed', image_url: 'https://storage.blob.core.windows.net/images/v0.png?sv=mock', created_at: '', updated_at: '' },
-          { id: 'r1-v1', status: 'completed', image_url: 'https://storage.blob.core.windows.net/images/v1.png?sv=mock', created_at: '', updated_at: '' },
-          { id: 'r1-v2', status: 'completed', image_url: 'https://storage.blob.core.windows.net/images/v2.png?sv=mock', created_at: '', updated_at: '' },
-          { id: 'r1-v3', status: 'completed', image_url: 'https://storage.blob.core.windows.net/images/v3.png?sv=mock', created_at: '', updated_at: '' },
-          { id: 'r1-v4', status: 'completed', image_url: 'https://storage.blob.core.windows.net/images/v4.png?sv=mock', created_at: '', updated_at: '' },
-        ]),
-        makeRoom('room-2', 'Side Garden', 5),
-        makeRoom('room-3', 'Back Patio', 5),
-      ],
-    });
-
-    const sse = buildFullGenerationSSE();
-    await setupMockedRoutes(page, pending, withCompleted, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    // Initially all pending
-    const pendingPlaceholders = page.getByText('Awaiting generation');
-    expect(await pendingPlaceholders.count()).toBeGreaterThanOrEqual(5);
-
-    // Start generation
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // Wait for reload to reflect completed state
-    // When room.status is 'completed' with no failures, the status message isn't rendered.
-    // Instead, check for the per-room variation count text "5/5 variations"
-    await expect(page.getByText('5/5 variations').first()).toBeVisible({ timeout: 10_000 });
-
-    // Numbered badges for completed variations (1-5 for room-1)
-    for (let i = 1; i <= 5; i++) {
-      // The numbered badges are inside variation thumbnails
-      const badge = page.locator(`text="${i}"`).first();
-      await expect(badge).toBeVisible();
-    }
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/05-variation-thumbnails.png`, fullPage: true });
-  });
-
-  test('full generation lifecycle completes with toast and status badge', async ({ page }) => {
-    const pending = makeMockProject();
-    const completed = makeMockProject({
-      status: 'completed',
-      completed_variations: 15,
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'completed',
-          Array.from({ length: 5 }, (_, i) => ({
-            id: `r1-v${i}`, status: 'completed' as const,
-            image_url: `https://storage.blob.core.windows.net/images/v${i}.png?sv=mock`,
-            created_at: '', updated_at: '',
-          }))),
-        makeRoom('room-2', 'Side Garden', 5, 'completed',
-          Array.from({ length: 5 }, (_, i) => ({
-            id: `r2-v${i}`, status: 'completed' as const,
-            image_url: `https://storage.blob.core.windows.net/images/v${i}.png?sv=mock`,
-            created_at: '', updated_at: '',
-          }))),
-        makeRoom('room-3', 'Back Patio', 5, 'completed',
-          Array.from({ length: 5 }, (_, i) => ({
-            id: `r3-v${i}`, status: 'completed' as const,
-            image_url: `https://storage.blob.core.windows.net/images/v${i}.png?sv=mock`,
-            created_at: '', updated_at: '',
-          }))),
-      ],
-    });
-
-    const sse = buildFullGenerationSSE();
-    await setupMockedRoutes(page, pending, completed, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    // Start generation
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // Activity log shows completion message
-    await expect(page.getByText('Generation complete!')).toBeVisible({ timeout: 15_000 });
-
-    // Toast notification
-    await expect(page.getByText('Generation completed!')).toBeVisible({ timeout: 5000 });
-
-    // Status badge should show "completed" (the badge renders the status text)
-    await expect(page.locator('text=completed').first()).toBeVisible({ timeout: 10_000 });
-
-    // Variation count shows all complete (may appear in header or body)
-    await expect(page.getByText(/15\/15 variations complete/).first()).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/06-generation-complete.png`, fullPage: true });
-  });
-
-  test('stream_ended fallback reconciles state when no terminal event received', async ({ page }) => {
-    const pending = makeMockProject();
-    const partialComplete = makeMockProject({
-      status: 'processing',
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'completed',
-          Array.from({ length: 5 }, (_, i) => ({
-            id: `r1-v${i}`, status: 'completed' as const,
-            image_url: `https://example.com/v${i}.png`,
-            created_at: '', updated_at: '',
-          }))),
-        makeRoom('room-2', 'Side Garden', 5),
-        makeRoom('room-3', 'Back Patio', 5),
-      ],
-    });
-
-    // SSE stream with events but NO project_completed or error (stream just ends)
-    const sse =
-      sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 0,
-        image_url: 'https://example.com/v0.png', elapsed_ms: 3000, tokens_used: 1100, model: 'gpt-image-2',
-      });
-    // Stream ends after this — no terminal event
-
-    await setupMockedRoutes(page, pending, partialComplete, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // The stream_ended fallback should fire, setting isGenerating=false
-    // and triggering a project reload. Generating banner should disappear.
-    await expect(page.getByText('Generating variations...')).not.toBeVisible({ timeout: 15_000 });
-
-    // After reload, page should recover and show the partially-completed state
-    await expect(page.getByText('Front Yard').first()).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/07-stream-ended-fallback.png`, fullPage: true });
-  });
-
-  test('SSE parser handles events split across ReadableStream chunks', async ({ page }) => {
-    const pending = makeMockProject();
-    const processing = makeMockProject({ status: 'processing' });
-
-    // We inject a custom fetch that delivers SSE events across multiple chunks
-    // to test the parser's cross-chunk handling (the bug that was fixed).
-    await setupMockedRoutes(page, pending, processing, '');
-
-    // Override the generate route with a chunked response
-    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/generate`, async (route: Route) => {
-      // Build two chunks that split an event across the boundary:
-      // Chunk 1: complete first event + partial second event (event: line only)
-      // Chunk 2: data: line + empty line of second event + terminal event
-      const chunk1 =
-        `event: room_started\ndata: ${JSON.stringify({ type: 'room_started', room_id: 'room-1', label: 'Front Yard' })}\n\n`
-        + `event: variation_completed\n`;
-
-      const chunk2 =
-        `data: ${JSON.stringify({
-          type: 'variation_completed', room_id: 'room-1', variation_index: 0,
-          image_url: 'https://example.com/chunk-test.png', elapsed_ms: 2000, tokens_used: 900, model: 'gpt-image-2',
-        })}\n\n`
-        + `event: project_completed\ndata: ${JSON.stringify({ type: 'project_completed', status: 'completed' })}\n\n`;
-
-      const encoder = new TextEncoder();
-      const body = Buffer.concat([
-        Buffer.from(encoder.encode(chunk1)),
-        Buffer.from(encoder.encode(chunk2)),
-      ]);
-
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        headers: { 'Cache-Control': 'no-cache' },
-        body,
-      });
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [runningJob],
+      streamSeedJobs: [runningJob],
     });
 
     await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
+    await page.waitForLoadState('domcontentloaded');
 
-    // Both events should be parsed — room_started and variation_completed
-    await expect(page.getByText(/Starting generation for/).first()).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText(/Variation 1 saved/).first()).toBeVisible({ timeout: 8000 });
+    // The banner mounts as soon as the REST seed populates the
+    // inFlightProjectGeneration slice.
+    const banner = page.getByTestId('project-generation-banner');
+    await expect(banner).toBeVisible({ timeout: 8000 });
+    await expect(banner).toHaveAttribute('data-status', 'running');
+    await expect(banner).toHaveAttribute('data-phase', 'generating');
 
-    // Terminal event should also be received
-    await expect(page.getByText('Generation complete!').first()).toBeVisible({ timeout: 8000 });
+    // Header CTA is hidden — single-action contract (issue 011 ADOPTED
+    // from the projects-page-stalled-stream-error-cleanup PRD).
+    await expect(page.getByTestId('project-header-action')).toHaveCount(0);
 
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/08-chunk-boundary.png`, fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/03-in-flight-banner.png`, fullPage: true });
   });
 
-  test('generation error renders error banner with retry button', async ({ page }) => {
-    const pending = makeMockProject();
-    const failed = makeMockProject({ status: 'failed' });
+  test('Cancel button on banner posts DELETE to /staging/jobs/{jobId}', async ({ page }) => {
+    const project = makeMockProject({ status: 'processing' });
+    const runningJob = makeProjectGenerationJob({ status: 'running' });
 
-    const sse =
-      sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('error', { type: 'error', error: 'Rate limit exceeded — please wait and retry' });
-
-    await setupMockedRoutes(page, pending, failed, sse);
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
-
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
-
-    // Error banner should appear
-    await expect(page.getByText('Generation encountered an error')).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText('Rate limit exceeded').first()).toBeVisible();
-
-    // Retry button in error banner
-    await expect(page.getByRole('button', { name: /Retry/i }).first()).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/09-error-banner.png`, fullPage: true });
-  });
-
-  test('variation failure shows error in thumbnail', async ({ page }) => {
-    const pending = makeMockProject();
-    const withFailure = makeMockProject({
-      status: 'processing',
-      rooms: [
-        makeRoom('room-1', 'Front Yard', 5, 'completed', [
-          { id: 'r1-v0', status: 'completed', image_url: 'https://example.com/v0.png', created_at: '', updated_at: '' },
-          { id: 'r1-v1', status: 'failed', error: 'Content policy violation', created_at: '', updated_at: '' },
-          { id: 'r1-v2', status: 'completed', image_url: 'https://example.com/v2.png', created_at: '', updated_at: '' },
-          { id: 'r1-v3', status: 'pending', created_at: '', updated_at: '' },
-          { id: 'r1-v4', status: 'pending', created_at: '', updated_at: '' },
-        ]),
-        makeRoom('room-2', 'Side Garden', 5),
-        makeRoom('room-3', 'Back Patio', 5),
-      ],
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [runningJob],
+      streamSeedJobs: [runningJob],
     });
 
-    const sse =
-      sseEvent('room_started', { type: 'room_started', room_id: 'room-1', label: 'Front Yard' })
-      + sseEvent('variation_completed', {
-        type: 'variation_completed', room_id: 'room-1', variation_index: 0,
-        image_url: 'https://example.com/v0.png', elapsed_ms: 3000, tokens_used: 1100, model: 'gpt-image-2',
-      })
-      + sseEvent('variation_failed', {
-        type: 'variation_failed', room_id: 'room-1', variation_index: 1,
-        error: 'Content policy violation', elapsed_ms: 1000,
-      })
-      + sseEvent('project_completed', { type: 'project_completed', status: 'completed' });
-
-    await setupMockedRoutes(page, pending, withFailure, sse);
     await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
-    await page.getByRole('button', { name: /Generate 15 Variations/i }).click();
+    await expect(page.getByTestId('project-generation-banner')).toBeVisible({ timeout: 8000 });
 
-    // Activity log should show the failure
-    await expect(page.getByText(/Variation 2 failed/)).toBeVisible({ timeout: 8000 });
+    const cancelBtn = page.getByRole('button', { name: /cancel project generation/i });
+    await expect(cancelBtn).toBeVisible();
 
-    // After reload, the failed variation thumbnail should show error text
-    await expect(page.getByText('Content policy violation').first()).toBeVisible({ timeout: 10_000 });
-
-    // Retry button on failed thumbnail
-    await expect(page.getByRole('button', { name: /Retry/i }).first()).toBeVisible();
-
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/10-variation-failure.png`, fullPage: true });
+    const [delReq] = await Promise.all([
+      page.waitForRequest((req) =>
+        req.method() === 'DELETE' && req.url().includes(`/staging/jobs/${JOB_ID}`),
+      ),
+      cancelBtn.click(),
+    ]);
+    expect(delReq).toBeTruthy();
   });
 
+  test('refreshing mid-generation re-attaches the banner from the REST seed', async ({ page }) => {
+    // First load shows the banner because the REST seed surfaces an
+    // already-running job. This is the resume-on-refresh PRD AC: the
+    // server-side change feed is the source of truth, so a page refresh
+    // after the worker has started must re-mount the banner without any
+    // explicit Generate click.
+    const project = makeMockProject({ status: 'processing' });
+    const runningJob = makeProjectGenerationJob({
+      status: 'running',
+      progress: 60,
+      phase: 'generating',
+    });
+
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [runningJob],
+      streamSeedJobs: [runningJob],
+    });
+
+    // First visit.
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('domcontentloaded');
+    await expect(page.getByTestId('project-generation-banner')).toBeVisible({ timeout: 8000 });
+
+    // Refresh — the slice must reseed from REST + SSE and the banner
+    // must reappear.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByTestId('project-generation-banner')).toBeVisible({ timeout: 8000 });
+  });
+
+  test('terminal job (succeeded) clears the in-flight banner', async ({ page }) => {
+    const project = makeMockProject({ status: 'completed' });
+    // Initial load: no in-flight jobs (the only generate_project job is
+    // already in a terminal state, so the slice resolves to null).
+    const succeededJob = makeProjectGenerationJob({
+      status: 'succeeded',
+      progress: 100,
+      phase: 'finalizing',
+    });
+
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [succeededJob],
+      streamSeedJobs: [succeededJob],
+    });
+
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('domcontentloaded');
+
+    // The banner is NOT mounted because the slice excludes terminal jobs
+    // (TERMINAL_JOB_STATUSES = succeeded | failed | cancelled).
+    await expect(page.getByTestId('project-generation-banner')).toHaveCount(0);
+  });
+
+  test('enqueue 4xx error surfaces as a user-visible toast', async ({ page }) => {
+    const project = makeMockProject();
+    await setupAsyncRoutes(page, {
+      initialProject: project,
+      updatedProject: project,
+      initialJobs: [],
+      enqueueStatus: 503,
+      enqueueBody: { detail: 'queue temporarily unavailable' },
+    });
+
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('domcontentloaded');
+
+    await page.getByTestId('project-header-action').click();
+
+    // The page surfaces a destructive toast — issue 011 PRD AC.
+    // The exact copy is "Couldn't start generation, please try again."
+    await expect(page.getByText(/Couldn't start generation/i)).toBeVisible({
+      timeout: 8000,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Variation/room regen — KEPT verbatim from the pre-cutover spec because
+// these flows still go through useGenerationFleet + streamGeneration
+// against `/regenerate` endpoints (the cutover only swapped the page-level
+// initial-generation flow).
+// ---------------------------------------------------------------------------
+
+test.describe('Project Generation — variation/room regen (legacy SSE path)', () => {
   test('failed-variation Retry regenerates only that variation, not the whole room', async ({ page }) => {
-    // Project starts with one failed variation alongside completed siblings.
-    // Clicking Retry on the failed thumbnail must hit the SINGLE-variation
-    // regen endpoint, NOT the room-wide regen endpoint, so completed siblings
-    // are preserved.
     const projectWithFailure = makeMockProject({
       status: 'completed',
       rooms: [
@@ -655,39 +519,45 @@ test.describe('Project Generation', () => {
       ],
     });
 
-    await setupMockedRoutes(page, projectWithFailure, projectWithFailure, '');
-
-    // Capture any regenerate requests so we can assert which endpoint was hit.
-    const regenRequests: string[] = [];
-    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`, (route: Route) => {
-      regenRequests.push(route.request().url());
-      return route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
-        body: sseEvent('stream_ended', { type: 'stream_ended' }),
-      });
+    await setupAsyncRoutes(page, {
+      initialProject: projectWithFailure,
+      updatedProject: projectWithFailure,
+      initialJobs: [],
     });
 
-    await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    // Capture regenerate requests (variation-level + room-level — only
+    // the variation-level one should fire).
+    const regenRequests: string[] = [];
+    await page.route(
+      `${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`,
+      (route: Route) => {
+        regenRequests.push(route.request().url());
+        return route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+          body: sseEvent('stream_ended', { type: 'stream_ended' }),
+        });
+      },
+    );
 
-    // The failed thumbnail's Retry button is rendered inside the failed-state thumbnail.
+    await page.goto(`/projects/${PROJECT_ID}`);
+    await page.waitForLoadState('domcontentloaded');
+
     const retryBtn = page.getByRole('button', { name: /Retry/i }).first();
     await expect(retryBtn).toBeVisible();
 
     const [request] = await Promise.all([
       page.waitForRequest(
-        req => req.url().includes('/regenerate') && req.method() === 'POST',
+        (req) => req.url().includes('/regenerate') && req.method() === 'POST',
         { timeout: 5000 },
       ),
       retryBtn.click(),
     ]);
 
-    // Critical assertion: must hit the variation-level endpoint, NOT room-level.
+    // Critical: variation-level endpoint, NOT room-level.
     expect(request.url()).toContain('/variations/room-1-v1/regenerate');
     expect(request.url()).toContain('strategy=fresh');
-    // And the room-level regen endpoint must NOT have been hit.
     expect(request.url()).not.toMatch(/\/rooms\/[^/]+\/regenerate(\?|$)/);
 
     await page.screenshot({
@@ -697,8 +567,6 @@ test.describe('Project Generation', () => {
   });
 
   test('room-header Regenerate still hits the room-level regen endpoint', async ({ page }) => {
-    // Guard against accidentally rerouting the room-header button alongside
-    // the failed-thumbnail Retry change. Room-level regen must remain.
     const completed = makeMockProject({
       status: 'completed',
       rooms: [
@@ -714,34 +582,37 @@ test.describe('Project Generation', () => {
       ],
     });
 
-    await setupMockedRoutes(page, completed, completed, '');
+    await setupAsyncRoutes(page, {
+      initialProject: completed,
+      updatedProject: completed,
+      initialJobs: [],
+    });
 
-    await page.route(`${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`, (route: Route) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
-        body: sseEvent('stream_ended', { type: 'stream_ended' }),
-      }),
+    await page.route(
+      `${API_BASE}/staging/projects/${PROJECT_ID}/rooms/**/regenerate**`,
+      (route: Route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          headers: { 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+          body: sseEvent('stream_ended', { type: 'stream_ended' }),
+        }),
     );
 
     await page.goto(`/projects/${PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
-    // The room-header "Regenerate" button is the small ghost-style button
-    // adjacent to the room status badge.
     const roomHeaderRegenBtn = page.getByRole('button', { name: /^Regenerate$/i }).first();
     await expect(roomHeaderRegenBtn).toBeVisible();
 
     const [request] = await Promise.all([
       page.waitForRequest(
-        req => req.url().includes('/regenerate') && req.method() === 'POST',
+        (req) => req.url().includes('/regenerate') && req.method() === 'POST',
         { timeout: 5000 },
       ),
       roomHeaderRegenBtn.click(),
     ]);
 
-    // Room-header regen must hit room-level endpoint, NOT variation-level.
     expect(request.url()).toMatch(/\/rooms\/room-1\/regenerate(\?|$)/);
     expect(request.url()).not.toContain('/variations/');
   });
@@ -752,61 +623,59 @@ test.describe('Project Generation', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('Live Smoke Test', () => {
-  // Skip by default — enable with LIVE_SMOKE=1 env var
   test.skip(!process.env.LIVE_SMOKE, 'Set LIVE_SMOKE=1 to run against live backend');
 
   const LIVE_PROJECT_ID = process.env.LIVE_PROJECT_ID ?? '17735db0-a0bf-4dfb-8a45-fcf59fe4de3e';
 
-  test('SSE stream establishes and events flow for real project', async ({ page }) => {
+  test('async-job stream establishes for real project', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', (err) => errors.push(err.message));
 
-    // Collect all console messages for debugging
     const consoleLogs: string[] = [];
     page.on('console', (msg) => consoleLogs.push(`[${msg.type()}] ${msg.text()}`));
 
     await page.goto(`/projects/${LIVE_PROJECT_ID}`);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
-    // Project should load
     await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
-
     await page.screenshot({ path: `${SCREENSHOT_DIR}/11-live-project-loaded.png`, fullPage: true });
 
-    // Look for generate or regenerate button
-    const generateBtn = page.getByRole('button', { name: /Generate|Regenerate/i }).first();
+    const generateBtn = page.getByTestId('project-header-action');
     const hasButton = await generateBtn.isVisible().catch(() => false);
 
     if (!hasButton) {
-      console.log('No generate/regenerate button found — project may already be completed or processing');
+      console.log('No generate button found — project may already be processing or completed');
       console.log('Console logs:', consoleLogs.join('\n'));
       return;
     }
 
-    // Click and verify SSE POST is made
+    // Click and verify the new async-job POST is made (NOT the legacy /generate).
     const [postReq] = await Promise.all([
       page.waitForRequest(
-        req => req.url().includes('/generate') && req.method() === 'POST',
+        (req) => req.url().includes('/jobs/generate') && req.method() === 'POST',
         { timeout: 5000 },
       ),
       generateBtn.click(),
     ]);
 
     expect(postReq).toBeTruthy();
-    console.log('SSE POST request made to:', postReq.url());
+    expect(postReq.url()).toContain('/jobs/generate');
+    console.log('Async-job POST made to:', postReq.url());
 
-    // Wait for any activity log entry to appear (proves events are flowing)
+    // Wait for the in-flight banner to mount (proves the change feed
+    // surfaced the new job to the page).
     try {
-      await expect(page.getByText(/Starting generation for/)).toBeVisible({ timeout: 30_000 });
-      console.log('✓ SSE events are flowing — activity log shows generation started');
+      await expect(page.getByTestId('project-generation-banner')).toBeVisible({
+        timeout: 30_000,
+      });
+      console.log('✓ ProjectGenerationBanner mounted — async cutover is live');
     } catch {
-      console.log('⚠ No activity log entries after 30s — SSE events may not be reaching frontend');
+      console.log('⚠ Banner did not mount within 30s — change feed may not be reaching the frontend');
       console.log('Console logs:', consoleLogs.join('\n'));
     }
 
-    await page.screenshot({ path: `${SCREENSHOT_DIR}/12-live-generation-progress.png`, fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/12-live-banner-mounted.png`, fullPage: true });
 
-    // Log any JS errors for debugging
     if (errors.length > 0) {
       console.log('JS errors:', errors);
     }

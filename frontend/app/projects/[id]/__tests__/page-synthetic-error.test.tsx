@@ -10,9 +10,17 @@
  * Strategy: render ``ProjectDetailPage`` with every external
  * dependency mocked. The fake fleet captures the
  * ``handleStreamEvent`` callback the page passes into
- * ``startProject``. The test clicks the header CTA to trigger
- * ``startProject``, then drives the captured handler with a
- * synthetic and a real error and asserts on the rendered DOM.
+ * ``startRoom`` (the room-scope regen path that still uses the
+ * fleet post issue-011 cutover). The test clicks the room-level
+ * Regenerate button to trigger ``startRoom``, then drives the
+ * captured handler with a synthetic and a real error and asserts
+ * on the rendered DOM.
+ *
+ * Issue 011 of project-generation-async-queue-cutover PRD: the
+ * page-level Generate CTA no longer routes through the fleet —
+ * it enqueues an async job via ``enqueueProjectGeneration``.
+ * Variation/room regen still uses the fleet, so this test now
+ * uses the room-Regenerate button as the trigger.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -44,6 +52,12 @@ vi.mock('next/link', () => ({
 // stagingApi — only ``getProject`` is exercised on first paint. Other
 // exports are stubbed to satisfy the page's import statement.
 // ---------------------------------------------------------------------------
+//
+// Issue 011: the room must be in a status RoomGroup considers "regen-able"
+// (failed/completed/processing) so the Regenerate button renders. The
+// project status stays 'pending' so the recovery classifier picks the
+// 'none' arm and the page doesn't render any banner before the test
+// drives an error event.
 const mockProject: StagingProject = {
   id: 'project-1',
   name: 'Test Project',
@@ -55,7 +69,7 @@ const mockProject: StagingProject = {
       id: 'room-1',
       label: 'Living Room',
       original_image_url: 'https://example.com/r1.jpg',
-      status: 'pending',
+      status: 'completed',
       variations: [],
     },
   ],
@@ -74,6 +88,7 @@ vi.mock('@/services/stagingApi', async () => {
     resetProject: vi.fn(),
     updateProject: vi.fn(),
     updateRoomAddendum: vi.fn(),
+    enqueueProjectGeneration: vi.fn(),
   };
 });
 
@@ -90,9 +105,21 @@ vi.mock('@/services/sas-token', () => ({
 // ---------------------------------------------------------------------------
 // jobs-context — return inert values; the page only reads
 // ``jobs`` / ``aggregateProgress`` for the progress bar surface.
+// Issue 011: must include the new ``inFlightProjectGeneration`` /
+// ``cancelProjectGeneration`` / ``jobsById`` keys the page now reads.
+// Returning ``null`` for the slice keeps the new ProjectGenerationBanner
+// unmounted and the recovery banner blocks unsuppressed (so the
+// destructive-banner positive control still asserts correctly).
 // ---------------------------------------------------------------------------
 vi.mock('@/context/jobs-context', () => ({
-  useProjectJobs: () => ({ jobs: [], aggregateProgress: null, status: 'idle' }),
+  useProjectJobs: () => ({
+    jobs: [],
+    jobsById: {},
+    aggregateProgress: null,
+    status: 'idle',
+    inFlightProjectGeneration: null,
+    cancelProjectGeneration: vi.fn(),
+  }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -116,13 +143,16 @@ vi.mock('sonner', () => {
 
 // ---------------------------------------------------------------------------
 // useGenerationFleet — fake fleet that records the eventHandler given
-// to ``startProject`` so the test can drive it directly.
+// to ``startRoom`` so the test can drive it directly. (Pre-issue-011
+// the trigger was startProject; that path is no longer wired from the
+// page-level Generate CTA, so the test now drives the room-regen path
+// which still uses the fleet.)
 // ---------------------------------------------------------------------------
 vi.mock('@/hooks/useGenerationFleet', () => {
-  const startProject = vi.fn((_pid: string, h: StagingStreamEventCallback) => {
+  const startRoom = vi.fn((_pid: string, _rid: string, h: StagingStreamEventCallback) => {
     (globalThis as unknown as { __captured: StagingStreamEventCallback | null }).__captured = h;
   });
-  (globalThis as unknown as { __startProject: typeof startProject }).__startProject = startProject;
+  (globalThis as unknown as { __startRoom: typeof startRoom }).__startRoom = startRoom;
   return {
     useGenerationFleet: () => ({
       inFlightProject: false,
@@ -130,8 +160,8 @@ vi.mock('@/hooks/useGenerationFleet', () => {
       inFlightVariations: new Set<string>(),
       isAnyInFlight: false,
       lostOps: [],
-      startProject,
-      startRoom: vi.fn(),
+      startProject: vi.fn(),
+      startRoom,
       startVariation: vi.fn(),
       editPrompt: vi.fn(),
       retryLostOp: vi.fn(),
@@ -163,7 +193,7 @@ import { ActivityLogProvider } from '@/context/activity-log-context';
 // Vitest, so they cannot close over module-level `let` bindings.)
 const g = globalThis as unknown as {
   __toastSpy: { error: ReturnType<typeof vi.fn>; success: ReturnType<typeof vi.fn> };
-  __startProject: ReturnType<typeof vi.fn>;
+  __startRoom: ReturnType<typeof vi.fn>;
   __captured: StagingStreamEventCallback | null;
 };
 
@@ -178,20 +208,24 @@ function renderPage() {
 describe('ProjectDetailPage — synthetic-watchdog error suppression', () => {
   beforeEach(() => {
     g.__captured = null;
-    g.__startProject.mockClear();
+    g.__startRoom.mockClear();
     g.__toastSpy.error.mockClear();
   });
 
   it('does NOT render the destructive "Generation encountered an error" banner when the page receives a synthetic watchdog error event', async () => {
     renderPage();
 
-    const generateBtn = await screen.findByTestId('project-header-action');
+    // Click the room-level Regenerate button (issue 011: page-level
+    // Generate now goes through enqueueProjectGeneration, not the
+    // fleet, so room-regen is the path that captures the fleet's
+    // event handler).
+    const regenBtn = await screen.findByRole('button', { name: /regenerate/i });
 
     await act(async () => {
-      generateBtn.click();
+      regenBtn.click();
     });
 
-    expect(g.__startProject).toHaveBeenCalledTimes(1);
+    expect(g.__startRoom).toHaveBeenCalledTimes(1);
     expect(g.__captured).not.toBeNull();
 
     await act(async () => {
@@ -212,9 +246,9 @@ describe('ProjectDetailPage — synthetic-watchdog error suppression', () => {
   it('STILL renders the destructive banner when the page receives a real (non-synthetic) error event', async () => {
     renderPage();
 
-    const generateBtn = await screen.findByTestId('project-header-action');
+    const regenBtn = await screen.findByRole('button', { name: /regenerate/i });
     await act(async () => {
-      generateBtn.click();
+      regenBtn.click();
     });
 
     expect(g.__captured).not.toBeNull();
