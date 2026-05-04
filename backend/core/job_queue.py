@@ -140,6 +140,26 @@ class JobQueue:
         """Delete a successfully processed message from the main queue."""
         self._main.delete_message(message.raw)
 
+    def extend_visibility(self, message: JobMessage, timeout_seconds: int) -> None:
+        """Roll the message's visibility timeout forward by ``timeout_seconds``.
+
+        The Storage Queue SDK returns a refreshed ``QueueMessage`` whose
+        ``pop_receipt`` and ``next_visible_on`` supersede the current
+        values. We MUST write those back onto ``message.raw`` in place
+        so that a subsequent ``complete()`` (which delegates to
+        ``delete_message`` using ``message.raw``) hands the SDK the
+        latest receipt rather than a now-stale one. Without this
+        in-place update, the heartbeat path would 404 on delete after
+        the original receipt rotated, and Storage Queue would
+        re-deliver the message — running long-running jobs (e.g.
+        project generation) twice.
+        """
+        updated = self._main.update_message(
+            message.raw, visibility_timeout=timeout_seconds
+        )
+        message.raw.pop_receipt = updated.pop_receipt
+        message.raw.next_visible_on = updated.next_visible_on
+
     def abandon(self, message: JobMessage) -> None:
         """Failure path. Re-deliver under the limit; poison at/over it.
 

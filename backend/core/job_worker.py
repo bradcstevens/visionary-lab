@@ -48,12 +48,26 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Optional
 
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+
 from backend.core.config import settings
-from backend.core.job_queue import MAX_DEQUEUE_COUNT, JobMessage, JobQueue
+from backend.core.job_queue import (
+    MAX_DEQUEUE_COUNT,
+    VISIBILITY_TIMEOUT_SECONDS,
+    JobMessage,
+    JobQueue,
+)
 from backend.core.job_store import JobStore
 from backend.core.progress_estimator import ProgressEstimator
 
 logger = logging.getLogger(__name__)
+
+
+# Heartbeat cadence for the visibility-timeout extension loop spawned
+# by ``process_one`` while a dispatcher runs. Pinned by the PRD's
+# "every 30 seconds" requirement; comfortably under the 90s queue
+# visibility timeout so we get ~3 extensions per window.
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 class JobCancelled(Exception):
@@ -88,6 +102,7 @@ class JobWorker:
         idle_sleep: float = 1.0,
         estimator: Optional[ProgressEstimator] = None,
         progress_interval: float = 2.0,
+        heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
     ):
         self._queue = queue
         self._store = store
@@ -95,6 +110,7 @@ class JobWorker:
         self._idle_sleep = idle_sleep
         self._estimator = estimator
         self._progress_interval = progress_interval
+        self._heartbeat_interval = heartbeat_interval
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -212,9 +228,9 @@ class JobWorker:
             "model"
         ) or getattr(settings, "DEFAULT_IMAGE_MODEL", "default")
         kind = job.get("kind") or "unknown"
-        heartbeat: Optional[asyncio.Task[None]] = None
+        progress_heartbeat: Optional[asyncio.Task[None]] = None
         if self._estimator is not None:
-            heartbeat = asyncio.create_task(
+            progress_heartbeat = asyncio.create_task(
                 self._emit_progress(
                     job_id=job_id,
                     project_id=project_id,
@@ -223,6 +239,21 @@ class JobWorker:
                     started_monotonic=started_monotonic,
                 )
             )
+
+        # 4b) Visibility-timeout heartbeat (issue 001 of project-
+        # generation-async-queue-cutover). UNCONDITIONAL — fast jobs
+        # (~20s) cancel the task before its first wake; long-running
+        # jobs (project generation, multi-minute) get their queue
+        # visibility extended every ``heartbeat_interval`` seconds so
+        # Storage Queue does NOT redeliver a successful run after the
+        # 90s window. The shared ``message_lock`` serializes extend
+        # against complete/abandon — without it, an in-flight extend
+        # could race with the post-dispatch delete and either lose
+        # the freshest pop_receipt or 404 on delete.
+        message_lock = asyncio.Lock()
+        visibility_heartbeat: asyncio.Task[None] = asyncio.create_task(
+            self._extend_visibility_loop(message, message_lock)
+        )
 
         try:
             try:
@@ -236,7 +267,8 @@ class JobWorker:
                     job_id,
                     project_id,
                 )
-                self._queue.complete(message)
+                async with message_lock:
+                    self._queue.complete(message)
                 return
             except Exception as exc:  # noqa: BLE001 — convert to durable error
                 error_payload = {
@@ -258,13 +290,22 @@ class JobWorker:
                     terminal,
                     error_payload,
                 )
-                self._queue.abandon(message)
+                async with message_lock:
+                    self._queue.abandon(message)
                 return
         finally:
-            if heartbeat is not None:
-                heartbeat.cancel()
+            # Cancel both heartbeats. Awaiting cancellation guarantees
+            # neither task is mid-flight when complete()/abandon() is
+            # called below the finally — combined with the lock guard
+            # this gives belt-and-suspenders safety against the
+            # rubber-duck blocking #1 finding (stale pop_receipt → 404
+            # on delete → message redelivered → pipeline runs twice).
+            for task in (visibility_heartbeat, progress_heartbeat):
+                if task is None:
+                    continue
+                task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await heartbeat
+                    await task
 
         # 5) Success.
         self._store.update_job(
@@ -296,7 +337,67 @@ class JobWorker:
             project_id,
             attempts,
         )
-        self._queue.complete(message)
+        async with message_lock:
+            self._queue.complete(message)
+
+    async def _extend_visibility_loop(
+        self,
+        message: JobMessage,
+        lock: asyncio.Lock,
+    ) -> None:
+        """Periodically extend the queue message's visibility timeout.
+
+        Spawned by ``_handle`` for every dispatched message. Each tick
+        sleeps ``heartbeat_interval`` seconds, then calls
+        ``JobQueue.extend_visibility`` under the shared ``lock`` so the
+        extend cannot race with a concurrent ``complete()``/``abandon()``
+        on the same message.
+
+        Exit conditions:
+          - ``CancelledError`` (the dispatcher returned/raised, finally
+            cancels us). Re-raised so the awaiter's
+            ``contextlib.suppress`` sees the cancel.
+          - ``ResourceNotFoundError`` / ``HttpResponseError`` — the
+            message has almost certainly been deleted out from under us
+            (success path completed first, or a peer worker raced).
+            Logged at debug; loop exits cleanly so the awaiting task
+            terminates without bubbling.
+          - Any other exception is logged and the loop continues — the
+            heartbeat must NOT derail an in-flight long-running job
+            because of a transient storage hiccup. The next tick will
+            try again; if the storage is genuinely down, the queue's
+            visibility-timeout safety net kicks in (redelivery), which
+            is the same outcome we'd get without the heartbeat.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._heartbeat_interval)
+            except asyncio.CancelledError:
+                raise
+            try:
+                async with lock:
+                    self._queue.extend_visibility(
+                        message, VISIBILITY_TIMEOUT_SECONDS
+                    )
+                logger.debug(
+                    "heartbeat.extend job_id=%s",
+                    message.job_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (ResourceNotFoundError, HttpResponseError) as exc:
+                logger.debug(
+                    "heartbeat.skip job_id=%s reason=%s",
+                    message.job_id,
+                    exc.__class__.__name__,
+                )
+                return
+            except Exception:  # noqa: BLE001 — never derail the worker
+                logger.warning(
+                    "heartbeat.extend_failed job_id=%s",
+                    message.job_id,
+                    exc_info=True,
+                )
 
     async def _emit_progress(
         self,

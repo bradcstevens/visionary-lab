@@ -252,3 +252,86 @@ def test_default_construction_uses_managed_identity_no_connection_string(monkeyp
     for c in captured["calls"]:
         assert c["account_url"] == "https://teststorage.queue.core.windows.net/"
         assert c["credential"] is fake_cred
+
+
+# ---------------------------------------------------------------------------
+# Extend visibility — heartbeat for long-running messages (issue 001)
+# ---------------------------------------------------------------------------
+
+
+def test_extend_visibility_calls_update_message_with_timeout():
+    """The wrapper must drive the SDK's update_message with the requested
+    visibility timeout. The Azure Storage Queue SDK uses the message's
+    id + pop_receipt internally when the QueueMessage object is passed
+    in directly, so we don't need to forward those explicitly."""
+    main = MagicMock()
+    updated = MagicMock()
+    updated.pop_receipt = "fresh-receipt"
+    updated.next_visible_on = "2026-05-03T20:30:00Z"
+    main.update_message.return_value = updated
+    queue = _make_queue(main=main)
+
+    msg, raw = _msg(dequeue_count=1)
+    raw.pop_receipt = "stale-receipt"
+    raw.next_visible_on = "2026-05-03T20:00:00Z"
+
+    queue.extend_visibility(msg, 90)
+
+    main.update_message.assert_called_once()
+    args = main.update_message.call_args
+    assert args.kwargs.get("visibility_timeout") == 90
+
+
+def test_extend_visibility_writes_back_pop_receipt_in_place():
+    """AC: the wrapper mutates ``message.raw`` in place so a subsequent
+    ``complete()`` (which delegates to ``delete_message`` using
+    ``message.raw``) uses the latest receipt rather than a stale one.
+
+    Without this write-back the rubber-duck blocking #1 finding triggers:
+    after a 30s heartbeat extension, complete() would 404 and the
+    Storage Queue would redeliver the message, running the project
+    pipeline twice.
+    """
+    main = MagicMock()
+    updated = MagicMock()
+    updated.pop_receipt = "fresh-receipt"
+    updated.next_visible_on = "2026-05-03T20:30:00Z"
+    main.update_message.return_value = updated
+    queue = _make_queue(main=main)
+
+    msg, raw = _msg(dequeue_count=1)
+    raw.pop_receipt = "stale-receipt"
+    raw.next_visible_on = "2026-05-03T20:00:00Z"
+
+    queue.extend_visibility(msg, 90)
+
+    assert raw.pop_receipt == "fresh-receipt"
+    assert raw.next_visible_on == "2026-05-03T20:30:00Z"
+    # And the JobMessage's raw still points at the same object — no
+    # replacement, in-place mutation only.
+    assert msg.raw is raw
+
+
+def test_complete_after_extend_visibility_uses_refreshed_pop_receipt():
+    """End-to-end pin for the rubber-duck blocking #1 finding: once
+    extend_visibility has run, calling complete must hand the SDK a
+    message whose pop_receipt is the freshly-refreshed one. Without
+    the in-place write-back, the delete would 404."""
+    main = MagicMock()
+    updated = MagicMock()
+    updated.pop_receipt = "fresh-receipt"
+    updated.next_visible_on = "2026-05-03T20:30:00Z"
+    main.update_message.return_value = updated
+    queue = _make_queue(main=main)
+
+    msg, raw = _msg(dequeue_count=1)
+    raw.pop_receipt = "stale-receipt"
+
+    queue.extend_visibility(msg, 90)
+    queue.complete(msg)
+
+    main.delete_message.assert_called_once_with(raw)
+    # delete_message receives the raw message object; the SDK reads
+    # pop_receipt off it. The mutation in extend_visibility ensures
+    # this read returns the fresh receipt.
+    assert raw.pop_receipt == "fresh-receipt"
