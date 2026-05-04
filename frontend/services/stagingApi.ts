@@ -291,6 +291,93 @@ export async function createProject(request: CreateProjectRequest): Promise<Stag
   const data = await response.json();
   return data.project ?? data;
 }
+
+/**
+ * Recognizable error thrown by ``enqueueProjectGeneration`` when the
+ * 180s client-side abort fires.
+ *
+ * Issue 011 catches and discriminates on this error specifically to
+ * render a "couldn't reach generation; try again" banner — a generic
+ * AbortError would conflate the timeout with a user-initiated cancel.
+ */
+export class EnqueueGenerationTimeoutError extends Error {
+  constructor(message = "Project generation enqueue timed out after 180s") {
+    super(message);
+    this.name = "EnqueueGenerationTimeoutError";
+  }
+}
+
+/**
+ * Enqueue a ``generate_project`` job via the async-queue producer
+ * endpoint added in issue 006.
+ *
+ * The endpoint composes the design brief inline (~30-90s blocking
+ * call) before returning ``{ job_id }``, so the helper is configured
+ * with a 180s ``AbortController`` timeout. That sits comfortably above
+ * the inline-brief P99 and below typical Azure Front Door defaults
+ * (~240s) — the UI fails loud with ``EnqueueGenerationTimeoutError``
+ * rather than spinning indefinitely on a stalled request.
+ *
+ * @param projectId - target project id (path parameter)
+ * @param options.regenerateAll - when true, the backend cascade-cancels
+ *   every in-flight regenerate_variation job for the project BEFORE
+ *   creating the new generate_project doc (point of no return — the
+ *   cancellation persists even if create/enqueue subsequently fails).
+ *   Defaults to false. Coerced to a strict literal boolean before the
+ *   POST so the backend's ``StrictBool`` validator never sees
+ *   ``undefined`` / truthy garbage.
+ * @returns Promise resolving to ``{ job_id }`` on 2xx; rejects with
+ *   ``EnqueueGenerationTimeoutError`` on the 180s abort and a generic
+ *   ``Error`` (status + body included) on every other non-2xx.
+ */
+export async function enqueueProjectGeneration(
+  projectId: string,
+  options?: { regenerateAll?: boolean },
+): Promise<{ job_id: string }> {
+  const url = `${API_BASE_URL}/staging/projects/${projectId}/jobs/generate`;
+  const body = JSON.stringify({
+    regenerate_all: options?.regenerateAll === true,
+  });
+
+  if (API_DEBUG) {
+    console.log(`POST ${url}`);
+    console.log("Body:", body);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 180_000);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      signal: controller.signal,
+    });
+  } catch (err: unknown) {
+    if (
+      err !== null &&
+      typeof err === "object" &&
+      (err as { name?: unknown }).name === "AbortError"
+    ) {
+      throw new EnqueueGenerationTimeoutError();
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Failed to enqueue project generation: ${response.status} ${errorText}`,
+    );
+  }
+
+  return await response.json();
+}
+
 export async function listProjects(): Promise<StagingProject[]> {
   const url = `${API_BASE_URL}/staging/projects`;
   
