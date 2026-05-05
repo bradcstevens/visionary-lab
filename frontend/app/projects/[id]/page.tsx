@@ -20,7 +20,7 @@ import { ImageLightbox, LightboxImage } from "@/components/staging/ImageLightbox
 import { ProjectSettingsSheet } from "@/components/staging/ProjectSettingsSheet";
 import { EditPromptDialog } from "@/components/staging/EditPromptDialog";
 import { CollapsiblePrompt } from "@/components/staging/CollapsiblePrompt";
-import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, enqueueProjectGeneration, EnqueueGenerationTimeoutError, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
+import { getProject, deleteProject, resetProject, updateProject, updateRoomAddendum, enqueueProjectGeneration, EnqueueGenerationTimeoutError, EnqueueGenerationFailedError, StagingProject, Room, StagingStreamEvent, StagingStreamEventCallback, UpdateProjectBody } from "@/services/stagingApi";
 import { sasTokenService } from "@/services/sas-token";
 import { toast } from "sonner";
 import { parseApiError } from "@/utils/error-utils";
@@ -30,7 +30,11 @@ import { useActivityLog } from "@/context/activity-log-context";
 import { useRetryQueue } from "@/hooks/useRetryQueue";
 import { useGenerationFleet, type LostOp } from "@/hooks/useGenerationFleet";
 import { useProjectJobs } from "@/context/jobs-context";
+import type { ProjectJob } from "@/context/jobs-context";
 import { ProjectGenerationBanner } from "@/components/staging/ProjectGenerationBanner";
+import { EnqueueingBanner } from "@/components/staging/EnqueueingBanner";
+import { getErrorKindCopy } from "@/lib/error-kind-copy";
+import { deriveLogEntries } from "@/lib/activity-log-derivation";
 
 export default function ProjectDetailPage() {
   const params = useParams();
@@ -45,6 +49,18 @@ export default function ProjectDetailPage() {
   // `inFlightRooms` / `inFlightVariations` substitute for the prior reads
   // of `isGenerating` / `regeneratingVariationId`.
   const [generationError, setGenerationError] = useState<string | null>(null);
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: structured
+  // enqueue-error state set when the producer returns a classified
+  // ``EnqueueGenerationFailedError`` (issue 002 contract). Drives a
+  // dedicated recovery banner arm (the friendly-copy one) — kept
+  // separate from ``generationError`` so the legacy ``parseApiError``
+  // pipeline isn't fed structured-payload strings it would mis-classify.
+  const [enqueueErrorState, setEnqueueErrorState] = useState<{
+    errorKind: string;
+    userMessage: string;
+    httpStatus: number;
+    detail?: { type?: string; message?: string } | null;
+  } | null>(null);
   // Issue 011 of project-generation-async-queue-cutover PRD: tracks the
   // 30-90s window between the user clicking Generate and the producer
   // endpoint returning 202 with a job_id (inline brief composition runs
@@ -296,6 +312,12 @@ export default function ProjectDetailPage() {
   // The page mounts the ProjectGenerationBanner whenever this is non-null.
   const inFlightProjectGeneration = projectJobs.inFlightProjectGeneration;
   const cancelProjectGeneration = projectJobs.cancelProjectGeneration;
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: optimistic-job
+  // injection helper (jobs-context API). Called on a 202 response with
+  // the real job_id so the in-flight banner / room tile renders before
+  // the SSE seed catches up; the SSE-delivered doc supersedes the
+  // optimistic placeholder via the merge rule (epoch-zero updated_at).
+  const injectOptimisticJob = projectJobs.injectOptimisticJob;
   // Composite busy flag: true when ANY generation flow is mutating the
   // project. The fleet half (isAnyInFlight) covers the legacy variation /
   // room SSE streams; isProjectGenerationBusy covers the new async path
@@ -317,6 +339,34 @@ export default function ProjectDetailPage() {
     }
     return map;
   })();
+
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: activity-log
+  // derivation effect. Compares the previous jobs-by-id snapshot to the
+  // current one and emits structured log entries via deriveLogEntries
+  // (pure module). The bootstrap suppression guard (``bootstrappedRef``)
+  // ensures the first non-empty snapshot — which arrives via the SSE
+  // seed event mid-page load — does NOT backfill log entries for jobs
+  // that have been running since before the user opened the page.
+  // Without this, a refresh during an active run would emit "queued"
+  // entries for every existing job. The ref flips to false once the
+  // first non-empty snapshot is processed; subsequent updates emit
+  // log entries normally.
+  const prevJobsByIdRef = useRef<Record<string, ProjectJob>>({});
+  const bootstrappedRef = useRef(true);
+  useEffect(() => {
+    const current = projectJobs.jobsById;
+    const isBootstrap = bootstrappedRef.current;
+    const entries = deriveLogEntries(prevJobsByIdRef.current, current, {
+      bootstrap: isBootstrap,
+    });
+    for (const entry of entries) {
+      activityLog.log(entry);
+    }
+    prevJobsByIdRef.current = current;
+    if (isBootstrap && Object.keys(current).length > 0) {
+      bootstrappedRef.current = false;
+    }
+  }, [projectJobs.jobsById, activityLog]);
 
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
@@ -735,27 +785,126 @@ export default function ProjectDetailPage() {
   // backend path is reserved for a distinct future affordance (per PRD
   // issue 006: it pre-cancels in-flight variation jobs and reruns
   // everything from scratch).
+  //
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD rewrite:
+  //
+  //   1. Click → ``isEnqueueing=true`` immediately mounts the
+  //      ``EnqueueingBanner`` synchronously. NO upfront activity-log
+  //      entry — the branch decides what to log.
+  //   2. Helper resolves with ``{ job_id, already_in_flight }``:
+  //      - 202 (already_in_flight=false) → ``injectOptimisticJob`` so
+  //        the inFlightProjectGeneration slice has a doc to surface
+  //        BEFORE the SSE seed catches up; activity log "Submitted to
+  //        queue".
+  //      - 200 (already_in_flight=true) → toast "Generation already
+  //        in progress" + scroll into view; activity log info entry.
+  //        No optimistic injection (the existing job is already in
+  //        the SSE stream).
+  //   3. Helper rejects with ``EnqueueGenerationFailedError`` →
+  //      structured ``enqueueErrorState`` so the dedicated recovery
+  //      banner arm renders friendly copy + technical-details
+  //      collapsible.
+  //   4. Helper rejects with ``EnqueueGenerationTimeoutError`` →
+  //      toast (preserves the issue 011 contract).
+  //   5. Other errors → legacy ``generationError`` path (parsed via
+  //      parseApiError) so anything we can't classify still produces
+  //      a user-visible recovery banner.
+  //
+  // Re-entrancy guard (rubber-duck issue 004): two fast clicks on
+  // Retry can call startGeneration twice in the same React tick,
+  // before isAnyGenerationBusy has flushed via re-render. The
+  // closure-captured boolean is stale on the second call, so the
+  // ``if (isAnyGenerationBusy) return`` guard would let both calls
+  // race to the producer. The imperative ref below flips
+  // synchronously and is read at call time so duplicate calls
+  // short-circuit even when no re-render has occurred.
+  const startGenerationInFlightRef = useRef(false);
   const startGeneration = useCallback(async () => {
     retryQueue.clear();
     if (isAnyGenerationBusy) return;
+    if (startGenerationInFlightRef.current) return;
+    startGenerationInFlightRef.current = true;
     setGenerationError(null);
+    setEnqueueErrorState(null);
     setIsEnqueueing(true);
-    activityLog.log({
-      level: 'info',
-      icon: '▶',
-      message: `Starting generation for "${project?.name}"`,
-      detail: `${totalVariations} variations queued across ${project?.rooms.length} images`,
-    });
     try {
-      await enqueueProjectGeneration(projectId, { regenerateAll: false });
+      const result = await enqueueProjectGeneration(projectId, { regenerateAll: false });
+      if (result.already_in_flight) {
+        // 200 dedupe path — a generate_project job is already in
+        // flight server-side. Surface a small info toast + scroll
+        // into the room grid. The SSE seed will deliver the
+        // existing job's doc within a moment.
+        toast.info("Generation already in progress");
+        activityLog.log({
+          level: 'info',
+          icon: 'ℹ',
+          message: 'Generation already in progress',
+          detail: `Server reused existing job ${result.job_id.slice(0, 8)}.`,
+        });
+        // Best-effort scroll into the rooms grid so the user sees
+        // their work. The selector matches the project rooms region
+        // mounted lower on the page.
+        if (typeof document !== 'undefined') {
+          const target = document.querySelector('[data-testid="project-rooms"]');
+          if (target && typeof target.scrollIntoView === 'function') {
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }
+      } else {
+        // 202 happy path — fresh enqueue. Inject an optimistic job
+        // with the real job_id so the in-flight banner / room tile
+        // surfaces immediately. Real SSE doc supersedes via merge.
+        //
+        // Issue 004: NO manual activity-log entry here. The
+        // ``deriveLogEntries`` effect (line ~360) sees the optimistic
+        // job appear in jobsById with phase=queued and emits a
+        // single "Queued" entry. Emitting both "Submitted to queue"
+        // here AND letting derivation emit "Queued" produces two
+        // entries for the same logical event. Derivation is the
+        // single source of truth for job-driven log entries.
+        const optimistic: ProjectJob = {
+          id: result.job_id,
+          project_id: projectId,
+          room_id: '__project__',
+          variation_id: '__project__',
+          revision: 0,
+          kind: 'generate_project',
+          status: 'pending',
+          progress: 0,
+          phase: 'queued',
+          updated_at: '1970-01-01T00:00:00Z',
+        };
+        injectOptimisticJob(optimistic);
+      }
     } catch (err: unknown) {
       // 180s client-side abort surfaces as a user-visible toast rather
       // than a frozen spinner (PRD AC: "user-visible error message
       // 'Couldn't start generation, please try again'").
       if (err instanceof EnqueueGenerationTimeoutError) {
         toast.error("Couldn't start generation, please try again.");
+      } else if (err instanceof EnqueueGenerationFailedError) {
+        // Issue 004: structured backend failure. Set the dedicated
+        // ``enqueueErrorState`` so the friendly recovery banner arm
+        // renders kind-specific copy via getErrorKindCopy. NO toast —
+        // the banner is the recovery surface, not a fire-and-forget
+        // notification.
+        setEnqueueErrorState({
+          errorKind: err.errorKind,
+          userMessage: err.userMessage,
+          httpStatus: err.httpStatus,
+          detail: err.detail ?? null,
+        });
+        const copy = getErrorKindCopy(err.errorKind);
+        activityLog.log({
+          level: 'error',
+          icon: '⚠',
+          message: copy.friendlyTitle,
+          detail: err.detail?.message
+            ? `${err.detail.type ?? 'Error'}: ${err.detail.message}`
+            : err.userMessage,
+        });
       } else {
-        // Non-2xx + network errors: surface as a destructive recovery
+        // Non-classified errors: surface as a destructive recovery
         // banner via setGenerationError. The recovery classifier maps
         // this to the existing 'error' arm and renders the prior
         // collapsible "Full error" detail block.
@@ -765,8 +914,9 @@ export default function ProjectDetailPage() {
       }
     } finally {
       setIsEnqueueing(false);
+      startGenerationInFlightRef.current = false;
     }
-  }, [retryQueue, activityLog, project, totalVariations, isAnyGenerationBusy, projectId]);
+  }, [retryQueue, activityLog, isAnyGenerationBusy, projectId, injectOptimisticJob]);
 
   const handleRegenerateRoom = useCallback((room: Room) => {
     retryQueue.clear();
@@ -1119,8 +1269,31 @@ export default function ProjectDetailPage() {
         </div>
       </div>
 
+      {/* Issue 004 of active-and-queued-jobs-ux-redesign PRD: synchronous
+          preflight banner. Mounts immediately on click and stays up until
+          either (a) the producer returns (202 → SSE seed populates the
+          inFlightProjectGeneration slice → its banner takes over; 200 →
+          dedupe toast clears `isEnqueueing`) or (b) the producer rejects
+          with a structured EnqueueGenerationFailedError, in which case
+          we mount the dedicated enqueue-error banner below instead. The
+          two visibility predicates are mutually exclusive so exactly one
+          banner is rendered at a time (single-banner contract). */}
+      {isEnqueueing && !inFlightProjectGeneration && !enqueueErrorState && (
+        <EnqueueingBanner />
+      )}
+
       {/* Issue 011 of project-generation-async-queue-cutover PRD:
           in-flight project-generation banner. The slice is non-null
+          for any non-terminal generate_project job; mounting this
+          banner takes precedence over the recovery banner blocks
+          below (single-banner contract). The Cancel button signals
+          the worker via cancelProjectGeneration; the slice stays
+          non-null until the worker observes the cancel_requested
+          flag and flips status to 'cancelled' (during which window
+          the banner shows the disabled "Cancelling…" state via the
+          cancelling prop). */}
+
+      {/* in-flight project-generation banner. The slice is non-null
           for any non-terminal generate_project job; mounting this
           banner takes precedence over the recovery banner blocks
           below (single-banner contract). The Cancel button signals
@@ -1147,6 +1320,95 @@ export default function ProjectDetailPage() {
         />
       )}
 
+      {/* Issue 004 of active-and-queued-jobs-ux-redesign PRD: structured
+          enqueue-error banner. Replaces the legacy generationError
+          recovery banner specifically for classified producer failures
+          (issue 002 ErrorKind contract). Friendly title + user-message
+          come from getErrorKindCopy(errorKind) so a single source of
+          truth maps the 5 enum values to UX copy. The collapsible
+          "Show technical details" surfaces detail.type / detail.message
+          for support / debugging. Retry clears the structured state and
+          re-runs startGeneration; Dismiss clears the state without
+          retrying. This block takes precedence over the legacy
+          recovery banner (the suppression below).
+          The ``!inFlightProjectGeneration`` gate is belt-and-suspenders:
+          ``startGeneration`` early-returns when a project job is in
+          flight, so we cannot normally reach this state. Add the gate
+          anyway in case a future race (e.g. SSE delivers a stale doc
+          AFTER setEnqueueErrorState) would otherwise mount two banners. */}
+      {enqueueErrorState && !inFlightProjectGeneration && (() => {
+        const copy = getErrorKindCopy(enqueueErrorState.errorKind);
+        return (
+          <div
+            data-testid="enqueue-error-banner"
+            data-error-kind={enqueueErrorState.errorKind}
+            className="overflow-hidden rounded-lg border border-destructive/20 bg-destructive/[0.04]"
+          >
+            <div className="flex items-start gap-3 p-4">
+              <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0 space-y-1">
+                <p className="text-sm font-medium text-destructive">
+                  {copy.friendlyTitle}
+                </p>
+                <p className="text-xs text-destructive/80 break-words">
+                  {copy.userMessage}
+                </p>
+                {(enqueueErrorState.detail?.type || enqueueErrorState.detail?.message) && (
+                  <Collapsible>
+                    <CollapsibleTrigger className="group inline-flex items-center gap-1 text-[11px] text-destructive/60 hover:text-destructive transition-colors mt-1 cursor-pointer">
+                      <ChevronDown className="h-3 w-3 transition-transform group-data-[state=open]:rotate-180" />
+                      Show technical details
+                    </CollapsibleTrigger>
+                    <CollapsibleContent forceMount>
+                      <pre
+                        data-testid="enqueue-error-detail"
+                        className="mt-2 rounded-md bg-destructive/[0.06] border border-destructive/10 px-3 py-2 text-[11px] text-destructive/70 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto"
+                      >
+                        {enqueueErrorState.detail?.type ?? 'Error'}: {enqueueErrorState.detail?.message ?? '(no message)'}
+                        {enqueueErrorState.httpStatus ? ` [HTTP ${enqueueErrorState.httpStatus}]` : ''}
+                      </pre>
+                    </CollapsibleContent>
+                  </Collapsible>
+                )}
+              </div>
+              <div className="flex flex-col items-end gap-1 shrink-0">
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    data-testid="enqueue-error-dismiss"
+                    onClick={() => setEnqueueErrorState(null)}
+                  >
+                    Dismiss
+                  </Button>
+                  {copy.retryable && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      data-testid="enqueue-error-retry"
+                      onClick={() => {
+                        setEnqueueErrorState(null);
+                        if (!isAnyInFlight) {
+                          startGeneration();
+                        }
+                      }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                      Retry
+                    </Button>
+                  )}
+                </div>
+                {copy.showAdminContact && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Contact your administrator if this persists.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Issue 002 of projects-page-stalled-stream-error-cleanup PRD:
           unified recovery banner. Replaces the three prior in-line
           banner blocks (`generationError`, `isStaleProcessing`,
@@ -1156,7 +1418,7 @@ export default function ProjectDetailPage() {
           Issue 011: SUPPRESSED while a project-scope async job is
           enqueueing or running (the in-flight banner above takes
           precedence — single-banner contract). */}
-      {!isProjectGenerationBusy && recoveryState.kind === 'error' && (
+      {!isProjectGenerationBusy && !enqueueErrorState && recoveryState.kind === 'error' && (
           <div
             data-testid="recovery-banner"
             data-recovery-kind="error"
@@ -1224,7 +1486,7 @@ export default function ProjectDetailPage() {
             </div>
           )}
 
-      {!isProjectGenerationBusy && recoveryState.kind === 'stream-lost' && (
+      {!isProjectGenerationBusy && !enqueueErrorState && recoveryState.kind === 'stream-lost' && (
         <div
           data-testid="recovery-banner"
           data-recovery-kind="stream-lost"
@@ -1277,7 +1539,7 @@ export default function ProjectDetailPage() {
         </div>
       )}
 
-      {!isProjectGenerationBusy && recoveryState.kind === 'interrupted' && (
+      {!isProjectGenerationBusy && !enqueueErrorState && recoveryState.kind === 'interrupted' && (
         <div
           data-testid="recovery-banner"
           data-recovery-kind="interrupted"

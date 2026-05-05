@@ -45,6 +45,13 @@ export interface ProjectJob {
   phase?: JobPhase
   attempts?: number
   error?: string | null
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: classified
+  // failure kind written by the worker on terminal-failure transitions
+  // and by the producer on enqueue failures (issue 002). Mirrors the
+  // backend's ``ErrorKind`` enum (.value form). Optional because most
+  // jobs don't carry one — only failed ones, and even then only after
+  // the issue 002 backend ship.
+  error_kind?: string | null
   result?: unknown
   cancel_requested?: boolean
   created_at?: string
@@ -136,6 +143,17 @@ export interface ProjectJobsState {
   // the SSE/REST stream after the worker observes ``cancel_requested=true``;
   // we intentionally do NOT optimistically mutate (contrast with retry()).
   cancelProjectGeneration: () => Promise<void>
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: inject a synthetic
+  // optimistic job into the merged jobsById so the in-flight banner / room
+  // tile renders immediately on a 202 response, before the SSE seed catches
+  // up (~1-3s window). The job's ``updated_at`` is forced to epoch zero
+  // ("1970-01-01T00:00:00Z") so any real SSE doc with a non-empty
+  // ``updated_at`` strictly supersedes it via ``_isNewer``. Page-level
+  // callers populate the synthetic doc with the REAL ``job_id`` returned
+  // from the producer 202; if SSE never delivers (network down), the
+  // optimistic doc lingers — same failure mode as before, just with a
+  // visible banner instead of a silent gap.
+  injectOptimisticJob: (job: ProjectJob) => void
 }
 
 interface UseProjectJobsOptions {
@@ -488,6 +506,14 @@ export function useProjectJobs(
     // the cancel_requested flip and the eventual terminal status.
   }, [apiBaseUrl, fetchFn, inFlightProjectGeneration])
 
+  // Issue 004 of active-and-queued-jobs-ux-redesign PRD: inject a synthetic
+  // optimistic job. Forces ``updated_at`` to epoch zero so the merge rule
+  // (``_isNewer``) lets any real SSE doc supersede us regardless of when
+  // the optimistic injection happened.
+  const injectOptimisticJob = useCallback((job: ProjectJob): void => {
+    mergeJobs([{ ...job, updated_at: "1970-01-01T00:00:00Z" }])
+  }, [mergeJobs])
+
   return {
     jobs,
     jobsById,
@@ -498,6 +524,7 @@ export function useProjectJobs(
     refresh: seedFromRest,
     inFlightProjectGeneration,
     cancelProjectGeneration,
+    injectOptimisticJob,
   }
 }
 
