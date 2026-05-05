@@ -71,6 +71,13 @@ export default function ProjectDetailPage() {
   const [isEnqueueing, setIsEnqueueing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
+  // ``isRefreshing`` drives inline feedback on the interrupted-recovery
+  // banner Refresh button. Set true synchronously on click, cleared in the
+  // wrapping ``finally`` so the spinner stops on success, error, or the
+  // stale-loadId early-return path. Distinct from ``isLoading`` so the
+  // page-level full-page guard does not flash; the user sees the existing
+  // banner with a button-local spinner instead of a destructive page swap.
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showSettingsSheet, setShowSettingsSheet] = useState(false);
   // Issue 004 of projects-page-improvements PRD: per-variation Edit
@@ -181,10 +188,16 @@ export default function ProjectDetailPage() {
     }
   };
 
-  const loadProject = useCallback(async () => {
+  // ``blocking`` toggles the page-level full-page loader. Defaults true so
+  // every existing caller (mount effect, debouncedReload, post-cancel
+  // reloads, stream handlers) keeps today's behavior. The interrupted-
+  // banner Refresh button is the only opt-out: it passes ``blocking: false``
+  // so the banner stays mounted with a button-local spinner instead of the
+  // entire view being replaced by a generic "Loading project..." screen.
+  const loadProject = useCallback(async ({ blocking = true }: { blocking?: boolean } = {}) => {
     const loadId = ++latestLoadIdRef.current;
     try {
-      setIsLoading(true);
+      if (blocking) setIsLoading(true);
       const data = await getProject(projectId);
       // Discard stale responses from overlapping fetches
       if (loadId !== latestLoadIdRef.current) return;
@@ -197,6 +210,10 @@ export default function ProjectDetailPage() {
       toast.error('Failed to load project');
       router.push('/projects');
     } finally {
+      // Always reset on the latest call regardless of blocking. This
+      // guarantees a stranded ``isLoading=true`` from a prior blocking
+      // call cannot persist after a later non-blocking call wins the
+      // ``latestLoadIdRef`` race.
       if (loadId === latestLoadIdRef.current) {
         setIsLoading(false);
       }
@@ -1740,17 +1757,30 @@ export default function ProjectDetailPage() {
                 size="sm"
                 variant="outline"
                 data-testid="recovery-banner-secondary"
-                onClick={loadProject}
-                disabled={isResetting}
+                onClick={() => {
+                  // Inline-feedback Refresh: ``blocking: false`` keeps
+                  // the banner mounted (no full-page guard flash); the
+                  // local ``isRefreshing`` toggle drives the button
+                  // spinner and disables both banner buttons so the
+                  // user cannot fire ``Reset & Retry`` against stale
+                  // state mid-fetch. ``finally`` runs even on the
+                  // stale-loadId early-return path, so the spinner
+                  // always stops.
+                  setIsRefreshing(true);
+                  loadProject({ blocking: false }).finally(() =>
+                    setIsRefreshing(false),
+                  );
+                }}
+                disabled={isResetting || isRefreshing}
               >
-                <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                {isRefreshing ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
                 Refresh
               </Button>
               <Button
                 size="sm"
                 data-testid="recovery-banner-primary"
                 onClick={handleResetProject}
-                disabled={isResetting}
+                disabled={isResetting || isRefreshing}
               >
                 {isResetting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Play className="h-3.5 w-3.5 mr-1" />}
                 Reset &amp; Retry
