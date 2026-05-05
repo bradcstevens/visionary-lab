@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, Suspense } from "react";
+import { useState, useEffect, useRef, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Plus, Loader2, RefreshCw, ServerCrash, WifiOff, ShieldAlert, ChevronDown } from "lucide-react";
@@ -23,44 +23,66 @@ function ErrorIcon({ statusCode }: { statusCode: number | null }) {
 function ProjectsList() {
   const [projects, setProjects] = useState<StagingProject[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRetrying, setIsRetrying] = useState(false);
   const [loadError, setLoadError] = useState<ParsedError | null>(null);
   const searchParams = useSearchParams();
+  const latestLoadIdRef = useRef(0);
 
   useEffect(() => {
     loadProjects();
   }, []);
 
-  const loadProjects = async () => {
+  const loadProjects = async ({ blocking = true }: { blocking?: boolean } = {}) => {
+    const loadId = ++latestLoadIdRef.current;
     try {
-      setIsLoading(true);
+      if (blocking) setIsLoading(true);
       setLoadError(null);
-      const data = await listProjects();
+
+      // Fetch project list and SAS tokens in parallel — the list call is
+      // the slow path (Cosmos query + per-project rooms) and the token call
+      // is independent. Running them sequentially adds ~one round trip to
+      // every projects-page load.
+      const [data, tokensResult] = await Promise.all([
+        listProjects(),
+        sasTokenService.getTokens().catch((sasError) => {
+          console.warn('Failed to get SAS tokens for project list:', sasError);
+          toast.warning('Image previews may not load — storage access token unavailable', {
+            id: 'sas-token-warning',
+            duration: 8000,
+          });
+          return null;
+        }),
+      ]);
+
+      // Discard stale responses from overlapping fetches.
+      if (loadId !== latestLoadIdRef.current) return;
+
       const projectList = Array.isArray(data) ? data : [];
 
-      // Resolve blob URLs with SAS tokens
-      try {
-        const tokens = await sasTokenService.getTokens();
+      // Resolve blob URLs with SAS tokens (only if we got them).
+      if (tokensResult) {
         for (const project of projectList) {
           for (const room of project.rooms) {
             if (room.original_image_url && !room.original_image_url.includes('?')) {
-              room.original_image_url = `${room.original_image_url}?${tokens.imageSasToken}`;
+              room.original_image_url = `${room.original_image_url}?${tokensResult.imageSasToken}`;
             }
           }
         }
-      } catch (sasError) {
-        console.warn('Failed to get SAS tokens for project list:', sasError);
-        toast.warning('Image previews may not load — storage access token unavailable', {
-          id: 'sas-token-warning',
-          duration: 8000,
-        });
       }
 
       setProjects(projectList);
     } catch (error) {
+      if (loadId !== latestLoadIdRef.current) return;
       console.error('Failed to load projects:', error);
       setLoadError(parseApiError(error));
     } finally {
-      setIsLoading(false);
+      // Always reset on the latest call regardless of `blocking`. This
+      // guarantees a stranded ``isLoading=true`` from a prior blocking
+      // call cannot persist after a later non-blocking call wins the
+      // ``latestLoadIdRef`` race.
+      if (loadId === latestLoadIdRef.current) {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -138,8 +160,21 @@ function ProjectsList() {
               </Collapsible>
             )}
 
-            <Button onClick={loadProjects} variant="outline" size="sm" className="mt-1">
-              <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+            <Button
+              onClick={() => {
+                setIsRetrying(true);
+                loadProjects({ blocking: false }).finally(() => setIsRetrying(false));
+              }}
+              disabled={isRetrying}
+              variant="outline"
+              size="sm"
+              className="mt-1"
+            >
+              {isRetrying ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+              )}
               Retry
             </Button>
           </div>
