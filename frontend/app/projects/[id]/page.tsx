@@ -225,7 +225,12 @@ export default function ProjectDetailPage() {
     if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
     reloadTimerRef.current = setTimeout(() => {
       reloadTimerRef.current = null;
-      loadProject();
+      // Background reconcile from SSE — the page is already mounted with
+      // a project on screen, so we never want to swap the view for the
+      // page-level "Loading project..." spinner. Pass blocking=false to
+      // skip the isLoading flip; the latest-loadId race-safety in
+      // loadProject still applies.
+      loadProject({ blocking: false });
     }, 500);
   }, [loadProject]);
 
@@ -654,11 +659,11 @@ export default function ProjectDetailPage() {
           // same cleanup — reload the project to surface the new
           // variation. The hook clears the variation from inFlightVariations
           // automatically.
-          loadProject();
+          loadProject({ blocking: false });
           break;
         case 'error':
           toast.error(event.error || 'Regeneration failed');
-          loadProject();
+          loadProject({ blocking: false });
           break;
       }
     });
@@ -753,12 +758,12 @@ export default function ProjectDetailPage() {
           case 'project_completed':
           case 'stream_ended':
             setEditPromptTarget(null);
-            loadProject();
+            loadProject({ blocking: false });
             resolve();
             break;
           case 'error':
             toast.error(event.error || 'Edit Prompt failed');
-            loadProject();
+            loadProject({ blocking: false });
             reject(new Error(event.error || 'Edit Prompt failed'));
             break;
         }
@@ -883,12 +888,12 @@ export default function ProjectDetailPage() {
         // page just resets its own page-level error state.
         setGenerationError(null);
         toast.success('Generation completed!');
-        loadProject();
+        loadProject({ blocking: false });
         break;
       case 'stream_ended':
         // Fallback: stream closed without a terminal event — reconcile state
         if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
-        loadProject();
+        loadProject({ blocking: false });
         break;
       case 'error': {
         if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
@@ -909,7 +914,7 @@ export default function ProjectDetailPage() {
           setGenerationError(event.error || 'Generation failed');
         }
         toast.error(event.error || 'Generation failed');
-        loadProject();
+        loadProject({ blocking: false });
         // Issue 004 of failed-variation-retry-queue PRD: drop queued
         // retries on global stream error so we don't immediately fire N
         // more requests against the same broken upstream after the banner
@@ -1279,6 +1284,15 @@ export default function ProjectDetailPage() {
       : null,
   });
 
+  // Page-level guard. Both arms are load-bearing:
+  //   - ``!project`` covers the initial mount (project starts null).
+  //   - ``isLoading`` covers route navigation /projects/[id1] → /projects/[id2].
+  //     The projectId effect above does NOT call setProject(null) before
+  //     fetching, so without this arm Project A's data would briefly
+  //     render under Project B's URL until the fetch resolves. The mount
+  //     and projectId-change effects are the only callers that still pass
+  //     blocking=true; SSE-driven and post-mutation reconciles all use
+  //     blocking=false to avoid flashing this loader on a mounted page.
   if (isLoading || !project) {
     return (
       <div className="container mx-auto px-4 py-8">
@@ -1707,7 +1721,7 @@ export default function ProjectDetailPage() {
                 onClick={() => {
                   // PRD: dismiss then re-sync with server.
                   fleet.dismissLostOp(recoveryState.lostOpId);
-                  loadProject();
+                  loadProject({ blocking: false });
                 }}
               >
                 Dismiss
