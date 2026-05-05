@@ -805,3 +805,315 @@ describe("useProjectJobs — cancelProjectGeneration handler", () => {
     ).rejects.toThrow(/503.*Async queue feature flag is disabled/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Issue 005 — staleness tracking + cancelAllProjectJobs
+// ---------------------------------------------------------------------------
+
+describe("useProjectJobs — staleness baseline (issue 005)", () => {
+  it("records lastBackendActivityByJobId on every merge (REST seed, SSE seed, SSE job)", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "running",
+        phase: "generating",
+        progress: 50,
+        updated_at: "2026-05-04T11:59:00Z",
+      })],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: MockEventSource as unknown as typeof EventSource,
+      }),
+    )
+
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(1))
+
+    // After REST seed, baseline is the front-end wall clock at merge time
+    // (NOT the worker's updated_at — rubber-duck #2). Allow a few ms of
+    // drift because vi.waitFor advances the fake clock while polling.
+    expect(result.current.lastBackendActivityByJobId["g1"]).toBeGreaterThanOrEqual(
+      Date.parse("2026-05-04T12:00:00Z"),
+    )
+    const seedBaseline = result.current.lastBackendActivityByJobId["g1"]
+    expect(seedBaseline).toBeLessThan(Date.parse("2026-05-04T12:00:30Z"))
+
+    // Now an SSE job event lands later — baseline should advance.
+    vi.setSystemTime(new Date("2026-05-04T12:00:30Z"))
+    await vi.waitFor(() => expect(MockEventSource.instances.length).toBe(1))
+    const es = MockEventSource.instances[0]
+    act(() => {
+      es.dispatch("job", makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "running",
+        phase: "generating",
+        progress: 70,
+        updated_at: "2026-05-04T12:00:25Z",
+      }))
+    })
+    await vi.waitFor(() => {
+      expect(result.current.jobsById["g1"].progress).toBe(70)
+    })
+    expect(result.current.lastBackendActivityByJobId["g1"]).toBeGreaterThanOrEqual(
+      Date.parse("2026-05-04T12:00:30Z"),
+    )
+  })
+
+  it("baseline persists across renders even when no new merge fires", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "running",
+        phase: "generating",
+        progress: 50,
+        updated_at: "2026-05-04T11:59:00Z",
+      })],
+    }))
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        // Polling-only mode (no SSE)
+        eventSourceImpl: null,
+        pollIntervalMs: 60_000, // long so we don't trigger duplicate polls
+      }),
+    )
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(1))
+    const initialBaseline = result.current.lastBackendActivityByJobId["g1"]
+    expect(initialBaseline).toBeGreaterThanOrEqual(Date.parse("2026-05-04T12:00:00Z"))
+
+    // Time advances 30s but no merge fires. Baseline does NOT advance —
+    // it represents "last time we confirmed activity from backend",
+    // which is exactly what the staleness detector wants.
+    expect(result.current.lastBackendActivityByJobId["g1"]).toBe(
+      initialBaseline,
+    )
+  })
+
+  it("baseline does NOT advance when a poll returns the SAME doc (rubber-duck strict-newer rule)", async () => {
+    // The polling layer fires every pollIntervalMs and merges the same
+    // doc when nothing has changed worker-side. The pre-fix behaviour
+    // recorded a fresh ``Date.now()`` baseline on every accepted merge,
+    // including these no-op polls — staleness would NEVER trigger
+    // because the baseline kept tracking wall-clock. The fix: only
+    // STRICTLY-NEWER ``updated_at`` advances the baseline. Polls
+    // delivering the same doc accept the merge (progress tiebreak) but
+    // leave the baseline alone, which is exactly the freshness signal
+    // the detector wants.
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    let pollCount = 0
+    const fetchMock = vi.fn(async () => {
+      pollCount += 1
+      return jsonResponse({
+        jobs: [
+          makeJob({
+            id: "g1",
+            kind: "generate_project",
+            status: "running",
+            phase: "generating",
+            progress: 50,
+            updated_at: "2026-05-04T11:59:00Z",
+          }),
+        ],
+      })
+    })
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+        pollIntervalMs: 1_000,
+      }),
+    )
+
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(1))
+    const initialBaseline = result.current.lastBackendActivityByJobId["g1"]
+    expect(initialBaseline).toBeGreaterThanOrEqual(
+      Date.parse("2026-05-04T12:00:00Z"),
+    )
+
+    // Advance the clock and let the polling timer fire several times.
+    vi.setSystemTime(new Date("2026-05-04T12:01:00Z"))
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // Confirm polling actually happened (otherwise the test is trivially
+    // green for the wrong reason).
+    expect(pollCount).toBeGreaterThan(1)
+
+    // Baseline did NOT advance even though the wall clock moved by 60s.
+    expect(result.current.lastBackendActivityByJobId["g1"]).toBe(
+      initialBaseline,
+    )
+  })
+
+  it("deriveProjectWorstStaleness exposes worst-state across non-terminal generate_project jobs", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [
+        makeJob({
+          id: "g1",
+          kind: "generate_project",
+          status: "pending",
+          updated_at: "2026-05-04T11:59:00Z",
+        }),
+        makeJob({
+          id: "g2",
+          kind: "generate_project",
+          status: "pending",
+          updated_at: "2026-05-04T11:59:00Z",
+        }),
+      ],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(2))
+    expect(result.current.inFlightProjectGeneration).toBeNull()
+
+    // Tier-3 multi-pending case (rubber-duck #3): cancel-all is
+    // most-needed exactly when the canonical slice returns null.
+    // Project staleness must STILL surface.
+    expect(result.current.projectStaleness).not.toBeNull()
+    expect(result.current.projectStaleness?.kind).toBe("fresh")
+  })
+
+  it("computes hard-pending after 120s elapsed (5s tick recomputes)", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "pending",
+        updated_at: "2026-05-04T11:59:00Z",
+      })],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+        pollIntervalMs: 60_000,
+      }),
+    )
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(1))
+    expect(result.current.projectStaleness?.kind).toBe("fresh")
+
+    // Advance 120s past baseline merge time and run a 5s tick.
+    await act(async () => {
+      vi.setSystemTime(new Date("2026-05-04T12:02:00Z"))
+      await vi.advanceTimersByTimeAsync(5_000)
+    })
+    expect(result.current.projectStaleness?.kind).toBe("hard-pending")
+    expect(result.current.projectStaleness?.secondsAgo).toBeGreaterThanOrEqual(120)
+  })
+
+  it("ignores terminal jobs in projectStaleness", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-05-04T12:00:00Z"))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      jobs: [makeJob({
+        id: "g1",
+        kind: "generate_project",
+        status: "succeeded",
+        updated_at: "2026-05-04T11:00:00Z",
+      })],
+    }))
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await vi.waitFor(() => expect(result.current.jobs).toHaveLength(1))
+    expect(result.current.projectStaleness).toBeNull()
+  })
+})
+
+describe("useProjectJobs — cancelAllProjectJobs (issue 005)", () => {
+  it("issues DELETE to /staging/projects/{id}/jobs and resolves with the response body", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ jobs: [] }))
+      .mockResolvedValueOnce(jsonResponse({
+        status: "accepted",
+        cancelled_count: 3,
+        project_id: "p1",
+      }, { status: 202 }))
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    let response: { status: string; cancelled_count: number; project_id: string } | undefined | void
+    await act(async () => {
+      response = await result.current.cancelAllProjectJobs()
+    })
+    expect(response).toEqual({
+      status: "accepted",
+      cancelled_count: 3,
+      project_id: "p1",
+    })
+    const lastCall = fetchMock.mock.calls[fetchMock.mock.calls.length - 1]
+    expect(lastCall[0]).toBe("http://api/staging/projects/p1/jobs")
+    expect(lastCall[1].method).toBe("DELETE")
+    expect(lastCall[1].credentials).toBe("include")
+  })
+
+  it("throws with status + body on non-2xx", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ jobs: [] }))
+      .mockResolvedValueOnce(
+        new Response("Project not found", { status: 404 }),
+      )
+
+    const { result } = renderHook(() =>
+      useProjectJobs("p1", {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    await expect(result.current.cancelAllProjectJobs()).rejects.toThrow(/404.*Project not found/)
+  })
+
+  it("no-ops when projectId is null", async () => {
+    const fetchMock = vi.fn()
+    const { result } = renderHook(() =>
+      useProjectJobs(null, {
+        apiBaseUrl: "http://api",
+        fetchImpl: fetchMock as unknown as typeof fetch,
+        eventSourceImpl: null,
+      }),
+    )
+    const before = fetchMock.mock.calls.length
+    await act(async () => {
+      await result.current.cancelAllProjectJobs()
+    })
+    expect(fetchMock.mock.calls.length).toBe(before)
+  })
+})

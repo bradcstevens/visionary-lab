@@ -2,6 +2,11 @@
 
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { API_BASE_URL } from "@/services/stagingApi"
+import {
+  computeStaleness,
+  deriveProjectWorstStaleness,
+  type StalenessState,
+} from "@/lib/job-staleness"
 
 // ---------------------------------------------------------------------------
 // Project-scoped job state (issue 006 — image-pipeline-and-project-ux-overhaul)
@@ -154,6 +159,26 @@ export interface ProjectJobsState {
   // optimistic doc lingers — same failure mode as before, just with a
   // visible banner instead of a silent gap.
   injectOptimisticJob: (job: ProjectJob) => void
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: per-job baseline
+  // recording the front-end wall-clock timestamp of the most recent merge
+  // that ACCEPTED a doc (i.e., the doc passed ``_isNewer`` and won the
+  // comparison). Consumed by the staleness detector — exposed for tests
+  // and for any UI that wants raw freshness data.
+  lastBackendActivityByJobId: Record<string, number>
+  // Issue 005: pre-computed worst-case staleness across all non-terminal
+  // ``generate_project`` jobs. NULL when there are no in-flight jobs OR
+  // every in-flight job is fresh and there's nothing actionable. Recomputed
+  // every 5s and on every merge so the page header doesn't have to call
+  // ``computeStaleness`` itself.
+  projectStaleness: StalenessState | null
+  // Issue 005: bulk cancel — the user's "give up" escape hatch when
+  // staleness has crossed the 120s hard threshold. Hits
+  // DELETE /staging/projects/{id}/jobs which is a thin wrapper around
+  // ``_cascade_cancel_project_jobs``. Returns the response body so the
+  // page can surface ``cancelled_count`` in the success toast.
+  cancelAllProjectJobs: () => Promise<
+    { status: string; cancelled_count: number; project_id: string } | void
+  >
 }
 
 interface UseProjectJobsOptions {
@@ -194,6 +219,20 @@ export function useProjectJobs(
   const [jobsById, setJobsById] = useState<Record<string, ProjectJob>>({})
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle")
   const [lastError, setLastError] = useState<string | null>(null)
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: per-job baseline
+  // map. Set by ``mergeJobs`` for every doc that wins the ``_isNewer``
+  // comparison; consumed by ``computeStaleness``. Tracking
+  // front-end wall clock (NOT job.updated_at) defends against worker /
+  // client NTP drift poisoning the detector — see job-staleness.ts.
+  const [lastBackendActivityByJobId, setLastBackendActivityByJobId] = useState<
+    Record<string, number>
+  >({})
+  // Issue 005: tick state forces a recomputation of projectStaleness even
+  // when no merge has fired (a job that's been sitting at 119s elapsed
+  // becomes hard-stale at 120s without any new doc arriving — the 5s
+  // interval bumps this counter so the useMemo re-evaluates against
+  // ``Date.now()``).
+  const [stalenessTick, setStalenessTick] = useState(() => Date.now())
 
   const esRef = useRef<EventSource | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -223,12 +262,41 @@ export function useProjectJobs(
     setJobsById((prev) => {
       let changed = false
       const next: Record<string, ProjectJob> = { ...prev }
+      // Issue 005: only docs with a STRICTLY-NEWER ``updated_at`` than the
+      // existing one (or first-seen) advance the staleness baseline. A poll
+      // that returns the same doc is NOT evidence the worker is alive — it's
+      // evidence the list-jobs endpoint works. Without the strict check,
+      // staleness would never trigger because every 5s poll would reset the
+      // baseline to ``Date.now()``. Equal-timestamp merges still accept (so
+      // the existing ``_isNewer`` progress-tiebreaker keeps working), they
+      // just don't reset the baseline.
+      const strictlyNewerHere: string[] = []
       for (const job of incoming) {
         if (!job || !job.id) continue
         if (_isNewer(job, prev[job.id])) {
           next[job.id] = job
           changed = true
+          const prevTs = prev[job.id]?.updated_at
+            ? Date.parse(prev[job.id].updated_at as string)
+            : 0
+          const incomingTs = job.updated_at ? Date.parse(job.updated_at) : 0
+          if (!prev[job.id] || incomingTs > prevTs) {
+            strictlyNewerHere.push(job.id)
+          }
         }
+      }
+      if (strictlyNewerHere.length > 0) {
+        // Issue 005: every strictly-newer accepted merge bumps the per-job
+        // baseline to *now* (front-end wall clock, NOT job.updated_at, so
+        // NTP drift between worker and client doesn't poison the detector).
+        // Performed synchronously inside the jobsById update so the baseline
+        // lands in the same React commit as the merge.
+        const now = Date.now()
+        setLastBackendActivityByJobId((prevBaseline) => {
+          const nextBaseline = { ...prevBaseline }
+          for (const id of strictlyNewerHere) nextBaseline[id] = now
+          return nextBaseline
+        })
       }
       return changed ? next : prev
     })
@@ -514,6 +582,71 @@ export function useProjectJobs(
     mergeJobs([{ ...job, updated_at: "1970-01-01T00:00:00Z" }])
   }, [mergeJobs])
 
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: bulk cancel —
+  // hits ``DELETE /staging/projects/{project_id}/jobs`` (server-side
+  // cascade). Returns the response body so the page can render
+  // "Cancelled N queued jobs" in the success toast.
+  const cancelAllProjectJobs = useCallback(
+    async (): Promise<
+      { status: string; cancelled_count: number; project_id: string } | void
+    > => {
+      const pid = projectIdRef.current
+      if (!pid) return
+      const resp = await fetchFn(`${apiBaseUrl}/staging/projects/${pid}/jobs`, {
+        method: "DELETE",
+        credentials: "include",
+      })
+      if (!resp.ok) {
+        let detail = ""
+        try { detail = await resp.text() } catch { /* ignore */ }
+        throw new Error(
+          `Cancel-all failed: HTTP ${resp.status}${detail ? ` - ${detail}` : ""}`,
+        )
+      }
+      try {
+        return (await resp.json()) as {
+          status: string
+          cancelled_count: number
+          project_id: string
+        }
+      } catch {
+        // Server may return 202 with empty body in degenerate cases.
+        return
+      }
+    },
+    [apiBaseUrl, fetchFn],
+  )
+
+  // Issue 005: 5s wall-clock tick to refresh projectStaleness even when
+  // no merges fire. A job sitting idle at 119s elapsed must transition to
+  // hard-stale at 120s without waiting for a backend event. Plain
+  // ``setInterval`` (no ``visibilitychange`` listener): hidden tabs
+  // throttle to ≥1000ms but don't pause, which is acceptable here. We
+  // store the wall-clock value (not a monotonic counter) so the memo
+  // below stays a pure function of state — calling ``Date.now()``
+  // during render trips the React 19 ``react-hooks/purity`` rule.
+  useEffect(() => {
+    if (!enabled || !projectId) return
+    const t = setInterval(() => {
+      setStalenessTick(Date.now())
+    }, 5_000)
+    return () => clearInterval(t)
+  }, [enabled, projectId])
+
+  // Issue 005: pre-compute project-level worst-staleness so the page
+  // header doesn't have to invoke the detector itself. Keyed on jobsById
+  // (every merge), lastBackendActivityByJobId (every accepted merge),
+  // and stalenessTick (every 5s wall-clock tick — also seeds the
+  // initial ``now`` on first render via lazy ``useState`` init).
+  const projectStaleness = useMemo<StalenessState | null>(() => {
+    const states = computeStaleness(
+      jobs,
+      lastBackendActivityByJobId,
+      stalenessTick,
+    )
+    return deriveProjectWorstStaleness(states)
+  }, [jobs, lastBackendActivityByJobId, stalenessTick])
+
   return {
     jobs,
     jobsById,
@@ -525,6 +658,9 @@ export function useProjectJobs(
     inFlightProjectGeneration,
     cancelProjectGeneration,
     injectOptimisticJob,
+    lastBackendActivityByJobId,
+    projectStaleness,
+    cancelAllProjectJobs,
   }
 }
 

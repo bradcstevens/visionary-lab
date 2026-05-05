@@ -1901,9 +1901,11 @@ async def update_brief(
 _TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 
 
-def _cascade_cancel_project_jobs(project_id: str, store: "JobStore") -> None:
+def _cascade_cancel_project_jobs(project_id: str, store: "JobStore") -> int:
     """Mark every non-terminal job for ``project_id`` as
-    ``cancel_requested=True``.
+    ``cancel_requested=True``. Returns the count of jobs the cascade
+    successfully flipped (NOT the count attempted — failed
+    ``update_job`` calls are excluded).
 
     Issue 007 cascade. Best-effort: any failure in
     ``list_jobs_by_project`` aborts the cascade with a WARNING log
@@ -1915,15 +1917,21 @@ def _cascade_cancel_project_jobs(project_id: str, store: "JobStore") -> None:
     The ``JobWorker`` (issue 003) re-reads the doc on its
     ``is_cancelled`` probe each tick, so the flag is observed
     regardless of which replica was holding the queue lease.
+
+    Issue 005 of active-and-queued-jobs-ux-redesign PRD: the return
+    value is consumed by ``DELETE /staging/projects/{project_id}/jobs``
+    so the front-end can surface "we cancelled N jobs" in the toast.
+    The legacy ``delete_project`` caller ignores the return value
+    (cascade is logged, the delete continues regardless).
     """
     try:
         jobs = store.list_jobs_by_project(project_id)
     except Exception as exc:  # noqa: BLE001 — best-effort cascade
         logger.warning(
-            "staging.delete_project.cascade.list_failed project_id=%s error=%s",
+            "staging.cascade.list_failed project_id=%s error=%s",
             project_id, exc,
         )
-        return
+        return 0
 
     cancelled = 0
     for job in jobs:
@@ -1935,13 +1943,14 @@ def _cascade_cancel_project_jobs(project_id: str, store: "JobStore") -> None:
             cancelled += 1
         except Exception as exc:  # noqa: BLE001 — best-effort cascade
             logger.warning(
-                "staging.delete_project.cascade.update_failed job_id=%s error=%s",
+                "staging.cascade.update_failed job_id=%s error=%s",
                 job_id, exc,
             )
     logger.info(
-        "staging.delete_project.cascade.done project_id=%s cancelled=%d",
+        "staging.cascade.done project_id=%s cancelled=%d",
         project_id, cancelled,
     )
+    return cancelled
 
 
 def _require_async_queue_enabled() -> None:
@@ -2313,6 +2322,48 @@ async def cancel_job(
     store.update_job(job_id, project_id, cancel_requested=True)
     logger.info("staging.jobs.cancel.requested job_id=%s", job_id)
     return {"status": "accepted", "job_id": job_id, "already_terminal": False}
+
+
+@router.delete("/projects/{project_id}/jobs", status_code=202)
+async def cancel_all_project_jobs(
+    project_id: str,
+    storage: StagingStorageService = Depends(get_staging_storage),
+    store: JobStore = Depends(get_job_store),
+):
+    """Cancel every non-terminal job for ``project_id``.
+
+    Issue 005 of active-and-queued-jobs-ux-redesign PRD. The user's
+    "give up — free the queue" escape hatch when generation has
+    stalled past the front-end's 120-second hard staleness threshold.
+
+    Behavior mirrors ``DELETE /projects/{id}`` cascade exactly so a
+    partial-stalled project doesn't have to be deleted to recover.
+    Idempotent: a project with only terminal jobs (or no jobs at
+    all) returns ``cancelled_count: 0`` — no error.
+
+    Returns 202 ``{status, cancelled_count, project_id}`` so the
+    UI can surface "we cancelled N jobs" in the success toast.
+
+    Validation order: feature flag (503) before project lookup
+    (404). The 404 path validates the project exists BEFORE running
+    the cascade so a typo'd id doesn't silently no-op.
+    """
+    _require_async_queue_enabled()
+
+    project_data = storage.get_project(project_id)
+    if not project_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cancelled_count = _cascade_cancel_project_jobs(project_id, store)
+    logger.info(
+        "staging.jobs.cancel_all.requested project_id=%s cancelled=%d",
+        project_id, cancelled_count,
+    )
+    return {
+        "status": "accepted",
+        "cancelled_count": cancelled_count,
+        "project_id": project_id,
+    }
 
 
 # ---------------------------------------------------------------------------

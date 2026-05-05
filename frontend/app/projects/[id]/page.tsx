@@ -33,6 +33,7 @@ import { useProjectJobs } from "@/context/jobs-context";
 import type { ProjectJob } from "@/context/jobs-context";
 import { ProjectGenerationBanner } from "@/components/staging/ProjectGenerationBanner";
 import { EnqueueingBanner } from "@/components/staging/EnqueueingBanner";
+import { StalenessSubline } from "@/components/staging/StalenessSubline";
 import { getErrorKindCopy } from "@/lib/error-kind-copy";
 import { deriveLogEntries } from "@/lib/activity-log-derivation";
 
@@ -84,6 +85,33 @@ export default function ProjectDetailPage() {
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestLoadIdRef = useRef(0);
+
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: cancel-all wiring.
+  //
+  // ``cancellingState`` flips true synchronously on Cancel-button click and
+  // stays true until ONE of:
+  //  - the cancelled job flips terminal (SSE confirmation: success path), OR
+  //  - the 10s ``cancelTimeoutRef`` fires (fallback path: server didn't confirm).
+  //
+  // ``dismissedAfterTimeoutFor`` is the jobId whose staleness UI is suppressed
+  // AFTER a fallback-timeout fire. Without this, the staleness subline would
+  // immediately re-mount because the worker hasn't terminated the job yet.
+  // Cleared by an effect when the live non-terminal set no longer contains
+  // that jobId (terminal arrival OR replaced by a new job). This implements
+  // rubber-duck blocking finding #4.
+  //
+  // ``cancelInFlightRef`` doubles as the re-entrancy latch (per the issue 004
+  // pattern): a non-null value means a cancel is in flight; the click handler
+  // early-returns. Stores the captured jobId so the fallback-timeout knows
+  // which job to suppress.
+  const [cancellingState, setCancellingState] = useState(false);
+  const [dismissedAfterTimeoutFor, setDismissedAfterTimeoutFor] = useState<
+    string | null
+  >(null);
+  const cancelInFlightRef = useRef<{
+    jobId: string;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
 
   const activityLog = useActivityLog();
 
@@ -367,6 +395,131 @@ export default function ProjectDetailPage() {
       bootstrappedRef.current = false;
     }
   }, [projectJobs.jobsById, activityLog]);
+
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: cancel-all
+  // wiring effect.
+  //
+  // Watches ``projectJobs.activeJobs`` (the canonical "non-terminal" set)
+  // for two state transitions:
+  //
+  //   1. Cancellation confirmed: while a cancel is in flight
+  //      (``cancelInFlightRef.current`` non-null), if the targeted jobId
+  //      is no longer present in the live non-terminal generate_project
+  //      set, the worker has flipped it terminal. Clear the timer, the
+  //      ref, the cancellingState, and any stale ``dismissedAfterTimeout``
+  //      suppression. This is the success-path reconciliation.
+  //
+  //   2. Suppression auto-clear: if ``dismissedAfterTimeoutFor`` is set
+  //      AND that jobId is no longer in the non-terminal set, clear the
+  //      suppression. This handles the post-timeout case where the
+  //      worker eventually catches up (the staleness UI is now safe to
+  //      surface again should a NEW job become stale).
+  useEffect(() => {
+    const liveGenerateProjectJobIds = new Set(
+      (projectJobs.activeJobs ?? [])
+        .filter((j) => j.kind === "generate_project")
+        .map((j) => j.id),
+    );
+
+    if (
+      cancelInFlightRef.current &&
+      !liveGenerateProjectJobIds.has(cancelInFlightRef.current.jobId)
+    ) {
+      clearTimeout(cancelInFlightRef.current.timer);
+      cancelInFlightRef.current = null;
+      setCancellingState(false);
+      setDismissedAfterTimeoutFor(null);
+    }
+
+    if (
+      dismissedAfterTimeoutFor &&
+      !liveGenerateProjectJobIds.has(dismissedAfterTimeoutFor)
+    ) {
+      // Guarded reconciliation against the refreshed activeJobs list —
+      // only fires when the previously-suppressed job has actually left
+      // the non-terminal set, which is the external state-change this
+      // effect synchronizes to.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setDismissedAfterTimeoutFor(null);
+    }
+  }, [projectJobs.activeJobs, dismissedAfterTimeoutFor]);
+
+  // Issue 005: cleanup the cancel-fallback timer on unmount so a
+  // setTimeout callback firing post-unmount doesn't try to setState
+  // on a torn-down tree (act-warning correctness).
+  useEffect(() => {
+    return () => {
+      if (cancelInFlightRef.current) {
+        clearTimeout(cancelInFlightRef.current.timer);
+        cancelInFlightRef.current = null;
+      }
+    };
+  }, []);
+
+  // Issue 005 of active-and-queued-jobs-ux-redesign PRD: cancel-all
+  // click handler.
+  //
+  // Imperative re-entrancy guard: ``cancelInFlightRef`` non-null means a
+  // cancel is in progress; double-click is a no-op (see issue 004
+  // for the same pattern on Retry).
+  //
+  // Captures the worst-staleness jobId (NOT inFlightProjectGeneration's
+  // jobId; the tier-3 multi-pending case has inFlightProjectGeneration
+  // === null but projectStaleness still surfaces a worst-state job
+  // — rubber-duck blocking finding #3).
+  //
+  // Schedules a 10s fallback timer: if the worker doesn't confirm
+  // (active set still contains the jobId), set ``dismissedAfterTimeoutFor``
+  // so the staleness UI hides AND fire a fallback toast so the user
+  // gets feedback. The cancel is still in flight server-side; the
+  // suppression effect above clears ``dismissedAfterTimeoutFor`` if the
+  // job eventually does flip terminal.
+  const handleCancelAllProjectJobs = useCallback(() => {
+    if (cancelInFlightRef.current) {
+      return;
+    }
+    const jobId = projectJobs.projectStaleness?.jobId;
+    if (!jobId) {
+      return;
+    }
+
+    const fallbackTimer = setTimeout(() => {
+      cancelInFlightRef.current = null;
+      setCancellingState(false);
+      setDismissedAfterTimeoutFor(jobId);
+      toast.error(
+        "Cancel request didn't confirm in time. Try refreshing the page if jobs remain stuck.",
+      );
+    }, 10_000);
+
+    cancelInFlightRef.current = { jobId, timer: fallbackTimer };
+    setCancellingState(true);
+
+    projectJobs
+      .cancelAllProjectJobs()
+      .then((res) => {
+        const cancelledCount =
+          res && typeof res === "object" && "cancelled_count" in res
+            ? (res as { cancelled_count: number }).cancelled_count
+            : 0;
+        toast.success(
+          cancelledCount === 0
+            ? "No queued jobs to cancel."
+            : cancelledCount === 1
+              ? "Cancelled 1 queued job."
+              : `Cancelled ${cancelledCount} queued jobs.`,
+        );
+      })
+      .catch((err: unknown) => {
+        if (cancelInFlightRef.current) {
+          clearTimeout(cancelInFlightRef.current.timer);
+          cancelInFlightRef.current = null;
+        }
+        setCancellingState(false);
+        const message = err instanceof Error ? err.message : String(err);
+        toast.error(`Couldn't cancel jobs: ${message}`);
+      });
+  }, [projectJobs]);
 
   const handleVariationClick = (room: Room, variationIndex: number) => {
     const variation = room.variations[variationIndex];
@@ -1184,11 +1337,40 @@ export default function ProjectDetailPage() {
               }}
               disabled={isAnyInFlight}
             />
-            {totalVariations > 0 && (
-              <p className="text-xs text-muted-foreground">
-                {completedVariations}/{totalVariations} variations complete across {project.rooms.length} images
-              </p>
-            )}
+            {/* Issue 005 of active-and-queued-jobs-ux-redesign PRD:
+                staleness subline lives INSIDE the header (rubber-duck
+                blocking finding #5: NOT a separate banner). Renders the
+                4 staleness-tier copies + the 120s "Cancel queued jobs"
+                button when the worker has gone hard-stale; falls back
+                to the existing ``{N}/{M} variations complete`` counter
+                line when staleness is fresh. The component itself owns
+                the cancelling-state copy override so a stale-running
+                flip during the in-flight cancel doesn't flash. */}
+            {(() => {
+              const counterFallback =
+                totalVariations > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    {completedVariations}/{totalVariations} variations complete across {project.rooms.length} images
+                  </p>
+                ) : null;
+
+              const suppressed =
+                projectJobs.projectStaleness?.jobId !== undefined &&
+                projectJobs.projectStaleness?.jobId === dismissedAfterTimeoutFor;
+
+              return (
+                <StalenessSubline
+                  staleness={
+                    cancellingState || suppressed
+                      ? null
+                      : projectJobs.projectStaleness
+                  }
+                  cancelling={cancellingState}
+                  onCancelAllClick={handleCancelAllProjectJobs}
+                  fallback={counterFallback}
+                />
+              );
+            })()}
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
