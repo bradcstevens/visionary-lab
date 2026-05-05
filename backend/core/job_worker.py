@@ -271,6 +271,8 @@ class JobWorker:
                     self._queue.complete(message)
                 return
             except Exception as exc:  # noqa: BLE001 — convert to durable error
+                from backend.core.job_errors import classify
+                error_kind, _http_status, _user_msg = classify(exc)
                 error_payload = {
                     "type": exc.__class__.__name__,
                     "message": str(exc),
@@ -281,13 +283,16 @@ class JobWorker:
                     project_id,
                     status=("failed" if terminal else "pending"),
                     error=error_payload,
+                    error_kind=error_kind.value,
                 )
                 logger.warning(
-                    "job.failed job_id=%s project_id=%s attempt=%d terminal=%s error=%s",
+                    "job.failed job_id=%s project_id=%s attempt=%d "
+                    "terminal=%s error_kind=%s error=%s",
                     job_id,
                     project_id,
                     attempts,
                     terminal,
+                    error_kind.value,
                     error_payload,
                 )
                 async with message_lock:

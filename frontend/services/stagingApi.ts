@@ -308,39 +308,115 @@ export class EnqueueGenerationTimeoutError extends Error {
 }
 
 /**
+ * Error thrown by ``enqueueProjectGeneration`` when the backend
+ * returns a structured ``{ error_kind, user_message, detail }`` body
+ * (issue 002). The ``errorKind`` is the canonical string from
+ * ``backend.core.job_errors.ErrorKind`` — the recovery banner uses
+ * it to render a kind-specific message instead of the raw
+ * ``user_message``. ``userMessage`` is preserved so legacy callers
+ * that just want to display "something went wrong" still work.
+ */
+export class EnqueueGenerationFailedError extends Error {
+  readonly errorKind: string;
+  readonly userMessage: string;
+  readonly httpStatus: number;
+  readonly detail?: { type?: string; message?: string } | null;
+  constructor(args: {
+    errorKind: string;
+    userMessage: string;
+    httpStatus: number;
+    detail?: { type?: string; message?: string } | null;
+  }) {
+    super(args.userMessage);
+    this.name = "EnqueueGenerationFailedError";
+    this.errorKind = args.errorKind;
+    this.userMessage = args.userMessage;
+    this.httpStatus = args.httpStatus;
+    this.detail = args.detail ?? null;
+  }
+}
+
+/**
+ * Mint a fresh idempotency key for the project-generation enqueue
+ * call. Uses ``crypto.randomUUID()`` with a fallback for older
+ * environments. The key is sent verbatim as the ``Idempotency-Key``
+ * header AND is the deterministic-id revision component on the
+ * backend, so transport-layer retries that re-send the SAME key
+ * collapse onto the SAME job doc.
+ *
+ * Format matches the backend's regex (``^[A-Za-z0-9_-]{1,128}$``):
+ * UUIDs are lower-case hex with hyphens (36 chars).
+ */
+export function mintIdempotencyKey(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  // Fallback: minimal RFC4122 v4 generator (matches the backend regex).
+  let result = "";
+  for (let i = 0; i < 32; i++) {
+    result += Math.floor(Math.random() * 16).toString(16);
+    if (i === 7 || i === 11 || i === 15 || i === 19) result += "-";
+  }
+  return result;
+}
+
+/**
  * Enqueue a ``generate_project`` job via the async-queue producer
- * endpoint added in issue 006.
+ * endpoint.
  *
  * The endpoint composes the design brief inline (~30-90s blocking
- * call) before returning ``{ job_id }``, so the helper is configured
- * with a 180s ``AbortController`` timeout. That sits comfortably above
- * the inline-brief P99 and below typical Azure Front Door defaults
- * (~240s) — the UI fails loud with ``EnqueueGenerationTimeoutError``
- * rather than spinning indefinitely on a stalled request.
+ * call) before returning ``{ job_id, already_in_flight }``, so the
+ * helper is configured with a 180s ``AbortController`` timeout. That
+ * sits comfortably above the inline-brief P99 and below typical
+ * Azure Front Door defaults (~240s) — the UI fails loud with
+ * ``EnqueueGenerationTimeoutError`` rather than spinning indefinitely
+ * on a stalled request.
+ *
+ * Issue 002 of the active-and-queued PRD:
+ *
+ * - Mints a fresh ``crypto.randomUUID()`` per call and sends it as
+ *   the ``Idempotency-Key`` header. Transport-layer retries
+ *   (network-flake, HTTP/2 stream reset) that re-send the SAME key
+ *   collapse onto the SAME doc; double-clicks (which mint distinct
+ *   keys) produce distinct docs but the lease precheck dedupes the
+ *   second one as ``already_in_flight``.
+ * - Parses the new response shape ``{ job_id, already_in_flight }``.
+ * - Parses the structured error body
+ *   ``{ error_kind, user_message, detail }`` and throws an
+ *   ``EnqueueGenerationFailedError`` so the recovery banner can
+ *   render a kind-specific message.
  *
  * @param projectId - target project id (path parameter)
  * @param options.regenerateAll - when true, the backend cascade-cancels
  *   every in-flight regenerate_variation job for the project BEFORE
  *   creating the new generate_project doc (point of no return — the
  *   cancellation persists even if create/enqueue subsequently fails).
- *   Defaults to false. Coerced to a strict literal boolean before the
- *   POST so the backend's ``StrictBool`` validator never sees
- *   ``undefined`` / truthy garbage.
- * @returns Promise resolving to ``{ job_id }`` on 2xx; rejects with
- *   ``EnqueueGenerationTimeoutError`` on the 180s abort and a generic
- *   ``Error`` (status + body included) on every other non-2xx.
+ *   Defaults to false.
+ * @param options.idempotencyKey - optional pre-minted key (tests can
+ *   pin it for assertions). Production callers omit this and let the
+ *   helper mint one per call.
+ * @returns Promise resolving to ``{ job_id, already_in_flight }`` on
+ *   2xx. Rejects with ``EnqueueGenerationTimeoutError`` on the 180s
+ *   abort, ``EnqueueGenerationFailedError`` on a structured 4xx/5xx,
+ *   and a generic ``Error`` on transport failures or unparseable
+ *   responses.
  */
 export async function enqueueProjectGeneration(
   projectId: string,
-  options?: { regenerateAll?: boolean },
-): Promise<{ job_id: string }> {
+  options?: { regenerateAll?: boolean; idempotencyKey?: string },
+): Promise<{ job_id: string; already_in_flight: boolean }> {
   const url = `${API_BASE_URL}/staging/projects/${projectId}/jobs/generate`;
   const body = JSON.stringify({
     regenerate_all: options?.regenerateAll === true,
   });
+  const idempotencyKey = options?.idempotencyKey ?? mintIdempotencyKey();
 
   if (API_DEBUG) {
     console.log(`POST ${url}`);
+    console.log("Idempotency-Key:", idempotencyKey);
     console.log("Body:", body);
   }
 
@@ -351,7 +427,10 @@ export async function enqueueProjectGeneration(
   try {
     response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
       body,
       signal: controller.signal,
     });
@@ -369,7 +448,35 @@ export async function enqueueProjectGeneration(
   }
 
   if (!response.ok) {
+    // Try to parse the structured error body. If parsing fails (e.g.
+    // a 502 from a load balancer that returned HTML), fall back to
+    // the legacy raw-text Error so the caller still sees something.
     const errorText = await response.text();
+    try {
+      const parsed = JSON.parse(errorText) as {
+        error_kind?: string;
+        user_message?: string;
+        detail?: { type?: string; message?: string } | string | null;
+      };
+      if (parsed && typeof parsed.error_kind === "string") {
+        throw new EnqueueGenerationFailedError({
+          errorKind: parsed.error_kind,
+          userMessage:
+            (typeof parsed.user_message === "string" && parsed.user_message) ||
+            "Couldn't start generation. Try again.",
+          httpStatus: response.status,
+          detail:
+            parsed.detail && typeof parsed.detail === "object"
+              ? parsed.detail
+              : null,
+        });
+      }
+    } catch (parseErr) {
+      if (parseErr instanceof EnqueueGenerationFailedError) {
+        throw parseErr;
+      }
+      // fall through to generic Error
+    }
     throw new Error(
       `Failed to enqueue project generation: ${response.status} ${errorText}`,
     );
@@ -1122,6 +1229,11 @@ export async function removeRoom(
 // optional — omit a field to leave it unchanged on the server. Sending
 // ``design_brief: null`` explicitly clears the brief; sending null for
 // the other three fields is a 422.
+//
+// Issue 018 of the image-pipeline-and-project-ux-overhaul PRD added
+// ``wizard_state`` — opaque scratch-pad blob that the adaptive wizard
+// PATCHes on every step transition. ``null`` clears the persisted
+// state on final compose+submit.
 export interface UpdateProjectBody {
   name?: string;
   prompt?: string;
@@ -1129,6 +1241,7 @@ export interface UpdateProjectBody {
   // persisted settings (the backend preserves keys you don't send).
   settings?: Partial<StagingSettings>;
   design_brief?: DesignBrief | null;
+  wizard_state?: Record<string, unknown> | null;
 }
 
 export async function updateProject(

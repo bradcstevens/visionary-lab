@@ -53,12 +53,17 @@ def _project_with_brief() -> dict:
     /projects/{id} flow writes into Cosmos via DesignBrief.model_dump.
     Only the fields BriefGeneratorService.brief_to_prompts touches
     need to be present for the endpoint to construct the model.
+
+    Carries an ``_etag`` field so the producer's
+    ``acquire_project_lease`` step (which CAS-replaces the project
+    doc) can succeed against the test fakes.
     """
     return {
         "id": PROJECT_ID,
         "name": "Generate-jobs project",
         "prompt": "warm modern with greenery",
         "status": "completed",
+        "_etag": '"abcd-1234"',
         "rooms": [
             {
                 "id": ROOM_ID,
@@ -112,9 +117,20 @@ def gen_jobs_deps(app, mock_staging_deps):
     ``get_job_store`` and ``get_job_queue``.
 
     The ``store.create_job`` side-effect rebuilds the deterministic id
-    from the kwargs so two concurrent POSTs (each with a distinct
-    UUID4 revision) produce distinct ids — the test_..._distinct
-    test pins this.
+    from the kwargs so two POSTs (each with a distinct
+    Idempotency-Key header) produce distinct ids — the
+    test_..._distinct test pins this.
+
+    ``store.get_job.return_value = None`` is the default so the
+    producer's same-key dedupe precheck doesn't mistakenly think a
+    doc already exists. Tests that exercise the dedupe branch override
+    this explicitly.
+
+    The ``mock_staging_deps`` container's ``replace_item`` also returns
+    a fresh project doc so ``acquire_project_lease`` (called by the
+    producer to CAS-claim ``current_project_job_id``) succeeds by
+    default. Tests that exercise the CAS-lose branch can override
+    ``replace_item`` to raise a CosmosAccessConditionFailedError.
     """
     from backend.api.endpoints import staging as staging_module
 
@@ -143,6 +159,15 @@ def gen_jobs_deps(app, mock_staging_deps):
         }
     store.create_job.side_effect = _create
     store.list_jobs_by_project.return_value = []
+    # Default: same-key precheck sees no existing doc.
+    store.get_job.return_value = None
+
+    # Lease acquire CAS path: replace_item returns the updated project
+    # doc so ``acquire_project_lease`` reports success.
+    container = mock_staging_deps["container"]
+    def _replace_item_default(item, body, **_kwargs):
+        return body
+    container.replace_item.side_effect = _replace_item_default
 
     app.dependency_overrides[staging_module.get_job_store] = lambda: store
     app.dependency_overrides[staging_module.get_job_queue] = lambda: queue
@@ -444,7 +469,15 @@ def test_post_marks_job_failed_when_enqueue_raises(client, gen_jobs_deps):
     the doc would otherwise sit in 'pending' forever (no worker will
     ever pick it up; UUID4 means the client retry produces a NEW
     distinct doc, not the same one). Compensation: mark the orphan
-    'failed' so the SSE feed and GET /jobs surface it."""
+    'failed' (with error_kind + structured error dict) so the SSE
+    feed and GET /jobs surface it.
+
+    Issue 002: response is the new structured error shape
+    ``{error_kind, user_message, detail}`` (was raw ``{detail: str}``).
+    A bare RuntimeError ("queue down") is classified as UNKNOWN/500
+    by ``backend.core.job_errors.classify``; QUEUE_PERMISSION/502
+    would require a real Azure auth error type.
+    """
     container = gen_jobs_deps["container"]
     container.read_item.return_value = _project_with_brief()
 
@@ -457,9 +490,14 @@ def test_post_marks_job_failed_when_enqueue_raises(client, gen_jobs_deps):
             f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
             json={},
         )
-    # 502 = "I tried to talk to the queue and it failed". Distinguishes
-    # this from a 500 from inside the brief / Cosmos paths.
-    assert response.status_code == 502, response.text
+    # Generic RuntimeError is classified as UNKNOWN/500.
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert body["error_kind"] == "UNKNOWN"
+    assert "user_message" in body
+    assert body["detail"] == {
+        "type": "RuntimeError", "message": "queue down",
+    }
 
     store = gen_jobs_deps["store"]
     # Compensation update_job MUST have been called with status=failed
@@ -471,14 +509,20 @@ def test_post_marks_job_failed_when_enqueue_raises(client, gen_jobs_deps):
     )
     compensation_call = store.update_job.call_args
     compensation_kwargs = compensation_call.kwargs
-    # Positional or kwarg job_id — accept either form.
     args = compensation_call.args
     job_id = args[0] if args else compensation_kwargs.get("job_id")
     assert job_id and job_id.startswith(
         f"{PROJECT_ID}:__project__:__project__:"
     )
     assert compensation_kwargs.get("status") == "failed"
-    assert "queue down" in str(compensation_kwargs.get("error", ""))
+    # Issue 002: error_kind is now persisted on the doc so the front-end
+    # can surface a kind-specific message via /jobs.
+    assert compensation_kwargs.get("error_kind") == "UNKNOWN"
+    # Issue 002: error is a structured {type, message} dict (matches the
+    # worker's existing terminal-failure shape), not a raw string.
+    assert compensation_kwargs.get("error") == {
+        "type": "RuntimeError", "message": "queue down",
+    }
 
 
 def test_post_compensation_failure_still_raises_5xx(client, gen_jobs_deps):
@@ -744,3 +788,177 @@ def test_post_two_concurrent_calls_produce_two_distinct_job_ids(
         for c in gen_jobs_deps["store"].create_job.call_args_list
     ]
     assert revisions[0] != revisions[1]
+
+
+# ---------------------------------------------------------------------------
+# Issue 002 — Idempotency-Key + dedupe + structured error shape
+# ---------------------------------------------------------------------------
+
+
+def test_post_uses_idempotency_key_header_as_revision(client, gen_jobs_deps):
+    """Issue 002 contract: when the front-end sends an
+    ``Idempotency-Key`` header, the producer uses it verbatim as the
+    deterministic-id revision component. Transport-layer retries that
+    re-send the SAME header collapse onto the SAME doc id."""
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    key = "abc123-DEADBEEF_42"
+    patcher, _ = _patched_brief()
+    with patcher:
+        response = client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+            headers={"Idempotency-Key": key},
+        )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["job_id"] == f"{PROJECT_ID}:__project__:__project__:{key}"
+    assert body["already_in_flight"] is False
+    revision = gen_jobs_deps["store"].create_job.call_args.kwargs["revision"]
+    assert revision == key
+
+
+def test_post_same_idempotency_key_returns_200_already_in_flight(
+    client, gen_jobs_deps
+):
+    """Issue 002 headline contract: a transport-layer retry that
+    re-sends the SAME Idempotency-Key gets 200 (not 202) +
+    ``already_in_flight=true`` AND the same job_id. No second
+    ``create_job`` call is made (idempotent retry semantics).
+    """
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    key = "samekey1234567890"
+    seeded_id = f"{PROJECT_ID}:__project__:__project__:{key}"
+    store = gen_jobs_deps["store"]
+    # Same-key precheck finds the existing doc — produces dedupe path.
+    store.get_job.return_value = {
+        "id": seeded_id,
+        "project_id": PROJECT_ID,
+        "kind": "generate_project",
+        "status": "pending",
+    }
+
+    patcher, brief_mock = _patched_brief()
+    with patcher:
+        response = client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+            headers={"Idempotency-Key": key},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["job_id"] == seeded_id
+    assert body["already_in_flight"] is True
+    # Dedupe must short-circuit BEFORE brief composition + create_job.
+    store.create_job.assert_not_called()
+    gen_jobs_deps["queue"].enqueue.assert_not_called()
+    assert not brief_mock.called
+
+
+def test_post_invalid_idempotency_key_returns_422(client, gen_jobs_deps):
+    """Issue 002 server-side validation: keys must match the regex
+    ``^[A-Za-z0-9_-]{1,128}$``. Empty / >128 / non-ASCII / colon /
+    slash / dot — all rejected with 422 BEFORE any side effects."""
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    response = client.post(
+        f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+        json={},
+        headers={"Idempotency-Key": "has space"},
+    )
+    assert response.status_code == 422, response.text
+    gen_jobs_deps["store"].create_job.assert_not_called()
+    gen_jobs_deps["queue"].enqueue.assert_not_called()
+
+
+def test_post_missing_idempotency_key_falls_back_to_server_minted_revision(
+    client, gen_jobs_deps
+):
+    """Backwards-compat: callers that don't send the header still
+    succeed. The server mints a uuid4().hex as the revision. The
+    response body is still the new ``{job_id, already_in_flight}``
+    shape (NOT a legacy single-key body)."""
+    import re
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    patcher, _ = _patched_brief()
+    with patcher:
+        response = client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+        )  # no Idempotency-Key header
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert "job_id" in body
+    assert body["already_in_flight"] is False
+    revision = gen_jobs_deps["store"].create_job.call_args.kwargs["revision"]
+    assert re.fullmatch(r"[0-9a-f]{32}", revision), (
+        f"Server-minted revision must be uuid4().hex, got {revision!r}"
+    )
+
+
+def test_post_brief_composition_failure_returns_structured_error_kind(
+    app, gen_jobs_deps
+):
+    """Issue 002 error-shape contract: brief composition failure no
+    longer raises an unhandled exception — it's classified as
+    BRIEF_FAILED/502 with the structured ``{error_kind, user_message,
+    detail}`` body so the front-end can surface a kind-specific
+    message instead of a raw string.
+    """
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    patcher, _ = _patched_brief(side_effect=RuntimeError("LLM down"))
+    raising_client = TestClient(app, raise_server_exceptions=False)
+    with patcher:
+        response = raising_client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+        )
+    assert response.status_code == 502, response.text
+    body = response.json()
+    assert body["error_kind"] == "BRIEF_FAILED"
+    assert "user_message" in body and body["user_message"]
+    # detail carries the wrapping ``BriefCompositionFailed`` type +
+    # the underlying message (preserved via __cause__). The wrapper
+    # type is what the classifier dispatches on, so it's the
+    # canonical "type" for the structured error.
+    assert body["detail"]["type"] == "BriefCompositionFailed"
+    assert "LLM down" in body["detail"]["message"]
+    # No job created — brief failure is a clean short-circuit.
+    gen_jobs_deps["store"].create_job.assert_not_called()
+    gen_jobs_deps["queue"].enqueue.assert_not_called()
+
+
+def test_post_two_distinct_keys_produce_distinct_jobs(client, gen_jobs_deps):
+    """Frontend always mints a fresh ``crypto.randomUUID()`` per
+    button click. Two distinct keys produce two distinct doc ids
+    (the dedupe path doesn't fire). This pins that the
+    Idempotency-Key wire format actually round-trips through the
+    revision component."""
+    container = gen_jobs_deps["container"]
+    container.read_item.return_value = _project_with_brief()
+
+    patcher, _ = _patched_brief()
+    with patcher:
+        r1 = client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+            headers={"Idempotency-Key": "key-one"},
+        )
+        r2 = client.post(
+            f"/api/v1/staging/projects/{PROJECT_ID}/jobs/generate",
+            json={},
+            headers={"Idempotency-Key": "key-two"},
+        )
+    assert r1.status_code == 202
+    assert r2.status_code == 202
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+    assert r1.json()["job_id"].endswith(":key-one")
+    assert r2.json()["job_id"].endswith(":key-two")

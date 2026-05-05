@@ -57,6 +57,7 @@ _UPDATABLE_FIELDS = frozenset(
         "payload",
         "result",
         "error",
+        "error_kind",
         "cancel_requested",
     }
 )
@@ -65,11 +66,17 @@ JOBS_CONTAINER_ID = "jobs"
 
 
 def deterministic_job_id(
-    project_id: str, room_id: str, variation_id: str, revision: int
+    project_id: str, room_id: str, variation_id: str, revision: int | str
 ) -> str:
     """Return the canonical deterministic id for a job.
 
     Format: ``{project_id}:{room_id}:{variation_id}:{revision}``.
+
+    The ``revision`` component is an integer for room/variation jobs
+    (a counter) and a string for project-level jobs (the producer's
+    Idempotency-Key, validated against ``^[A-Za-z0-9_-]{1,128}$``).
+    Both are safe to ``f""``-interpolate without escaping; callers
+    are responsible for the validation contract upstream.
 
     Used as the Cosmos doc id (so ``create_item`` with this id will 409
     on a duplicate enqueue, which ``create_job`` swallows). Also used
@@ -123,7 +130,7 @@ class JobStore:
         project_id: str,
         room_id: str,
         variation_id: str,
-        revision: int,
+        revision: int | str,
         kind: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:

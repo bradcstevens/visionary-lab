@@ -252,10 +252,49 @@ def test_process_one_failure_at_max_dequeue_marks_failed_and_abandons():
     error = final.get("error")
     assert error is not None
     assert "downstream really down" in str(error)
+    # Issue 002 (active-and-queued PRD): the worker's terminal-failure
+    # path classifies the exception via ``backend.core.job_errors``
+    # and persists the resulting kind on the job doc. A bare
+    # RuntimeError is classified UNKNOWN.
+    assert final.get("error_kind") == "UNKNOWN", (
+        "issue 002: terminal failures must persist error_kind so the "
+        "front-end can surface kind-specific recovery messages"
+    )
 
     # Abandon (not complete) — JobQueue.abandon will route to poison.
     queue.abandon.assert_called_once_with(msg)
     queue.complete.assert_not_called()
+
+
+def test_process_one_failure_persists_error_kind_for_classified_exception():
+    """Issue 002: when a worker dispatch raises a CLASSIFIED exception
+    (e.g. ``CosmosHttpResponseError``), the job_errors classifier maps
+    it to ``STORE_FAILED`` and the worker persists that kind on the
+    job doc so the front-end can render a 'database hiccup' message
+    instead of generic 'something went wrong'.
+    """
+    from azure.cosmos.exceptions import CosmosHttpResponseError
+    from backend.core.job_queue import MAX_DEQUEUE_COUNT
+
+    msg = _make_message(dequeue_count=MAX_DEQUEUE_COUNT)
+    queue = MagicMock()
+    queue.dequeue.return_value = msg
+
+    store = MagicMock()
+    store.get_job.return_value = _make_job_doc(attempts=MAX_DEQUEUE_COUNT - 1)
+
+    async def dispatcher(job, is_cancelled):
+        raise CosmosHttpResponseError(message="cosmos timeout")
+
+    worker = _make_worker(queue=queue, store=store, dispatcher=dispatcher)
+    asyncio.run(worker.process_one())
+
+    final = store.update_job.call_args_list[-1].kwargs
+    assert final.get("status") == "failed"
+    assert final.get("error_kind") == "STORE_FAILED", (
+        "CosmosHttpResponseError must classify as STORE_FAILED — see "
+        "backend.core.job_errors.classify"
+    )
 
 
 # ---------------------------------------------------------------------------

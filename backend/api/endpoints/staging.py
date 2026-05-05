@@ -7,8 +7,8 @@ from typing import List, Optional
 
 import asyncio
 
-from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Cookie, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from pydantic import BaseModel, StrictBool
 
@@ -16,8 +16,16 @@ from backend.core.azure_storage import AzureBlobStorageService
 from backend.core.brief_generator import backfill_legacy_brief_sections
 from backend.core.brief_resolver import migrate_legacy_plant_palette
 from backend.core.config import settings
+from backend.core.job_errors import BriefCompositionFailed
 from backend.core.job_queue import JobQueue
 from backend.core.job_store import JobStore, deterministic_job_id
+from backend.core.project_generation_producer import (
+    AlreadyInFlight,
+    EnqueueFailed,
+    NewlyEnqueued,
+    produce as produce_project_generation,
+    validate_idempotency_key,
+)
 from backend.core.project_lease import cascade_cancel_variation_jobs
 from backend.core.sse_hub import SSEHub, get_sse_hub
 from backend.core.project_status import ProjectStatusCalculator
@@ -342,12 +350,12 @@ async def reset_project(
     # non-terminal job. The /reset endpoint is the user explicitly clicking
     # "give up — put me back to a usable state" so we additionally apply
     # _derive_status_from_rooms when the canonical path returns None,
-    # otherwise reset wouldn't move stuck legacy projects (no job id) off
-    # 'processing' at all.
-    new_status = compute_project_status_from_jobs(project, store)
-    if new_status is None:
-        new_status = _derive_status_from_rooms(project)
-    if new_status != project.get("status"):
+    # ensuring the user always gets out of 'processing'. The reconcile
+    # path NEVER produces 'failed' (AC#6).
+    if project.get("status") == "processing":
+        new_status = compute_project_status_from_jobs(project, store)
+        if new_status is None:
+            new_status = _derive_status_from_rooms(project.get("rooms") or [])
         project["status"] = new_status
 
     try:
@@ -770,6 +778,14 @@ async def update_project(
         if "design_brief" in sent:
             # ``None`` is meaningful here — clears the brief.
             project_data["design_brief"] = body.design_brief
+        if "wizard_state" in sent:
+            # Issue 018 — adaptive-wizard autosave. ``None`` is
+            # meaningful (clears the scratch-pad on final compose+
+            # submit). The mirror below skips when neither ``prompt``
+            # nor ``design_brief`` is in ``sent`` (see ``_mirror_…``
+            # early-return), so wizard-only PATCHes never re-mirror —
+            # critical for autosave isolation.
+            project_data["wizard_state"] = body.wizard_state
 
         # Issue 013 — prompt_summary maintenance. Three cases:
         #
@@ -2083,10 +2099,13 @@ class GenerateProjectJobRequest(BaseModel):
     regenerate_all: StrictBool = False
 
 
-@router.post("/projects/{project_id}/jobs/generate", status_code=202)
+@router.post("/projects/{project_id}/jobs/generate")
 async def enqueue_generate_project_job(
     project_id: str,
     body: Optional[GenerateProjectJobRequest] = None,
+    idempotency_key: Optional[str] = Header(
+        default=None, alias="Idempotency-Key"
+    ),
     storage: StagingStorageService = Depends(get_staging_storage),
     store: JobStore = Depends(get_job_store),
     queue: JobQueue = Depends(get_job_queue),
@@ -2109,34 +2128,41 @@ async def enqueue_generate_project_job(
                                       # variations + cancel in-flight
                                       # variation jobs FIRST
 
-    Algorithm (point-of-no-return contract: cascade-cancel in step 5
-    persists even if create_job/enqueue subsequently fails — there is
-    NO rollback because uncancelling could race a legitimate
-    user-initiated cancel)::
+    Idempotency-Key header (issue 002 of the active-and-queued PRD):
+    optional, but the front-end always sends it. When present, used
+    as the deterministic job-id revision component so transport-layer
+    retries collapse onto the same doc. When absent, a server-side
+    ``uuid4().hex`` is minted (preserves backwards compatibility with
+    legacy callers that don't send the header).
 
-        1. Feature-flag gate (503 if FEATURE_ASYNC_QUEUE off)
-        2. Project exists (404 if missing)
-        3. Project has at least one room (400 — preserves legacy
-           POST /projects/{id}/generate parity; rejects BEFORE
-           burning brief composition or pre-cancelling siblings)
-        4. Inline brief composition (5xx on failure; no side
-           effects yet — no job created, no cascade run)
-        5. If regenerate_all=true: cascade-cancel every non-terminal
-           regenerate_variation job for the project. POINT OF NO
-           RETURN.
-        6. Mint a new doc id with revision = uuid.uuid4().hex (NOT
-           an integer counter — two concurrent POSTs MUST produce
-           two distinct doc ids; the regenerate_variation idempotent
-           revision selector silently collapses concurrent integer
-           collisions)
-        7. queue.enqueue with compensation: if it raises, mark the
-           orphan doc status="failed" so the SSE feed and
-           GET /jobs surface the failure. Compensation is best-
-           effort (warn-log on inner failure); endpoint returns 502.
+    Response shapes (cross-slice contract; consumed by Slices 4 + 5)::
 
-    Returns ``{"job_id": "<deterministic id>"}`` with 202.
+        200 {"job_id", "already_in_flight": true}    # dedupe hit
+        202 {"job_id", "already_in_flight": false}   # newly enqueued
+        4xx/5xx {"error_kind", "user_message", "detail"}  # classified
+
+    Algorithm is owned by ``backend.core.project_generation_producer``;
+    this wrapper only:
+
+      * gates on ``FEATURE_ASYNC_QUEUE``;
+      * 404s on missing project;
+      * 400s on no-rooms (preserves legacy parity — rejects BEFORE
+        burning brief composition);
+      * 422s on invalid Idempotency-Key (server-side validation);
+      * builds the inline ``compose_brief`` callable from the
+        already-fetched project doc;
+      * translates the discriminated-union return into the response
+        shape above.
     """
     _require_async_queue_enabled()
+
+    if idempotency_key is None:
+        idempotency_key = uuid.uuid4().hex
+    else:
+        try:
+            idempotency_key = validate_idempotency_key(idempotency_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     project_data = storage.get_project(project_id)
     if not project_data:
@@ -2153,11 +2179,17 @@ async def enqueue_generate_project_job(
 
     regenerate_all = bool(body.regenerate_all) if body is not None else False
 
-    brief_prompts: Optional[dict] = None
-    if project.design_brief and project.analyses:
+    async def _compose_brief() -> Optional[dict]:
+        """Closure over the validated project — returns the precomputed
+        per-room brief prompts dict, or None when the project has no
+        design_brief / analyses (the dispatcher's None-fallback path)."""
+        if not (project.design_brief and project.analyses):
+            return None
         from backend.core.brief_generator import BriefGeneratorService
         from backend.core import async_llm_client
-        from backend.models.design_brief import DesignBrief as DBModel, ImageAnalysis
+        from backend.models.design_brief import (
+            DesignBrief as DBModel, ImageAnalysis,
+        )
 
         brief = DBModel(**project.design_brief)
         analyses = [ImageAnalysis(**a) for a in project.analyses]
@@ -2165,63 +2197,60 @@ async def enqueue_generate_project_job(
             async_llm_client=async_llm_client,
             llm_deployment=settings.LLM_DEPLOYMENT,
         )
-        brief_prompts = await brief_service.brief_to_prompts(
-            brief=brief,
-            image_analyses=analyses,
-            n_variations=project.settings.variations_per_room,
-        )
+        try:
+            return await brief_service.brief_to_prompts(
+                brief=brief,
+                image_analyses=analyses,
+                n_variations=project.settings.variations_per_room,
+            )
+        except Exception as exc:
+            raise BriefCompositionFailed(str(exc)) from exc
 
-    if regenerate_all:
-        cancelled = cascade_cancel_variation_jobs(
-            store=store, project_id=project_id
-        )
-        logger.info(
-            "staging.jobs.generate.cascade_cancel project_id=%s cancelled=%d",
-            project_id, cancelled,
-        )
-
-    revision = uuid.uuid4().hex
-    doc = store.create_job(
+    result = await produce_project_generation(
         project_id=project_id,
-        room_id="__project__",
-        variation_id="__project__",
-        revision=revision,
-        kind="generate_project",
-        payload={
-            "regenerate_all": regenerate_all,
-            "brief_prompts": brief_prompts,
+        project_data=project_data,
+        idempotency_key=idempotency_key,
+        regenerate_all=regenerate_all,
+        compose_brief=_compose_brief,
+        store=store,
+        queue=queue,
+        storage=storage,
+    )
+
+    if isinstance(result, AlreadyInFlight):
+        logger.info(
+            "staging.jobs.generate.dedupe project_id=%s job_id=%s",
+            project_id, result.job_id,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"job_id": result.job_id, "already_in_flight": True},
+        )
+
+    if isinstance(result, NewlyEnqueued):
+        logger.info(
+            "staging.jobs.generate.enqueued project_id=%s job_id=%s "
+            "regenerate_all=%s",
+            project_id, result.job_id, regenerate_all,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": result.job_id, "already_in_flight": False},
+        )
+
+    assert isinstance(result, EnqueueFailed)
+    logger.warning(
+        "staging.jobs.generate.failed project_id=%s error_kind=%s",
+        project_id, result.error_kind.value,
+    )
+    return JSONResponse(
+        status_code=result.http_status,
+        content={
+            "error_kind": result.error_kind.value,
+            "user_message": result.user_message,
+            "detail": result.detail,
         },
     )
-    job_id = doc["id"]
-
-    try:
-        queue.enqueue(job_id=job_id, project_id=project_id)
-    except Exception as enqueue_exc:
-        try:
-            store.update_job(
-                job_id, project_id,
-                status="failed",
-                error=f"enqueue failed: {enqueue_exc!r}",
-            )
-        except Exception as compensation_exc:
-            logger.warning(
-                "staging.jobs.generate.compensation_failed job_id=%s error=%s",
-                job_id, compensation_exc,
-            )
-        logger.warning(
-            "staging.jobs.generate.enqueue_failed job_id=%s error=%s",
-            job_id, enqueue_exc,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Queue enqueue failed: {enqueue_exc}",
-        )
-
-    logger.info(
-        "staging.jobs.generate.enqueued project_id=%s job_id=%s regenerate_all=%s",
-        project_id, job_id, regenerate_all,
-    )
-    return {"job_id": job_id}
 
 
 @router.get("/projects/{project_id}/jobs")
@@ -2478,3 +2507,225 @@ async def stream_project_jobs(
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Adaptive-wizard support endpoints (issue 018 of the image-pipeline-and-
+# project-ux-overhaul PRD).
+#
+# These endpoints are thin HTTP wrappers around modules that already
+# exist in ``backend.core``:
+#
+# - ``DomainClassifier`` and ``RegionalPackLoader`` live in
+#   ``backend.core.regional_pack_loader`` (issue 017 — done).
+# - ``BriefSectionRegistry`` lives in
+#   ``backend.core.brief_section_registry`` (issue 015 — done).
+# - The async LLM client is the same shared singleton imported by every
+#   other LLM-backed endpoint in this file.
+#
+# All three endpoints sit under the ``/wizard`` sub-prefix so the URL
+# space stays organised and a future frontend toggling the legacy
+# wizard off doesn't have to coordinate with project endpoints.
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel, Field, validator as _wiz_validator  # noqa: E402
+
+from backend.core.brief_section_registry import section_ids as _wiz_section_ids  # noqa: E402
+from backend.core.regional_pack_loader import (  # noqa: E402
+    DomainClassifier as _WizDomainClassifier,
+    RegionalPackLoader as _WizRegionalPackLoader,
+)
+
+
+# Module-level singletons. ``RegionalPackLoader`` caches packs on first
+# read so repeated wizard requests never re-parse JSON; the classifier
+# is stateless but instantiated once for symmetry.
+_wizard_domain_classifier = _WizDomainClassifier()
+_wizard_pack_loader = _WizRegionalPackLoader()
+
+
+class WizardClassifyDomainRequest(BaseModel):
+    text: str = Field(..., description="Free-text user description.")
+
+
+class WizardClassifyDomainResponse(BaseModel):
+    domain: Optional[str] = Field(
+        ...,
+        description=(
+            "Classified domain id, or ``null`` when no keyword match "
+            "crossed ``DomainClassifier.MIN_VOTES``. Wizard falls back "
+            "to a generic chip-less flow on null."
+        ),
+    )
+
+
+class WizardPackResponse(BaseModel):
+    domain: str
+    region: str
+    display_name: str = ""
+    description: str = ""
+    chips: dict = Field(default_factory=dict)
+
+
+class WizardGenerateQuestionRequest(BaseModel):
+    section_id: str = Field(
+        ...,
+        description="One of ``BriefSectionRegistry`` ids — see ``brief_section_registry.py``.",
+    )
+    current_state: dict = Field(
+        default_factory=dict,
+        description=(
+            "Wizard scratch-pad state so far. Opaque to the backend; "
+            "passed verbatim into the LLM prompt context."
+        ),
+    )
+    domain: Optional[str] = Field(
+        None,
+        description=(
+            "Classified domain id from a prior call to "
+            "``/classify-domain``. ``null`` when the user is mid-typing "
+            "step 1 and we don't yet have a confident classification."
+        ),
+    )
+
+    @_wiz_validator("section_id")
+    def _section_id_is_known(cls, v):
+        valid = set(_wiz_section_ids())
+        if v not in valid:
+            raise ValueError(
+                f"section_id {v!r} is not in BriefSectionRegistry; valid ids: {sorted(valid)}"
+            )
+        return v
+
+
+class WizardGenerateQuestionResponse(BaseModel):
+    question: str
+
+
+@router.post(
+    "/wizard/classify-domain",
+    response_model=WizardClassifyDomainResponse,
+)
+async def wizard_classify_domain(
+    body: WizardClassifyDomainRequest,
+) -> WizardClassifyDomainResponse:
+    """Classify a free-text user description into a domain id.
+
+    Pure-Python keyword voting via ``DomainClassifier`` — no LLM call,
+    deterministic, cheap. Returns ``{domain: null}`` when no domain
+    crosses the vote threshold; the wizard treats that as "fall back
+    to a generic chip-less flow" rather than picking a wrong domain.
+    """
+    domain = _wizard_domain_classifier.classify(body.text)
+    return WizardClassifyDomainResponse(domain=domain)
+
+
+@router.get(
+    "/wizard/pack/{domain}/{region}",
+    response_model=WizardPackResponse,
+)
+async def wizard_get_pack(domain: str, region: str) -> WizardPackResponse:
+    """Return the regional content pack for ``(domain, region)``.
+
+    Always 200 — ``RegionalPackLoader.get`` returns an empty pack
+    rather than raising on unknown / missing / malformed input so the
+    wizard stays usable without a packaged domain. The empty-pack body
+    still echoes the requested ``domain`` / ``region`` so the frontend
+    can cache the response under those keys regardless.
+    """
+    pack = _wizard_pack_loader.get(domain, region)
+    return WizardPackResponse(
+        domain=pack.domain,
+        region=pack.region,
+        display_name=pack.display_name,
+        description=pack.description,
+        chips=dict(pack.chips),
+    )
+
+
+async def _generate_wizard_question(
+    *,
+    section_id: str,
+    current_state: dict,
+    domain: Optional[str],
+) -> str:
+    """Ask the LLM for one focused follow-up question for ``section_id``.
+
+    Implementation note — this helper is the seam tests patch out so
+    the endpoint stays fast and credential-free. Production behavior
+    builds a prompt from the section's title/description, the current
+    wizard state, and the (optional) domain context, and asks the
+    shared ``async_llm_client`` for a single short question. On any
+    LLM failure we fall back to the section's PRD-canon description so
+    the user always sees a usable prompt rather than an empty step.
+    """
+    from backend.core import async_llm_client
+    from backend.core.brief_section_registry import get_section
+
+    section = get_section(section_id)
+    fallback = section.description if section else ""
+
+    if async_llm_client is None:
+        return fallback
+
+    domain_hint = f" (domain: {domain})" if domain else ""
+    state_summary_parts: List[str] = []
+    for sec_id, payload in (current_state or {}).items():
+        if isinstance(payload, dict):
+            content = payload.get("content")
+            if isinstance(content, str) and content.strip():
+                state_summary_parts.append(f"- {sec_id}: {content.strip()}")
+    state_summary = "\n".join(state_summary_parts) if state_summary_parts else "(none yet)"
+
+    system = (
+        "You are a design assistant guiding a user through a structured "
+        "brief wizard. For each step, write ONE short follow-up question "
+        "that helps the user fill in the current section. Keep it under "
+        "20 words. Do not greet, do not summarise — just the question."
+    )
+    user = (
+        f"Current section: {section.title if section else section_id}{domain_hint}\n"
+        f"Section purpose: {section.description if section else ''}\n"
+        f"State so far:\n{state_summary}\n\n"
+        f"Write one focused follow-up question for this step."
+    )
+
+    try:
+        response = await async_llm_client.chat.completions.create(
+            model=settings.LLM_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.4,
+            max_tokens=80,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return text or fallback
+    except Exception as exc:
+        logger.warning(
+            "wizard.generate_question.llm_failed section_id=%s err=%s",
+            section_id, exc,
+        )
+        return fallback
+
+
+@router.post(
+    "/wizard/generate-question",
+    response_model=WizardGenerateQuestionResponse,
+)
+async def wizard_generate_question(
+    body: WizardGenerateQuestionRequest,
+) -> WizardGenerateQuestionResponse:
+    """Generate one short follow-up question for the current wizard step.
+
+    The Pydantic validator on ``section_id`` already 422s unknown ids
+    (the wizard always sends a registry id; an unknown id means a
+    misbehaving client and we don't want to send garbage to the LLM).
+    """
+    question = await _generate_wizard_question(
+        section_id=body.section_id,
+        current_state=body.current_state,
+        domain=body.domain,
+    )
+    return WizardGenerateQuestionResponse(question=question)
